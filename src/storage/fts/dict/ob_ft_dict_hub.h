@@ -19,7 +19,9 @@
 
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_mutex.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
+#include <atomic>
 
 namespace oceanbase
 {
@@ -93,31 +95,42 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObIFTDict;
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
-  ~ObFTDictHub() {}
+  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_(),
+                 builtin_ik_dicts_(nullptr), builtin_ik_lock_() {}
+  ~ObFTDictHub();
 
   int init();
 
+  // All parser users must have stopped, and the global KV cache must still exist.
   int destroy();
 
   int build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  // Immutable built-in dictionaries only. The returned views live until destroy().
+  int get_builtin_ik_dicts(const ObIFTDict *&main_dict,
+                           const ObIFTDict *&quan_dict,
+                           const ObIFTDict *&stop_dict);
+
 private:
+  struct BuiltinIKDicts;
+
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
-
 
 private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  std::atomic<BuiltinIKDicts *> builtin_ik_dicts_;
+  lib::ObMutex builtin_ik_lock_;
 };
 
 } //  namespace storage

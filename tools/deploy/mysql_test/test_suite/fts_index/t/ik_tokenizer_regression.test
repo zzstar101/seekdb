@@ -1,32 +1,29 @@
 # owner: storage
 # owner group: storage
-# description: regression checks for the internals of the ik fulltext tokenizer, which are
-#   shared by the index build path, the tokenize() function and the match() query path:
-#   1. the char of the text is decoded and classified only once (ObFTCharUtil).
-#   2. the arbitration of the candidate chains still outputs every word once (ObIKArbitrator).
-#   3. the per word post processing still cases the words down (ObAddWord).
+# description: regression checks shared by IK index build, tokenize() and match().
+#   Check complete words, case folding, mixed character classification, and long inputs.
 
 --disable_warnings
 drop database if exists fts_ik_reg;
 create database fts_ik_reg;
 use fts_ik_reg;
 set ob_query_timeout = 10000000000;
-create table memo (id BIGINT AUTO_INCREMENT, title VARCHAR(100), body TEXT, FULLTEXT INDEX fti(title, body));
+create table memo (id BIGINT AUTO_INCREMENT, title VARCHAR(100), body VARCHAR(4000), FULLTEXT INDEX fti(title, body) WITH PARSER ik) default charset utf8mb4;
 insert into memo (title, body) values ('电影评论', '昨晚看的一部电影非常感人，让我思考了很多。');
 insert into memo (title, body) values ('Security Audit', 'Completed the annual security audit.');
+insert into memo (title, body) values ('长文', repeat('昨晚看的一部电影非常感人。', 100));
 --enable_warnings
 
---result_format 4
-
-select instr(tokenize('hello world'), 'world') > 0 as ok;
-select instr(tokenize('hello world'), 'hell') = 0 as ok;
-select length(tokenize('hello world')) > 2 as ok;
-select instr(tokenize('HELLO'), 'hello') > 0 as ok;
-select instr(tokenize('HELLO'), 'HELLO') = 0 as ok;
-select length(tokenize('中文abc123，测试。')) > 2 as ok;
-select length(tokenize('A-1 B.2 C_3 x@y.com 100,000')) > 2 as ok;
-select length(tokenize(repeat('昨晚看的一部电影非常感人', 100))) > 2 as ok;
-select count(*) from memo where match(body) against ('audit');
-select count(*) from memo where match(body) against ('nothinghere');
+select json_contains(tokenize('hello world', 'ik'), '"world"') as ok;
+select json_contains(tokenize('hello world', 'ik'), '"hell"') = 0 as ok;
+select json_length(tokenize('hello world', 'ik')) = 2 as ok;
+select json_contains(tokenize('HELLO', 'ik'), '"hello"') as ok;
+select json_contains(tokenize('HELLO', 'ik'), '"HELLO"') = 0 as ok;
+select json_length(tokenize('中文abc123，测试。', 'ik')) > 0 as ok;
+select json_length(tokenize('A-1 B.2 C_3 x@y.com 100,000', 'ik')) > 0 as ok;
+# A VARCHAR column avoids a LOB-typed repeat() expression in TOKENIZE.
+select json_length(tokenize(body, 'ik')) > 0 as ok from memo where title = '长文';
+select count(*) from memo where match(title, body) against ('audit');
+select count(*) from memo where match(title, body) against ('nothinghere');
 
 drop database fts_ik_reg;

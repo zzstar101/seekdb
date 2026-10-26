@@ -1,0 +1,171 @@
+# owner: storage
+# owner group: storage
+# tags: fts
+# description: the ik fulltext parser builds one immutable builtin dictionary view and then
+#   reuses it for tokenize(), for the index build path and for match(). this case pins the
+#   words and the word counts the ik parser produces while that view is reused in different
+#   ways: the same text tokenized again, the two ik modes called in turn, two sessions, a
+#   flushed ik dict cache, the text delivered through every charset/collation this build
+#   ships, and long texts the segmenter cuts into several batches. the tokenizer output of
+#   every row is snapshotted once per mode, every later phase re-tokenizes the same rows and
+#   the two document sets are compared with each other. the comparison is null safe everywhere
+#   (<=>, inside not (...)) and never looks at the json text or at the json key order: the
+#   word arrays must have the same length and contain each other, which pins the word set and
+#   the word count of every word, and the output="all" documents must carry the same number of
+#   tokens, contain each other and carry the same doc_len, so a lost word, a changed word
+#   count or a changed doc_len fails the case. the words that fts_index.ik_tokenizer_regression
+#   and fts_index.cn_word already pin are checked as well. a small fulltext index keeps the
+#   index build, match(), update and delete path covered.
+#   Fixed expectations were checked against the unmodified bfc46d6d binary.
+
+--disable_warnings
+drop database if exists fts_ik_reuse;
+create database fts_ik_reuse;
+use fts_ik_reuse;
+set ob_query_timeout = 10000000000;
+
+# rows are tokenized by the ik parser; mode is the ik mode used for the row and
+# also the mode that the expected snapshot is taken with.
+create table ik_doc (id int primary key, mode varchar(16) not null, txt varchar(4000)) default charset utf8mb4 collate utf8mb4_general_ci;
+insert into ik_doc values (1, 'smart', '中华人民共和国人民大会堂');
+insert into ik_doc values (2, 'max_word', '中华人民共和国人民大会堂');
+insert into ik_doc values (3, 'smart', 'OceanBase是一款非常稳定数据库，在110个星球上都非常著名');
+insert into ik_doc values (4, 'smart', 'zzznotaword qqqqxyz');
+insert into ik_doc values (5, 'smart', null);
+insert into ik_doc values (6, 'smart', '');
+insert into ik_doc values (7, 'smart', 'hello world');
+insert into ik_doc values (8, 'smart', repeat('abc def ghi,', 120));
+insert into ik_doc values (9, 'max_word', repeat('中华人民共和国 人民大会堂,', 100));
+insert into ik_doc values (10, 'smart', '人际关系');
+
+# the expected tokenization of every row, taken once per mode
+create table ik_snap (id int not null, mode varchar(24) not null, tks json, tks_all json, primary key (id, mode));
+insert into ik_snap select id, 'smart', tokenize(txt, 'ik'), tokenize(txt, 'ik', '[{"output": "all"}]') from ik_doc where mode = 'smart';
+insert into ik_snap select id, 'max_word', tokenize(txt, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(txt, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_doc where mode = 'max_word';
+
+# ik_now is refilled by every later phase with a fresh tokenize() of the same rows, and ik_diff
+# holds the (id, mode) rows whose fresh output differs from the snapshot, so each phase only
+# has to count the rows of ik_diff. the predicate is null safe: <> and = both drop the rows
+# where a json value is null, so every term is compared with <=> and a json value that is null
+# on one side only counts as a difference. the predicate does not depend on the key order and
+# never casts the json value to char, so no truncation can hide a difference: the word arrays
+# must have the same length and contain each other (word set plus word count of every word),
+# and the output="all" documents must have the same number of tokens, contain each other and
+# carry the same doc_len.
+create table ik_now (id int not null, mode varchar(24) not null, tks json, tks_all json, primary key (id, mode));
+create view ik_diff as select n.id as id, n.mode as mode from ik_now n join ik_snap s on s.id = n.id and s.mode = n.mode where not ((json_length(n.tks) <=> json_length(s.tks)) and ((json_contains(s.tks, n.tks) <=> 1) or (n.tks is null and s.tks is null)) and ((json_contains(n.tks, s.tks) <=> 1) or (n.tks is null and s.tks is null)) and (json_length(n.tks_all, '$.tokens') <=> json_length(s.tks_all, '$.tokens')) and ((json_contains(s.tks_all, n.tks_all) <=> 1) or (n.tks_all is null and s.tks_all is null)) and ((json_contains(n.tks_all, s.tks_all) <=> 1) or (n.tks_all is null and s.tks_all is null)) and (json_extract(n.tks_all, '$.doc_len') <=> json_extract(s.tks_all, '$.doc_len')) <=> 1);
+
+--echo == 1. every row must tokenize again to the same words, word counts and doc_len ==
+insert into ik_now select id, 'smart', tokenize(txt, 'ik'), tokenize(txt, 'ik', '[{"output": "all"}]') from ik_doc where mode = 'smart';
+insert into ik_now select id, 'max_word', tokenize(txt, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(txt, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_doc where mode = 'max_word';
+select count(*) as bad from ik_diff;
+select count(*) as n from ik_now;
+
+--echo == 2. the same statement called several times must keep the same result ==
+select json_length(tokenize('人际关系', 'ik')) as n;
+select json_length(tokenize('人际关系', 'ik')) as n;
+select json_length(tokenize('人际关系', 'ik')) as n;
+
+--echo == 3. words already pinned by fts_index.ik_tokenizer_regression and fts_index.cn_word ==
+# Smart and max_word deliberately have different word sets for the same text.
+select json_length(tokenize('hello world', 'ik')) as n;
+select json_contains(tokenize('hello world', 'ik'), '"hello"') as ok;
+select json_contains(tokenize('hello world', 'ik'), '"hell"') as ok;
+select json_length(tokenize('中文abc123，测试。', 'ik')) > 0 as ok;
+select json_contains(tokenize('OceanBase', 'ik'), '"oceanbase"') as ok;
+select json_length(tokenize('中华人民共和国人民大会堂', 'ik')) as n;
+select json_length(tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]')) as n;
+select json_length(tokenize('中华人民共和国人民大会堂', 'ik')) < json_length(tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]')) as ok;
+select json_extract(tokenize('hello world', 'ik', '[{"output": "all"}]'), '$.doc_len') as n;
+select json_length(tokenize('', 'ik')) as n;
+
+--echo == 4. a null text and a text that holds no known word ==
+select id, json_length(tokenize(txt, 'ik')) as n from ik_doc where id in (5, 6) order by id;
+select (json_length(tokenize(txt, 'ik')) <=> 0) as ok from ik_doc where id = 5;
+select json_contains(tokenize('zzznotaword qqqqxyz', 'ik'), '"zzznotaword"') as ok;
+
+--echo == 5. a text longer than SEGMENT_LIMIT is cut into several batches and keeps its words ==
+# [computed from the fixture, not from a run] repeat('abc def ghi,', 120) is 1440 characters and
+# repeat('中华人民共和国 人民大会堂,', 100) is 1400 characters, both above SEGMENT_LIMIT = 1000
+# (src/storage/fts/ob_ik_ft_parser.h) and both inside the varchar(4000) limit, so the segmenter
+# really cuts these two rows into several batches.
+select id, char_length(txt) as chars, char_length(txt) > 1000 as over_segment_limit, char_length(txt) <= 4000 as fits_varchar from ik_doc where id in (8, 9) order by id;
+select json_length(tokenize(txt, 'ik')) > 0 as ok from ik_doc where id = 8;
+select json_extract(tokenize(txt, 'ik', '[{"output": "all"}]'), '$.doc_len') > 0 as ok from ik_doc where id = 8;
+select json_length(tokenize(txt, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]')) > 0 as ok from ik_doc where id = 9;
+select json_extract(tokenize(txt, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]'), '$.doc_len') > 0 as ok from ik_doc where id = 9;
+
+--echo == 6. the same text through every charset/collation this build ships, both modes in turn ==
+# only the binary and the utf8mb4 charsets are compiled in, with the utf8mb4_general_ci,
+# utf8mb4_bin, utf8mb4_unicode_ci and binary collations (charset_wrap_arr_ and
+# collation_wrap_arr_ in src/oblib/lib/charset/ob_charset.cpp), so these are the conversions
+# this build can make. a gbk/latin1 leg needs a build that registers those charsets; it can not
+# run here and is not silently skipped.
+create table ik_cs (id int primary key, txt_general varchar(4000) character set utf8mb4 collate utf8mb4_general_ci, txt_bin varchar(4000) character set utf8mb4 collate utf8mb4_bin, txt_uni varchar(4000) character set utf8mb4 collate utf8mb4_unicode_ci) default charset utf8mb4 collate utf8mb4_general_ci;
+insert into ik_cs select id, txt, txt, txt from ik_doc;
+delete from ik_now;
+insert into ik_now select c.id, 'smart', tokenize(c.txt_bin, 'ik'), tokenize(c.txt_bin, 'ik', '[{"output": "all"}]') from ik_cs c join ik_doc d on d.id = c.id and d.mode = 'smart';
+insert into ik_now select c.id, 'max_word', tokenize(c.txt_bin, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(c.txt_bin, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_cs c join ik_doc d on d.id = c.id and d.mode = 'max_word';
+select count(*) as bad from ik_diff;
+delete from ik_now;
+insert into ik_now select c.id, 'smart', tokenize(c.txt_uni, 'ik'), tokenize(c.txt_uni, 'ik', '[{"output": "all"}]') from ik_cs c join ik_doc d on d.id = c.id and d.mode = 'smart';
+insert into ik_now select c.id, 'max_word', tokenize(c.txt_uni, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(c.txt_uni, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_cs c join ik_doc d on d.id = c.id and d.mode = 'max_word';
+select count(*) as bad from ik_diff;
+delete from ik_now;
+insert into ik_now select c.id, 'smart', tokenize(convert(convert(c.txt_general using binary) using utf8mb4), 'ik'), tokenize(convert(convert(c.txt_general using binary) using utf8mb4), 'ik', '[{"output": "all"}]') from ik_cs c join ik_doc d on d.id = c.id and d.mode = 'smart';
+select count(*) as bad from ik_diff;
+select count(*) as n from ik_now;
+
+--echo == 7. flush the ik dict cache, the cached dictionary view is not rebuilt and the words stay the same ==
+connect (obsys,$OBMYSQL_MS0,admin,$OBMYSQL_PWD,fts_ik_reuse,$OBMYSQL_PORT);
+connection obsys;
+alter system flush kvcache cache='dict_cache';
+disconnect obsys;
+connection default;
+# the built-in ik dictionaries are borrowed immutable views whose cache pins are owned by
+# ObFTDictHub for its lifetime (src/storage/fts/dict/ob_ft_dict_hub.h and
+# src/storage/fts/ob_ik_ft_parser.h), so this flush does not rebuild the builtin ik views; it
+# may evict cache entries, but it must not change a single word, word count or doc_len.
+delete from ik_now;
+insert into ik_now select id, 'smart', tokenize(txt, 'ik'), tokenize(txt, 'ik', '[{"output": "all"}]') from ik_doc where mode = 'smart';
+insert into ik_now select id, 'max_word', tokenize(txt, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(txt, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_doc where mode = 'max_word';
+select count(*) as bad from ik_diff;
+select count(*) as n from ik_now;
+
+--echo == 8. two sessions, the two ik modes called in turn on each of them ==
+connect (ik_conn2,$OBMYSQL_MS0,admin,$OBMYSQL_PWD,fts_ik_reuse,$OBMYSQL_PORT);
+connection ik_conn2;
+delete from ik_now;
+insert into ik_now select id, 'smart', tokenize(txt, 'ik'), tokenize(txt, 'ik', '[{"output": "all"}]') from ik_doc where mode = 'smart';
+insert into ik_now select id, 'max_word', tokenize(txt, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(txt, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_doc where mode = 'max_word';
+select count(*) as bad from ik_diff;
+connection default;
+delete from ik_now;
+insert into ik_now select id, 'max_word', tokenize(txt, 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]'), tokenize(txt, 'ik', '[{"output": "all"}, {"additional_args": [{"ik_mode": "max_word"}]}]') from ik_doc where mode = 'max_word';
+insert into ik_now select id, 'smart', tokenize(txt, 'ik'), tokenize(txt, 'ik', '[{"output": "all"}]') from ik_doc where mode = 'smart';
+select count(*) as bad from ik_diff;
+select count(*) as n from ik_now;
+disconnect ik_conn2;
+
+--echo == 9. index build, match(), update and delete keep the same id set ==
+# Check exact document IDs as well as counts after index maintenance.
+create table ik_idx (id int primary key, title varchar(256), body varchar(1024), fulltext index fti(title, body) with parser ik) default charset utf8mb4 collate utf8mb4_general_ci;
+insert into ik_idx values (1, '数据库 优化', 'OceanBase 是 一款 非常 稳定 的 数据库');
+insert into ik_idx values (2, '分词器', 'ik 分词器 支持 smart 和 max_word 两种 模式');
+insert into ik_idx values (3, 'hello world', 'the quick brown fox');
+insert into ik_idx values (4, '中文 文档', '中华人民共和国 人民大会堂 在 北京');
+insert into ik_idx values (5, '数据 迁移', '数据库 迁移 与 性能 优化 实践');
+select count(*) as n from ik_idx where match(title, body) against ('数据库' in boolean mode);
+select id from ik_idx where match(title, body) against ('数据库' in boolean mode) order by id;
+select count(*) as n from ik_idx where match(title, body) against ('分词器' in boolean mode);
+select count(*) as n from ik_idx where match(title, body) against ('hello' in boolean mode);
+select count(*) as n from ik_idx where match(title, body) against ('人民大会堂' in boolean mode);
+select count(*) as n from ik_idx where match(title, body) against ('zzznotaword' in boolean mode);
+update ik_idx set body = 'ik 分词器 支持 smart 和 max_word 两种 模式' where id = 3;
+select count(*) as n from ik_idx where match(title, body) against ('fox' in boolean mode);
+select id from ik_idx where match(title, body) against ('分词器' in boolean mode) order by id;
+delete from ik_idx where id = 1;
+select id from ik_idx where match(title, body) against ('数据库' in boolean mode) order by id;
+select count(*) as n from ik_idx;
+
+drop database fts_ik_reuse;

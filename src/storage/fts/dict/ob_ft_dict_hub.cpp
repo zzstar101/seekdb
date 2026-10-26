@@ -28,6 +28,78 @@ namespace oceanbase
 {
 namespace storage
 {
+// Ownership order is deliberate: views are destroyed before their pinned cache
+// handles, and the handles before their allocator. No per-token state is shared.
+struct ObFTDictHub::BuiltinIKDicts
+{
+  BuiltinIKDicts()
+      : allocator_(lib::ObMemAttr("FtsBuiltinDict")),
+        descs_{{"main_dict", ObFTDictType::DICT_IK_MAIN, CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN},
+               {"quan_dict", ObFTDictType::DICT_IK_QUAN, CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN},
+               {"stopword", ObFTDictType::DICT_IK_STOP, CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN}},
+        caches_{{allocator_}, {allocator_}, {allocator_}},
+        dicts_{{allocator_, &caches_[0], descs_[0]},
+               {allocator_, &caches_[1], descs_[1]},
+               {allocator_, &caches_[2], descs_[2]}}
+  {}
+
+  int init(ObFTDictHub &hub)
+  {
+    int ret = OB_SUCCESS;
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      if (OB_FAIL(hub.load_cache(descs_[i], caches_[i]))) {
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          ret = hub.build_cache(descs_[i], caches_[i]);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ret = dicts_[i].init();
+      }
+    }
+    return ret;
+  }
+
+  ObArenaAllocator allocator_;
+  ObFTDictDesc descs_[3];
+  ObFTCacheRangeContainer caches_[3];
+  ObFTRangeDict dicts_[3];
+};
+
+ObFTDictHub::~ObFTDictHub()
+{
+  destroy();
+}
+
+int ObFTDictHub::get_builtin_ik_dicts(const ObIFTDict *&main_dict,
+                                     const ObIFTDict *&quan_dict,
+                                     const ObIFTDict *&stop_dict)
+{
+  int ret = OB_SUCCESS;
+  BuiltinIKDicts *dicts = nullptr;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (nullptr == (dicts = builtin_ik_dicts_.load(std::memory_order_acquire))) {
+    lib::ObMutexGuard guard(builtin_ik_lock_);
+    if (nullptr == (dicts = builtin_ik_dicts_.load(std::memory_order_relaxed))) {
+      if (OB_ISNULL(dicts = OB_NEW(BuiltinIKDicts, "FtsBuiltinDict"))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(dicts->init(*this))) {
+        // Never publish a partial view. A later call can retry initialization.
+        OB_DELETE(BuiltinIKDicts, "FtsBuiltinDict", dicts);
+        dicts = nullptr;
+      } else {
+        builtin_ik_dicts_.store(dicts, std::memory_order_release);
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    main_dict = &dicts->dicts_[0];
+    quan_dict = &dicts->dicts_[1];
+    stop_dict = &dicts->dicts_[2];
+  }
+  return ret;
+}
+
 int ObFTDictHub::init()
 {
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
@@ -43,6 +115,11 @@ int ObFTDictHub::init()
 int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
+  // The server calls this only after parser users have stopped.
+  BuiltinIKDicts *dicts = builtin_ik_dicts_.exchange(nullptr, std::memory_order_relaxed);
+  if (nullptr != dicts) {
+    OB_DELETE(BuiltinIKDicts, "FtsBuiltinDict", dicts);
+  }
   is_inited_ = false;
   return ret;
 }
