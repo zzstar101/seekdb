@@ -1,0 +1,37 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py start 19128
+--disable_query_log
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ollama_completion_ep');
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ollama_embedding_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ollama_completion');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ollama_embedding');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ollama_completion', '{"type":"completion","model_name":"arbitrary-native-model"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ollama_embedding', '{"type":"dense_embedding","model_name":"arbitrary-native-embedding"}');
+--enable_query_log
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ollama_completion_ep', '{"ai_model_name":"ollama_completion","url":"http://127.0.0.1:19128/api/generate","provider":"oLlAmA"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ollama_embedding_ep', '{"ai_model_name":"ollama_embedding","url":"http://127.0.0.1:19128/api/embed","provider":"OLLAMA","access_key":""}');
+select ai_complete('ollama_completion', 'hello') = 'mock:hello' as native_completion_ok;
+select ai_embed('ollama_embedding', 'abc') = '[3, 4, 5, 6]' as native_embedding_ok;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ollama_completion_ep', '{"url":"http://127.0.0.1:19128/options/generate","provider":"ollama"}');
+select ai_complete('ollama_completion', 'hello', json_object('temperature', 0.7, 'max_tokens', 23, 'stream', true)) = 'mock:hello' as native_options_ok;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ollama_completion_ep', '{"url":"http://127.0.0.1:19128/valid/completions","provider":"openai","access_key":"key"}');
+select ai_complete('ollama_completion', 'hello') = 'mock:hello' as changed_provider_ok;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ollama_completion_ep', '{"url":"http://127.0.0.1:19128/api/generate","provider":"OLLAMA","access_key":""}');
+select ai_complete('ollama_completion', 'hello') = 'mock:hello' as changed_back_ok;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ollama_completion_ep', '{"url":"http://127.0.0.1:19128/empty/generate"}');
+--error 4070
+select ai_complete('ollama_completion', 'hello');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('ollama_completion_ep', '{"url":"http://127.0.0.1:19128/null/generate"}');
+--error 4070
+select ai_complete('ollama_completion', 'hello');
+--disable_query_log
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ollama_completion_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ollama_embedding_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ollama_completion');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ollama_embedding');
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py stop 19128
+--enable_query_log

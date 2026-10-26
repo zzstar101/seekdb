@@ -41,6 +41,28 @@ def serve(port):
                     response = {'choices': [{'message': {'content': value}}]}
                     if case == 'missing':
                         response = {'choices': []}
+                elif self.path.endswith('/generate'):
+                    assert self.headers.get('Authorization') is None
+                    assert self.headers.get('Content-Type') == 'application/json'
+                    assert isinstance(body['model'], str) and body['model']
+                    assert body['stream'] is False
+                    assert isinstance(body['prompt'], str)
+                    if case == 'options':
+                        assert body['options']['temperature'] == 0.7
+                        assert body['options']['num_predict'] == 23
+                        assert 'temperature' not in body and 'max_tokens' not in body
+                    response = {'response': 'mock:' + body['prompt'], 'done': True}
+                    if case == 'empty':
+                        response['response'] = ''
+                    elif case == 'null':
+                        response['response'] = None
+                elif self.path.endswith('/embed'):
+                    assert self.headers.get('Authorization') is None
+                    assert self.headers.get('Content-Type') == 'application/json'
+                    assert isinstance(body['model'], str) and body['model']
+                    assert isinstance(body['input'], list) and body['input']
+                    response = {'embeddings': [[len(value) + j for j in range(4)]
+                                               for value in body['input']]}
                 elif self.path.endswith('/embeddings'):
                     assert isinstance(body['model'], str) and body['model']
                     assert self.headers.get('Authorization', '').startswith('Bearer ')
