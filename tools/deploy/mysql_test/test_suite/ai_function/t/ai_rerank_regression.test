@@ -1,0 +1,58 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py start 19130
+--disable_query_log
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('rerank_reg_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('rerank_reg');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('rerank_reg', '{"type":"rerank","model_name":"ranking-model"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"ai_model_name":"rerank_reg","url":"http://127.0.0.1:19130/valid/rerank","provider":"siliconflow","access_key":"test-key"}');
+--enable_query_log
+# Scores by text length mod 5; reverse wire order must not affect ties.
+set @rank = ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]');
+select json_extract(@rank, '$[*].index') as ranked_indices;
+--let $indices = `select cast(json_extract(@rank, '$[*].index') as char) = '[0, 2, 3, 1]'`
+if (!$indices)
+{
+  --die rerank must sort scores descending and ties by original index
+}
+select ai_rerank('rerank_reg', 'query', '[{"id":"first", "text":"aaaa"},{"id":72,"text":"b"},{"id":"last","text":"cccc"}]', 'text') as ranked_objects;
+--disable_query_log
+set @strings = json_array();
+set @objects = json_array();
+--let $i = 0
+while ($i < 47)
+{
+  eval set @strings = json_array_append(@strings, '$', repeat('x', 1 + $i % 7));
+  eval set @objects = json_array_append(@objects, '$', json_object('id', 100 + $i, 'body', repeat('x', 1 + $i % 7)));
+  --inc $i
+}
+--enable_query_log
+set @rank = ai_rerank('rerank_reg', 'query', @strings);
+select json_length(@rank) as count, json_extract(@rank, '$[*].index') as ranked_indices;
+set @rank = ai_rerank('rerank_reg', 'query', @objects, 'body');
+select json_length(@rank) as count, json_extract(@rank, '$[*].id') as original_ids;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"provider":"aliyun-dashscope"}');
+set @rank = ai_rerank('rerank_reg', 'query', @strings);
+select json_length(@rank) as count, json_extract(@rank, '$[*].index') as ranked_indices;
+--let $case = duplicate-index
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = invalid-index
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = fractional-index
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = string-score
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = null-score
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = truncated
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = wrong-shape
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--let $case = wrong-entry
+--source mysql_test/test_suite/ai_function/include/ai_rerank_invalid.inc
+--disable_query_log
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('rerank_reg_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('rerank_reg');
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py stop 19130
+--enable_query_log

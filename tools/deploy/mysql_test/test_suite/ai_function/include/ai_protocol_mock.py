@@ -102,6 +102,36 @@ def serve(port):
                     elif case == 'fail-selected':
                         assert 'trigger failure' not in inputs, 'injected later-batch failure'
                     response = {'data': list(reversed(data)) if isinstance(data, list) else data}
+                elif self.path.endswith('/rerank'):
+                    assert isinstance(body['model'], str) and body['model']
+                    assert self.headers.get('Authorization', '').startswith('Bearer ')
+                    request = body.get('input', body)
+                    assert isinstance(request['query'], str)
+                    documents = request['documents']
+                    assert 0 < len(documents) <= 20, 'rerank batch exceeds limit'
+                    assert all(isinstance(doc, str) for doc in documents)
+                    results = [{'index': i, 'relevance_score': len(doc) % 5}
+                               for i, doc in enumerate(documents)]
+                    results.reverse()  # Neither score sorted nor stable for ties.
+                    if case == 'duplicate-index':
+                        results[0]['index'] = results[1]['index']
+                    elif case == 'invalid-index':
+                        results[0]['index'] = len(documents)
+                    elif case == 'fractional-index':
+                        results[0]['index'] = 0.5
+                    elif case == 'string-score':
+                        results[0]['relevance_score'] = '0.5'
+                    elif case == 'null-score':
+                        results[0]['relevance_score'] = None
+                    elif case == 'truncated':
+                        results = results[:-1]
+                    elif case == 'wrong-shape':
+                        results = {}
+                    elif case == 'wrong-entry':
+                        results[0] = []
+                    response = {'results': results}
+                    if 'input' in body:
+                        response = {'output': response}
                 else:
                     raise AssertionError('unrecognized protocol URL')
                 payload = json.dumps(response, ensure_ascii=False).encode()

@@ -1,0 +1,44 @@
+set @rank = ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]');
+select json_extract(@rank, '$[*].index') as ranked_indices;
+ranked_indices
+[0, 2, 3, 1]
+select ai_rerank('rerank_reg', 'query', '[{"id":"first", "text":"aaaa"},{"id":72,"text":"b"},{"id":"last","text":"cccc"}]', 'text') as ranked_objects;
+ranked_objects
+[{"id": "first", "text": "aaaa", "_model_score": 4.0}, {"id": "last", "text": "cccc", "_model_score": 4.0}, {"id": 72, "text": "b", "_model_score": 1.0}]
+set @rank = ai_rerank('rerank_reg', 'query', @strings);
+select json_length(@rank) as count, json_extract(@rank, '$[*].index') as ranked_indices;
+count	ranked_indices
+47	[3, 10, 17, 24, 31, 38, 45, 2, 9, 16, 23, 30, 37, 44, 1, 6, 8, 13, 15, 20, 22, 27, 29, 34, 36, 41, 43, 0, 5, 7, 12, 14, 19, 21, 26, 28, 33, 35, 40, 42, 4, 11, 18, 25, 32, 39, 46]
+set @rank = ai_rerank('rerank_reg', 'query', @objects, 'body');
+select json_length(@rank) as count, json_extract(@rank, '$[*].id') as original_ids;
+count	original_ids
+47	[103, 110, 117, 124, 131, 138, 145, 102, 109, 116, 123, 130, 137, 144, 101, 106, 108, 113, 115, 120, 122, 127, 129, 134, 136, 141, 143, 100, 105, 107, 112, 114, 119, 121, 126, 128, 133, 135, 140, 142, 104, 111, 118, 125, 132, 139, 146]
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"provider":"aliyun-dashscope"}');
+set @rank = ai_rerank('rerank_reg', 'query', @strings);
+select json_length(@rank) as count, json_extract(@rank, '$[*].index') as ranked_indices;
+count	ranked_indices
+47	[3, 10, 17, 24, 31, 38, 45, 2, 9, 16, 23, 30, 37, 44, 1, 6, 8, 13, 15, 20, 22, 27, 29, 34, 36, 41, 43, 0, 5, 7, 12, 14, 19, 21, 26, 28, 33, 35, 40, 42, 4, 11, 18, 25, 32, 39, 46]
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/duplicate-index/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [{"index": 1, "relevance_score": 3}, {"index": 1, "relevance_score": 2}, {"index": 0, "relevance_score": 1}]}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/invalid-index/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [{"index": 3, "relevance_score": 3}, {"index": 1, "relevance_score": 2}, {"index": 0, "relevance_score": 1}]}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/fractional-index/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [{"index": 0.5, "relevance_score": 3}, {"index": 1, "relevance_score": 2}, {"index": 0, "relevance_score": 1}]}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/string-score/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [{"index": 2, "relevance_score": "0.5"}, {"index": 1, "relevance_score": 2}, {"index": 0, "relevance_score": 1}]}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/null-score/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [{"index": 2, "relevance_score": null}, {"index": 1, "relevance_score": 2}, {"index": 0, "relevance_score": 1}]}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/truncated/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [{"index": 2, "relevance_score": 3}, {"index": 1, "relevance_score": 2}]}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/wrong-shape/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": {}}}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('rerank_reg_ep', '{"url":"http://127.0.0.1:19130/wrong-entry/rerank"}');
+select ai_rerank('rerank_reg', 'query', '["a", "bb", "ccc"]');
+ERROR HY000: unexpected http message: {"output": {"results": [[], {"index": 1, "relevance_score": 2}, {"index": 0, "relevance_score": 1}]}}
