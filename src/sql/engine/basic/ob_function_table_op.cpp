@@ -19,6 +19,9 @@
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "common/timezone/ob_time_convert.h"
+#include <charconv>
+#include <cmath>
 
 
 namespace oceanbase
@@ -27,7 +30,8 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_,
+                    is_file_scan_, file_column_ids_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -36,6 +40,9 @@ int ObFunctionTableOp::inner_open()
   already_calc_ = false;
   if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (MY_SPEC.is_file_scan_) {
+    next_row_func_ = &ObFunctionTableOp::inner_get_next_row_file;
+    ret = open_file_scan();
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -48,6 +55,9 @@ int ObFunctionTableOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObOperator::inner_rescan())) {
+  } else if (MY_SPEC.is_file_scan_) {
+    ret = file_reader_ == nullptr ? OB_NOT_INIT
+        : file_sql::sql_error(file_reader_->rescan(), file_reader_->error());
   } else {
     node_idx_ = 0;
     if (MY_SPEC.has_correlated_expr_) {
@@ -63,6 +73,7 @@ int ObFunctionTableOp::inner_rescan()
 int ObFunctionTableOp::inner_close()
 {
   int ret = OB_SUCCESS;
+  if (file_reader_ != nullptr) file_reader_->close();
   node_idx_ = 0;
   row_count_ = 0;
   col_count_ = 0;
@@ -72,9 +83,111 @@ int ObFunctionTableOp::inner_close()
 
 void ObFunctionTableOp::destroy()
 {
+  if (file_reader_ != nullptr) {
+    file_reader_->~CsvReader();
+    ctx_.get_allocator().free(file_reader_);
+    file_reader_ = nullptr;
+  }
   ObOperator::destroy();
 }
 
+
+int ObFunctionTableOp::open_file_scan()
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  ObDatum *datum = nullptr;
+  ObString secure_root, root_copy;
+  file_sql::FileScanDefinition definition;
+  if (OB_ISNULL(session)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "File SQL without enable_file_sql");
+  } else if (OB_FAIL(ctx_.check_status())) {
+  } else if (OB_FAIL(session->get_secure_file_priv(secure_root))) {
+  } else if (OB_FAIL(ob_write_string(ctx_.get_allocator(), secure_root, root_copy, true))) {
+  } else if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, datum))) {
+  } else if (datum == nullptr || datum->is_null()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(definition.decode(datum->get_string()))) {
+  } else {
+    if (file_reader_ == nullptr) {
+      void *storage = ctx_.get_allocator().alloc(sizeof(file_sql::CsvReader));
+      if (storage == nullptr) ret = OB_ALLOCATE_MEMORY_FAILED;
+      else file_reader_ = new (storage) file_sql::CsvReader();
+    }
+    OZ (definition.open_csv(ctx_.get_allocator(), *file_reader_, root_copy.ptr()));
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::inner_get_next_row_file()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  if (file_reader_ == nullptr || MY_SPEC.column_exprs_.count() != MY_SPEC.file_column_ids_.count()) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ctx_.check_status())) {
+  } else if (OB_FAIL(file_sql::sql_error(file_reader_->next(), file_reader_->error()))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+      const int64_t column = MY_SPEC.file_column_ids_.at(i);
+      ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+      if (column < 0 || column >= file_reader_->column_count() || expr == nullptr) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ObDatum &out = expr->locate_datum_for_write(eval_ctx_);
+        if (file_reader_->is_null(column)) {
+          out.set_null();
+        } else {
+          auto text = file_reader_->value(column);
+          const ObString str(text.size(), text.data());
+          switch (file_reader_->column(column).type) {
+            case file_sql::Type::BigInt: {
+              if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+              int64_t value = 0;
+              auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+              if (result.ec != std::errc() || result.ptr != text.data() + text.size()) ret = OB_INVALID_ARGUMENT;
+              else out.set_int(value);
+              break;
+            }
+            case file_sql::Type::Double: {
+              if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+              double value = 0;
+              auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+              if (result.ec != std::errc() || result.ptr != text.data() + text.size() || !std::isfinite(value)) ret = OB_INVALID_ARGUMENT;
+              else out.set_double(value);
+              break;
+            }
+            case file_sql::Type::Boolean:
+              out.set_int(str.case_compare("true") == 0 ? 1 : 0);
+              break;
+            case file_sql::Type::Date: {
+              int32_t value = 0;
+              OZ (ObTimeConverter::str_to_date(str, value));
+              if (OB_SUCC(ret)) out.set_date(value);
+              break;
+            }
+            case file_sql::Type::DateTime: {
+              int64_t value = 0;
+              const ObTimeConvertCtx convert(nullptr, false);
+              OZ (ObTimeConverter::str_to_datetime(str, convert, value));
+              if (OB_SUCC(ret)) out.set_datetime(value);
+              break;
+            }
+            case file_sql::Type::Varchar: out.set_string(str); break;
+            case file_sql::Type::Null: out.set_null(); break;
+          }
+        }
+        if (OB_SUCC(ret)) expr->set_evaluated_projected(eval_ctx_);
+      }
+    }
+  }
+  return ret;
+}
 
 int ObFunctionTableOp::get_current_result(ObObj &result)
 {

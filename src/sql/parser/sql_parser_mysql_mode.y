@@ -10874,6 +10874,8 @@ NAME_OB '(' file_table_arguments ')' file_table_alias
   ParseNode *func = NULL;
   merge_nodes(args, result, T_EXPR_LIST, $3);
   malloc_non_terminal_node(func, result->malloc_pool_, T_FUN_SYS, 2, $1, args);
+  /* These literals determine the relation's schema, not per-row values. */
+  func->is_tree_not_param_ = true;
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, func, $5);
 }
 ;

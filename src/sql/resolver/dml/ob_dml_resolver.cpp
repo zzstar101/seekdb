@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "ob_dml_resolver.h"
+#include "sql/engine/basic/file_sql_scan.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
@@ -3923,6 +3924,144 @@ int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableIte
   return ret;
 }
 
+int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode &function = *node.children_[0];
+  const ParseNode &name = *function.children_[0];
+  const ParseNode *args = function.children_[1];
+  const ObString function_name(name.str_len_, name.str_value_);
+  file_sql::FileScanDefinition definition;
+  file_sql::CsvOptions options;
+  options.enabled = true;
+  ObString secure_root, root_copy, encoded;
+  ObConstRawExpr *definition_expr = nullptr;
+  ObDMLStmt *stmt = get_stmt();
+  if (function_name.case_compare("read_csv") != 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file format");
+  } else if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(args) || args->num_child_ < 1
+             || OB_ISNULL(args->children_[0]) || args->children_[0]->type_ != T_VARCHAR) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  ObSEArray<ObString, 8> seen;
+  for (int64_t i = 1; OB_SUCC(ret) && i < args->num_child_; ++i) {
+    const ParseNode *option = args->children_[i];
+    if (option == nullptr || option->type_ != T_ASSIGN_ITEM || option->num_child_ != 2
+        || option->children_[0] == nullptr || option->children_[1] == nullptr) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const ParseNode &key = *option->children_[0], &value = *option->children_[1];
+      ObString key_name(key.str_len_, key.str_value_);
+      for (int64_t j = 0; OB_SUCC(ret) && j < seen.count(); ++j) {
+        if (key_name.case_compare(seen.at(j)) == 0) ret = OB_INVALID_ARGUMENT;
+      }
+      OZ (seen.push_back(key_name));
+      if (OB_FAIL(ret)) {
+      } else if (key_name.case_compare("header") == 0 || key_name.case_compare("empty_is_null") == 0) {
+        if ((value.type_ != T_BOOL && value.type_ != T_INT) || (value.value_ != 0 && value.value_ != 1)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (key_name.case_compare("header") == 0) {
+          options.header = value.value_ != 0;
+        } else {
+          options.empty_is_null = value.value_ != 0;
+        }
+      } else if (key_name.case_compare("sample_size") == 0) {
+        if (value.type_ != T_INT || value.value_ != -1) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size other than -1");
+        }
+      } else if (key_name.case_compare("delimiter") == 0 || key_name.case_compare("delim") == 0
+                 || key_name.case_compare("quote") == 0 || key_name.case_compare("escape") == 0) {
+        if (value.type_ != T_VARCHAR || value.str_len_ != 1) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (key_name.case_compare("quote") == 0) {
+          options.quote = value.str_value_[0];
+        } else if (key_name.case_compare("escape") == 0) {
+          options.escape = value.str_value_[0];
+        } else {
+          options.delimiter = value.str_value_[0];
+        }
+      } else if (key_name.case_compare("nullstr") == 0 || key_name.case_compare("null") == 0) {
+        if (value.type_ != T_VARCHAR) ret = OB_INVALID_ARGUMENT;
+        else options.null_text = std::string_view(value.str_value_, value.str_len_);
+      } else {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "unknown file scan option");
+      }
+    }
+  }
+  OZ (session_info_->get_secure_file_priv(secure_root));
+  OZ (ob_write_string(*allocator_, secure_root, root_copy, true));
+  if (OB_SUCC(ret)) {
+    const ParseNode &path = *args->children_[0];
+    OZ (definition.infer_csv(*allocator_, ObString(path.str_len_, path.str_value_), root_copy.ptr(), options));
+  }
+  OZ (definition.encode(*allocator_, encoded));
+  OZ (params_.expr_factory_->create_raw_expr(T_VARCHAR, definition_expr));
+  if (OB_SUCC(ret)) {
+    ObObj value;
+    value.set_varchar(encoded);
+    value.set_collation_type(CS_TYPE_BINARY);
+    definition_expr->set_value(value);
+    OZ (definition_expr->formalize(session_info_));
+    if (OB_SUCC(ret) && OB_ISNULL(table_item = stmt->create_table_item(*allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObString alias;
+    if (node.children_[1] != nullptr) {
+      alias.assign_ptr(node.children_[1]->str_value_, node.children_[1]->str_len_);
+    } else {
+      OZ (stmt->generate_func_table_name(*allocator_, alias));
+    }
+    table_item->table_name_ = alias;
+    table_item->alias_name_ = alias;
+    table_item->table_id_ = generate_table_id();
+    table_item->type_ = TableItem::FUNCTION_TABLE;
+    table_item->is_file_table_ = true;
+    table_item->function_table_expr_ = definition_expr;
+    // The inferred schema and file identity belong to this statement. A later
+    // statement must infer again, not reuse a cached descriptor for an old file.
+    ObQueryHint &query_hint = stmt->get_query_ctx()->get_query_hint_for_update();
+    query_hint.get_global_hint().merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+    OZ (stmt->add_table_item(session_info_, table_item));
+    ObSEArray<ColumnItem, 16> columns;
+    OZ (resolve_file_table_columns(*table_item, columns));
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_table_columns(const TableItem &table_item, ObIArray<ColumnItem> &col_items)
+{
+  int ret = OB_SUCCESS;
+  file_sql::FileScanDefinition definition;
+  if (table_item.function_table_expr_ == nullptr || !table_item.function_table_expr_->is_const_expr()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const ObObj &value = static_cast<const ObConstRawExpr *>(table_item.function_table_expr_)->get_value();
+    OZ (definition.decode(value.get_string()));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < definition.columns_.count(); ++i) {
+    const file_sql::FileColumn &col = definition.columns_.at(i);
+    ColumnItem *item = get_stmt()->get_column_item(table_item.table_id_, col.name_);
+    if (item == nullptr) {
+      ObObjMeta meta;
+      meta.set_type(col.sql_type());
+      meta.set_collation_type(meta.is_string_type() ? CS_TYPE_UTF8MB4_BIN : CS_TYPE_BINARY);
+      meta.set_collation_level(meta.is_string_type() ? CS_LEVEL_IMPLICIT : CS_LEVEL_NUMERIC);
+      ObAccuracy accuracy = ObAccuracy(PRECISION_UNKNOWN_YET, SCALE_UNKNOWN_YET);
+      if (meta.is_string_type()) accuracy.set_length(MAX(1, col.max_bytes_));
+      if (meta.is_datetime()) accuracy.set_scale(6);
+      OZ (resolve_function_table_column_item(table_item, meta, accuracy, col.name_, OB_APP_MIN_COLUMN_ID + i, item));
+    }
+    CK (OB_NOT_NULL(item));
+    OZ (col_items.push_back(*item));
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
                                                TableItem *&tbl_item)
 {
@@ -3949,9 +4088,11 @@ int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
         ret = OB_NOT_INIT;
       } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
         LOG_WARN("failed to read file SQL feature gate", K(ret));
-      } else {
+      } else if (!enabled) {
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, enabled ? "File table execution" : "File SQL without enable_file_sql");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "File SQL without enable_file_sql");
+      } else {
+        ret = resolve_file_table_item(parse_tree, tbl_item);
       }
       return ret;
     }
@@ -7499,7 +7640,9 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_item.function_table_expr_));
   if (OB_SUCC(ret)) {
-    if (table_item.function_table_expr_->get_result_type().is_ext()) {
+    if (table_item.is_file_table_) {
+      ret = resolve_file_table_columns(table_item, col_items);
+    } else if (table_item.function_table_expr_->get_result_type().is_ext()) {
       ret = resolve_function_table_column_item_udf(table_item, col_items);
     } else {
       ret = resolve_function_table_column_item_sys_func(table_item, col_items);

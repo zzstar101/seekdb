@@ -1,0 +1,22 @@
+SET SESSION enable_file_sql = ON;
+SELECT id, name, score, active, day, created, IF(note = '', '<EMPTY>', REPLACE(note, CHAR(10), '<NL>')) AS note FROM read_csv('CSV_FILE') f ORDER BY id;
+id	name	score	active	day	created	note
+1	alpha	1.5	1	2026-01-02	2026-01-02 03:04:05.000000	first<NL>line
+2	世界	2.5	0	2026-02-28	2026-02-28 00:00:00.000000	NULL
+3	gamma	NULL	1	2026-03-01	2026-03-01 12:30:00.000000	<EMPTY>
+SELECT COUNT(*) AS n, SUM(id) AS total FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv');
+n	total
+3	6
+SELECT name FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') WHERE id > 1 ORDER BY id DESC LIMIT 1;
+name
+gamma
+SELECT active, COUNT(*) AS n, SUM(id) AS total FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') GROUP BY active HAVING SUM(id) > 1 ORDER BY active;
+active	n	total
+0	1	2
+1	2	4
+SELECT a.id, b.name FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') a LEFT JOIN read_csv('/tmp/seekdb-file-sql-csv-regression.csv') b ON a.id + 1 = b.id ORDER BY a.id;
+id	name
+1	世界
+2	gamma
+3	NULL
+SET SESSION enable_file_sql = OFF;

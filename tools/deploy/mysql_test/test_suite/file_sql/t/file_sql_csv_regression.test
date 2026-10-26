@@ -1,0 +1,20 @@
+# Native seekdb CSV scans: metadata, projections, aggregation and rescanning joins.
+--disable_query_log
+let $csv_root = `SELECT @@global.secure_file_priv`;
+--enable_query_log
+SET SESSION enable_file_sql = ON;
+--write_file /tmp/seekdb-file-sql-csv-regression.csv
+id,name,score,active,day,created,note
+1,alpha,1.5,true,2026-01-02,2026-01-02 03:04:05,"first
+line"
+2,世界,2.5,false,2026-02-28,2026-02-28 00:00:00,NULL
+3,gamma,NULL,true,2026-03-01,2026-03-01 12:30:00,""
+EOF
+--replace_result /tmp/seekdb-file-sql-csv-regression.csv CSV_FILE
+SELECT id, name, score, active, day, created, IF(note = '', '<EMPTY>', REPLACE(note, CHAR(10), '<NL>')) AS note FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') f ORDER BY id;
+SELECT COUNT(*) AS n, SUM(id) AS total FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv');
+SELECT name FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') WHERE id > 1 ORDER BY id DESC LIMIT 1;
+SELECT active, COUNT(*) AS n, SUM(id) AS total FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') GROUP BY active HAVING SUM(id) > 1 ORDER BY active;
+SELECT a.id, b.name FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv') a LEFT JOIN read_csv('/tmp/seekdb-file-sql-csv-regression.csv') b ON a.id + 1 = b.id ORDER BY a.id;
+SET SESSION enable_file_sql = OFF;
+--remove_file /tmp/seekdb-file-sql-csv-regression.csv
