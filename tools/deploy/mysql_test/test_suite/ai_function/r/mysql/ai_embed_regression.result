@@ -1,0 +1,50 @@
+select ai_embed('embed_regression', 'abc') = '[3, 4, 5, 6]' as default_dimension_ok;
+default_dimension_ok
+1
+select ai_embed('embed_regression', 'abc', 2) = '[3, 4]' as explicit_dimension_ok;
+explicit_dimension_ok
+1
+select ai_embed('embed_regression', null) is null as null_input_ok;
+null_input_ok
+1
+select ai_embed('embed_regression', 'abc', 0);
+ERROR HY000: Incorrect arguments to ai_embed, dimension parameter must be a positive integer
+select ai_embed('embed_regression', 'abc', -1);
+ERROR HY000: Incorrect arguments to ai_embed, dimension parameter must be a positive integer
+select ai_embed('embed_regression', 'abc', 1.5);
+ERROR HY000: Incorrect arguments to ai_embed, dimension parameter must be an integer, not a decimal or float
+select ai_embed('embed_regression', 'abc', null);
+ERROR HY000: Incorrect arguments to ai_embed, dimension parameter must be an integer, not a decimal or float
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/wrong-dimension/embeddings"}');
+select ai_embed('embed_regression', 'abc', 2);
+ERROR HY000: Incorrect arguments to ai_embed, result dimension is not equal to dimension
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/string-element/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": ["1", 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/null-element/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": [null, 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/bool-element/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": [true, 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/overflow-element/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": [1e300, 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/empty-vector/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": []}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/invalid-index/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 1, "embedding": [3, 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/missing-index/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"embedding": [3, 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/duplicate-index/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": [3, 4, 5, 6]}, {"index": 0, "embedding": [3, 4, 5, 6]}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/empty-data/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": []}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/wrong-shape/embeddings"}');
+select ai_embed('embed_regression', 'abc');
+ERROR HY000: unexpected http message: {"data": {}}

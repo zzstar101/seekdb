@@ -41,6 +41,39 @@ def serve(port):
                     response = {'choices': [{'message': {'content': value}}]}
                     if case == 'missing':
                         response = {'choices': []}
+                elif self.path.endswith('/embeddings'):
+                    assert isinstance(body['model'], str) and body['model']
+                    assert self.headers.get('Authorization', '').startswith('Bearer ')
+                    inputs = body['input']
+                    assert isinstance(inputs, list) and inputs
+                    assert all(isinstance(value, str) for value in inputs)
+                    dim = body.get('dimensions', 4)
+                    assert isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
+                    data = [{'index': i, 'embedding': [len(value) + j for j in range(dim)]}
+                            for i, value in enumerate(inputs)]
+                    if case == 'wrong-dimension':
+                        data[0]['embedding'].append(0)
+                    elif case == 'string-element':
+                        data[0]['embedding'][0] = '1'
+                    elif case == 'null-element':
+                        data[0]['embedding'][0] = None
+                    elif case == 'bool-element':
+                        data[0]['embedding'][0] = True
+                    elif case == 'overflow-element':
+                        data[0]['embedding'][0] = 1e300
+                    elif case == 'empty-vector':
+                        data[0]['embedding'] = []
+                    elif case == 'missing-index':
+                        del data[0]['index']
+                    elif case == 'invalid-index':
+                        data[0]['index'] = len(data)
+                    elif case == 'empty-data':
+                        data = []
+                    elif case == 'duplicate-index':
+                        data.append(data[0])
+                    elif case == 'wrong-shape':
+                        data = {}
+                    response = {'data': list(reversed(data)) if isinstance(data, list) else data}
                 else:
                     raise AssertionError('unrecognized protocol URL')
                 payload = json.dumps(response, ensure_ascii=False).encode()

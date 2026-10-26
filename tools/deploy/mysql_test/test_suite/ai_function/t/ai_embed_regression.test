@@ -1,0 +1,59 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py start 19127
+--disable_query_log
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('embed_regression_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('embed_regression');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('embed_regression', '{"type":"dense_embedding","model_name":"arbitrary-embed-model"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('embed_regression_ep', '{"ai_model_name":"embed_regression","url":"http://127.0.0.1:19127/valid/embeddings","access_key":"test-key","provider":"openai"}');
+--enable_query_log
+select ai_embed('embed_regression', 'abc') = '[3, 4, 5, 6]' as default_dimension_ok;
+select ai_embed('embed_regression', 'abc', 2) = '[3, 4]' as explicit_dimension_ok;
+select ai_embed('embed_regression', null) is null as null_input_ok;
+--error 1210
+select ai_embed('embed_regression', 'abc', 0);
+--error 1210
+select ai_embed('embed_regression', 'abc', -1);
+--error 1210
+select ai_embed('embed_regression', 'abc', 1.5);
+--error 1210
+select ai_embed('embed_regression', 'abc', null);
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/wrong-dimension/embeddings"}');
+--error 1210
+select ai_embed('embed_regression', 'abc', 2);
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/string-element/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/null-element/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/bool-element/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/overflow-element/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/empty-vector/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/invalid-index/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/missing-index/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/duplicate-index/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/empty-data/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_regression_ep', '{"url":"http://127.0.0.1:19127/wrong-shape/embeddings"}');
+--error 4070
+select ai_embed('embed_regression', 'abc');
+--disable_query_log
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('embed_regression_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('embed_regression');
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py stop 19127
+--enable_query_log
