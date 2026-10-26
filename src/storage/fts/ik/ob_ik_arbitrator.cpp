@@ -39,8 +39,7 @@ int ObIKArbitrator::process(TokenizeContext &ctx)
   ObList<ObIKToken, ObIAllocator> &tokens = ctx.token_list().tokens();
   ObIKTokenChain *chain_need_arbitrate = nullptr;
   bool use_smart = ctx.is_smart();
-  if (OB_FAIL(prepare(ctx))) {
-  } else if (OB_ISNULL(chain_need_arbitrate = OB_NEWx(ObIKTokenChain, &alloc_, alloc_))) {
+  if (OB_ISNULL(chain_need_arbitrate = OB_NEWx(ObIKTokenChain, &alloc_, alloc_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc memory failed");
   } else {
@@ -112,25 +111,79 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
   int ret = OB_SUCCESS;
 
   int64_t char_len = 0;
+  ob_wc_t unicode = 0;
+  ObFTCharUtil::CharType gap_type = ObFTCharUtil::CharType::USELESS;
   ObIKTokenChain *chain = nullptr;
+  // The chains are sorted by min offset, walk them together with the char cursor so that the
+  // chain of the current position is found without hashing the offset for every char.
+  int64_t chain_idx = 0;
+  const int64_t chain_cnt = ordered_chains_.size();
   for (int64_t current = 0; OB_SUCC(ret) && current < ctx.fulltext_len();) {
-    ObFTCharUtil::CharType type;
+    ObFTCharUtil::CharType type = ObFTCharUtil::CharType::USELESS;
     // maybe not so good to keep single, check it later
-    if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
-                                            ctx.fulltext() + current,
-                                            ctx.fulltext_len() - current,
-                                            char_len))) {
-    } else if (OB_FAIL(ObFTCharUtil::classify_first_char(ctx.collation(),
-                                                         ctx.fulltext() + current,
-                                                         char_len,
-                                                         type))) {
+    if (OB_FAIL(ObFTCharUtil::decode_and_classify(ctx.collation(),
+                                                  ctx.fulltext() + current,
+                                                  ctx.fulltext_len() - current,
+                                                  char_len,
+                                                  unicode,
+                                                  type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
-    } else if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
-      if (!keep_single()) {
+    } else {
+      while (chain_idx < chain_cnt && ordered_chains_[chain_idx]->min_offset() < current) {
+        chain_idx++;
+      }
+      if (chain_idx < chain_cnt && ordered_chains_[chain_idx]->min_offset() == current) {
+        chain = ordered_chains_[chain_idx];
+        chain_idx++;
+        for (ObList<ObIKToken, ObIAllocator>::const_iterator iter = chain->list().tokens().begin();
+             OB_SUCC(ret) && iter != chain->list().tokens().end();
+             iter++) {
+          const ObIKToken &token = *iter;
+          if (!keep_single()) {
+            current = token.offset_;
+          } else {
+            // output single word between two token
+            while (OB_SUCC(ret) && current < token.offset_) {
+              if (OB_FAIL(ObFTCharUtil::decode_and_classify(ctx.collation(),
+                                                            ctx.fulltext() + current,
+                                                            ctx.fulltext_len() - current,
+                                                            char_len,
+                                                            unicode,
+                                                            gap_type))) {
+                break;
+              } else {
+                ObIKToken token;
+                token.offset_ = current;
+                token.length_ = char_len;
+                token.ptr_ = ctx.fulltext();
+                token.char_cnt_ = 1;
+                bool is_ignore = false;
+                if (ObFTCharUtil::CharType::CHINESE == type) {
+                  token.type_ = ObIKTokenType::IK_CHINESE_TOKEN;
+                  ctx.result_list().push_back(token);
+                } else if (ObFTCharUtil::CharType::OTHER_CJK == type) {
+                  if (OB_FAIL(ObFTCharUtil::is_ignore_single_cjk(unicode, is_ignore))) {
+                  } else if (!is_ignore) {
+                    token.type_ = ObIKTokenType::IK_OTHER_CJK_TOKEN;
+                    ctx.result_list().push_back(token);
+                  } else {
+                  }
+                }
+                current += char_len;
+              }
+            }
+          }
+
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(ctx.result_list().push_back(token))) {
+          } else
+            // output the token
+            current = token.offset_ + token.length_;
+        }
+      } else if (!keep_single()) {
         // skip single word
+        current += char_len;
       } else {
         // output single word
         ObIKToken token;
@@ -144,64 +197,14 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
           if (OB_FAIL(ctx.result_list().push_back(token))) {
           }
         } else if (ObFTCharUtil::CharType::OTHER_CJK == type) {
-          if (OB_FAIL(ObFTCharUtil::is_ignore_single_cjk(ctx.collation(),
-                                                         ctx.fulltext() + current,
-                                                         char_len,
-                                                         is_ignore))) {
+          if (OB_FAIL(ObFTCharUtil::is_ignore_single_cjk(unicode, is_ignore))) {
           } else if (!is_ignore && !FALSE_IT(token.type_ = ObIKTokenType::IK_OTHER_CJK_TOKEN)
                      && OB_FAIL(ctx.result_list().push_back(token))) {
           } else {
             // ignore
           }
         }
-      }
-      current += char_len;
-    } else {
-      for (ObList<ObIKToken, ObIAllocator>::const_iterator iter = chain->list().tokens().begin();
-           OB_SUCC(ret) && iter != chain->list().tokens().end();
-           iter++) {
-        const ObIKToken &token = *iter;
-        if (!keep_single()) {
-          current = token.offset_;
-        } else {
-          // output single word between two token
-          while (OB_SUCC(ret) && current < token.offset_) {
-            if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
-                                                    ctx.fulltext() + current,
-                                                    ctx.fulltext_len() - current,
-                                                    char_len))) {
-              break;
-            } else {
-              ObIKToken token;
-              token.offset_ = current;
-              token.length_ = char_len;
-              token.ptr_ = ctx.fulltext();
-              token.char_cnt_ = 1;
-              bool is_ignore = false;
-              if (ObFTCharUtil::CharType::CHINESE == type) {
-                token.type_ = ObIKTokenType::IK_CHINESE_TOKEN;
-                ctx.result_list().push_back(token);
-              } else if (ObFTCharUtil::CharType::OTHER_CJK == type) {
-                if (OB_FAIL(ObFTCharUtil::is_ignore_single_cjk(ctx.collation(),
-                                                               ctx.fulltext() + current,
-                                                               char_len,
-                                                               is_ignore))) {
-                } else if (!is_ignore) {
-                  token.type_ = ObIKTokenType::IK_OTHER_CJK_TOKEN;
-                  ctx.result_list().push_back(token);
-                } else {
-                }
-              }
-              current += char_len;
-            }
-          }
-        }
-
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(ctx.result_list().push_back(token))) {
-        } else
-          // output the token
-          current = token.offset_ + token.length_;
+        current += char_len;
       }
     }
     if (OB_FAIL(ret)) {
@@ -298,18 +301,10 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
   return ret;
 }
 
-int ObIKArbitrator::prepare(TokenizeContext &ctx)
+ObIKArbitrator::ObIKArbitrator()
+    : alloc_(lib::ObMemAttr("IK Arbitrator")), ordered_chains_(&alloc_)
 {
-  int ret = OB_SUCCESS;
-
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
-  }
-  return ret;
 }
-
-ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
 
 int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
 {
@@ -318,14 +313,14 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
     ret = OB_INVALID_ARGUMENT;
   } else if (chain->list().is_empty()) {
     // no need to add empty chain
-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
+  } else if (OB_FAIL(ordered_chains_.push_back(chain))) {
   }
   return ret;
 }
 
 ObIKArbitrator::~ObIKArbitrator()
 {
-  chains_.destroy();
+  ordered_chains_.reset();
   alloc_.reset();
 }
 } // namespace storage

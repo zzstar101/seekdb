@@ -78,7 +78,11 @@ public:
 
   int init();
   void destroy();
-  int check_stopword(const ObFTWord &word, bool &is_stopword);
+  // The allocator is only used when the charset conversion of the word needs a buffer,
+  // passing the caller's allocator avoids constructing a temporary arena for every word.
+  int check_stopword(const ObFTWord &word,
+                     common::ObIAllocator &allocator,
+                     bool &is_stopword);
 
 private:
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;

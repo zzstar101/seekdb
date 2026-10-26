@@ -31,29 +31,14 @@ namespace oceanbase
 {
 namespace storage
 {
-int ObIIKProcessor::process(TokenizeContext &ctx)
-{
-  int ret = OB_SUCCESS;
-
-  ObFTCharUtil::CharType type;
-  const char *ch = nullptr;
-  uint8_t char_len = 0;
-
-  if (OB_FAIL(ctx.current_char_type(type))) {
-  } else if (OB_FAIL(ctx.current_char(ch, char_len))) {
-  } else if (OB_FAIL(do_process(ctx, ch, char_len, type))) {
-  }
-  return ret;
-}
-
 TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  ObIAllocator &allocator,
                                  const char *fulltext,
                                  int64_t fulltext_len,
                                  bool is_smart)
     : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
-      next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
-      result_list_(allocator)
+      next_char_len_(0), next_char_code_(0), next_char_type_(ObFTCharUtil::CharType::USELESS),
+      handle_size_(0), is_smart_(is_smart), token_list_(allocator), result_list_(allocator)
 {
 }
 
@@ -76,40 +61,17 @@ int TokenizeContext::reset_resource()
   return OB_SUCCESS;
 }
 
-int TokenizeContext::current_char(const char *&ch, uint8_t &char_len)
-{
-  int ret = OB_SUCCESS;
-  if (cursor_ >= fulltext_len_) {
-    ret = OB_ITER_END;
-  } else {
-    ch = fulltext_ + cursor_;
-    char_len = next_char_len_;
-  }
-  return ret;
-}
-
-int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
-{
-  int ret = OB_SUCCESS;
-  if (cursor_ >= fulltext_len_) {
-    ret = OB_ITER_END;
-  } else {
-    type = next_char_type_;
-  }
-  return ret;
-}
-
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
-                                          fulltext_ + cursor_,
-                                          fulltext_len_ - cursor_,
-                                          next_char_len_))) {
-  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
-                                                       fulltext_ + cursor_,
-                                                       next_char_len_,
-                                                       next_char_type_))) {
+  // Decode and classify the char in one pass, the code point is kept in the context so that
+  // the segmenters do not need to decode the same char again.
+  if (OB_FAIL(ObFTCharUtil::decode_and_classify(coll_type_,
+                                                fulltext_ + cursor_,
+                                                fulltext_len_ - cursor_,
+                                                next_char_len_,
+                                                next_char_code_,
+                                                next_char_type_))) {
   }
   return ret;
 }
@@ -122,6 +84,7 @@ int TokenizeContext::step_next()
   } else if (cursor_ + next_char_len_ >= fulltext_len_) {
     cursor_ = fulltext_len_;
     next_char_len_ = 0;
+    next_char_code_ = 0;
     ret = OB_ITER_END;
   } else if (cursor_ < fulltext_len_ && 0 == next_char_len_) {
     // should not happen
@@ -135,22 +98,6 @@ int TokenizeContext::step_next()
   }
   return ret;
 }
-
-ObCollationType TokenizeContext::collation() const { return coll_type_; }
-
-int64_t TokenizeContext::get_end_cursor() const { return cursor_ + next_char_len_; }
-
-const char *TokenizeContext::fulltext() const { return fulltext_; }
-
-int64_t TokenizeContext::fulltext_len() const { return fulltext_len_; }
-
-int64_t TokenizeContext::get_cursor() const { return cursor_; }
-
-bool TokenizeContext::is_last() const { return cursor_ + next_char_len_ >= fulltext_len_; }
-
-bool TokenizeContext::iter_end() const { return cursor_ >= fulltext_len_; }
-
-bool TokenizeContext::is_smart() const { return is_smart_; }
 
 int TokenizeContext::add_token(const char *fulltext,
                                int64_t offset,

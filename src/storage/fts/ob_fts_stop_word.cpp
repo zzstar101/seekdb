@@ -71,12 +71,11 @@ void ObStopWordChecker::destroy()
   }
 }
 
-int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
+int ObStopWordChecker::check_stopword(const ObFTWord &word,
+                                      common::ObIAllocator &allocator,
+                                      bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
@@ -158,12 +157,28 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+// Casedown only rewrites upper case english letters, so a word which is made of bytes below
+// 0x80 without upper case english letters is guaranteed to be unchanged, and the word can be
+// used in place instead of being copied to the allocator.
+static bool is_casedown_noop(const ObString &word)
+{
+  bool noop = true;
+  const char *ptr = word.ptr();
+  for (int64_t i = 0; noop && i < word.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(ptr[i]);
+    if (c >= 0x80 || (c >= 'A' && c <= 'Z')) {
+      noop = false;
+    }
+  }
+  return noop;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (flag_.casedown()) {
+  } else if (flag_.casedown() && !is_casedown_noop(src.get_word().get_string())) {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
                     word_meta_.get_collation_type(),
@@ -189,7 +204,7 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
     ObStopWordChecker *stop_word_checker = ObFTParseData::instance().stop_word_checker();
     if (OB_ISNULL(stop_word_checker)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(stop_word_checker->check_stopword(ft_word, is_stopword))) {
+    } else if (OB_FAIL(stop_word_checker->check_stopword(ft_word, allocator_, is_stopword))) {
     }
   }
   return ret;
