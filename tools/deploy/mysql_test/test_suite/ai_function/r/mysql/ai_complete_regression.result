@@ -1,0 +1,32 @@
+select ai_complete('complete_regression', 'hello', null) = 'mock:hello' as null_config_ok;
+null_config_ok
+1
+select ai_complete('complete_regression', 'hello', json_object('temperature', 0.2, 'max_tokens', 16)) = 'mock:hello' as json_config_ok;
+json_config_ok
+1
+select ai_complete('complete_regression', 'hello') = 'mock:hello' as absent_config_ok;
+absent_config_ok
+1
+select ai_complete('complete_regression', repeat('世', 30000), '{}') = concat('mock:', repeat('世', 30000)) as long_prompt_ok;
+long_prompt_ok
+1
+select ai_complete('complete_regression', 'hello', json_array(1));
+ERROR HY000: Incorrect arguments to ai_complete, config must be a JSON object
+select ai_complete('complete_regression', 'hello', '[]');
+ERROR HY000: Incorrect arguments to ai_complete, config must be a JSON object
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('complete_regression_ep', '{"url":"http://127.0.0.1:19126/config/completions"}');
+select ai_complete('complete_regression', 'hello', json_object('temperature', 0.2, 'max_tokens', 16)) = 'mock:hello' as request_config_ok;
+request_config_ok
+1
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('complete_regression_ep', '{"url":"http://127.0.0.1:19126/empty/completions"}');
+select ai_complete('complete_regression', 'hello');
+ERROR HY000: unexpected http message: {"choices": [{"message": {"content": ""}}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('complete_regression_ep', '{"url":"http://127.0.0.1:19126/null/completions"}');
+select ai_complete('complete_regression', 'hello');
+ERROR HY000: unexpected http message: {"choices": [{"message": {"content": null}}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('complete_regression_ep', '{"url":"http://127.0.0.1:19126/number/completions"}');
+select ai_complete('complete_regression', 'hello');
+ERROR HY000: unexpected http message: {"choices": [{"message": {"content": 42}}]}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('complete_regression_ep', '{"url":"http://127.0.0.1:19126/missing/completions"}');
+select ai_complete('complete_regression', 'hello');
+ERROR HY000: unexpected http message: {"choices": []}

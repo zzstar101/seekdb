@@ -169,9 +169,11 @@ int ObOpenAIUtils::ObOpenAIComplete::parse_output(common::ObIAllocator &allocato
     common::ObString path_text("$.choices[0].message.content");
     ObJsonPath j_path(path_text, &allocator);
     ObJsonSeekResult hit;
+    result = nullptr;
     if (OB_FAIL(j_path.parse_path())) {
     } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
-    } else if (hit.size() == 0) {
+    } else if (hit.size() != 1 || OB_ISNULL(hit[0]) ||
+               hit[0]->json_type() != ObJsonNodeType::J_STRING || hit[0]->get_data_length() == 0) {
       ret = OB_INVALID_DATA;
     } else {
       result = hit[0];
