@@ -1,5 +1,7 @@
 # seekdb 全文索引优化报告
 
+> 本文记录第一轮的历史测量。其提交后用户反馈统一评测为 22.542/100；第二轮的实现、八次本地对照及验证边界见[第二轮报告](<FTS_OPTIMIZATION_ROUND2_REPORT.md>)。
+
 ## 结论与适用范围
 
 - 起点：`perf/fts-large-bench-optimize`，`bfc46d6dd12eec96b8d788b23413ab643ec35a8d`。性能测量在补丁提交前完成，原版和候选版由下文二进制哈希区分。

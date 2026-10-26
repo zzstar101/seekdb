@@ -25,6 +25,23 @@ namespace oceanbase
 namespace storage
 {
 
+// Binary document IDs do not need character-set lookup or space padding. Keep
+// the generic comparator for special datums, including NULL and empty pointers.
+inline int compare_binary_doc_ids(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret,
+                                 const common::ObDatumAccessContext *access_ctx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(lhs.is_null() || rhs.is_null() || lhs.is_ext() || rhs.is_ext()
+                  || nullptr == lhs.ptr_ || nullptr == rhs.ptr_)) {
+    ret = ObDatumFuncs::get_basic_func(ObVarcharType, CS_TYPE_BINARY)->null_first_cmp_(
+        lhs, rhs, cmp_ret, access_ctx);
+  } else {
+    const int cmp = lhs.get_string().compare(rhs.get_string());
+    cmp_ret = cmp > 0 ? 1 : (cmp < 0 ? -1 : 0);
+  }
+  return ret;
+}
+
 class ObDomainIdCmp
 {
 public:
@@ -51,7 +68,8 @@ int ObDomainIdCmp::init(const ObObjMeta &obj_meta)
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN,"failed to get basic functions", K(ret), K(obj_meta));
     } else {
-      cmp_func_ = id_basic_funcs->null_first_cmp_;
+      cmp_func_ = ObVarcharType == obj_meta.get_type() && CS_TYPE_BINARY == obj_meta.get_collation_type()
+          ? compare_binary_doc_ids : id_basic_funcs->null_first_cmp_;
     }
   }
   return ret;

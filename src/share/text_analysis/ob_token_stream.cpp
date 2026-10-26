@@ -294,10 +294,24 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
       ret = OB_ERR_UNEXPECTED;
     } else {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
-      ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      // Already-normalized ASCII words can borrow the input token until the
+      // next get_next()/reuse(), just like the tokenizer's own output. Keep
+      // other charsets and every non-ASCII or uppercase token on the original
+      // case-folding path; their byte lengths and mappings may differ.
+      bool normalized_ascii = CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(
+          static_cast<ObCollationType>(cs_->number));
+      for (uint32_t i = 0; normalized_ascii && i < norm_token_len; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(norm_token_ptr[i]);
+        normalized_ascii = ('a' <= ch && ch <= 'z') || ('0' <= ch && ch <= '9');
+      }
+      if (normalized_ascii) {
+        next_token.set_string(norm_alnum_token);
       } else {
-        next_token.set_string(norm_lower_token);
+        ObString norm_lower_token;
+        if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+        } else {
+          next_token.set_string(norm_lower_token);
+        }
       }
     }
   }
