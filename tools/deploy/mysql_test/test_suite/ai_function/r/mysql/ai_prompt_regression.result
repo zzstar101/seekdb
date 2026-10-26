@@ -1,0 +1,24 @@
+select ai_complete('prompt_regression', ai_prompt('{0}{0}{0}{0}', 'abcdefghijklmnop'), '{}') = concat('mock:', repeat('abcdefghijklmnop', 4)) as repeated_ok;
+repeated_ok
+1
+select ai_complete('prompt_regression', ai_prompt('{0}/{1}/{0}', '{1}', 'x'), '{}') = 'mock:{1}/x/{1}' as literal_argument_ok;
+literal_argument_ok
+1
+select ai_complete('prompt_regression', ai_prompt('outer {0}', ai_prompt('inner {0}', '世界')), '{}') = 'mock:outer inner 世界' as nested_ok;
+nested_ok
+1
+select ai_complete('prompt_regression', ai_prompt('{0}|{1}', json_array(1, json_extract('true', '$')), json_object('k', 2)), '{}') = 'mock:[1, true]|{"k": 2}' as json_ok;
+json_ok
+1
+select ai_complete('prompt_regression', ai_prompt('{18446744073709551616}', 'x'), '{}');
+ERROR HY000: Incorrect arguments to ai_prompt: invalid placeholder index
+select ai_complete('prompt_regression', ai_prompt('{1}', 'x'), '{}');
+ERROR HY000: Incorrect arguments to ai_prompt: invalid placeholder index
+create table prompt_regression_lob(id int primary key, t longtext, a longtext);
+insert into prompt_regression_lob values(1, '{0}', repeat('世', 30000)), (2, '{0}', null);
+select char_length(json_unquote(json_extract(ai_prompt(t, a), '$.args[0]'))) = 30000 as long_argument_ok from prompt_regression_lob where id = 1;
+long_argument_ok
+1
+select ai_prompt(t, a) from prompt_regression_lob where id = 2;
+ERROR 22000: Invalid data type for the operation
+drop table prompt_regression_lob;

@@ -1,0 +1,33 @@
+# AI_PROMPT runtime typing and rendering regressions.
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19125
+--disable_query_log
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('prompt_regression_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('prompt_regression');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('prompt_regression', '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('prompt_regression_ep', '{"ai_model_name":"prompt_regression","url":"http://127.0.0.1:19125/v1/chat/completions","access_key":"test-key","provider":"openai"}');
+--enable_query_log
+
+select ai_complete('prompt_regression', ai_prompt('{0}{0}{0}{0}', 'abcdefghijklmnop'), '{}') = concat('mock:', repeat('abcdefghijklmnop', 4)) as repeated_ok;
+select ai_complete('prompt_regression', ai_prompt('{0}/{1}/{0}', '{1}', 'x'), '{}') = 'mock:{1}/x/{1}' as literal_argument_ok;
+select ai_complete('prompt_regression', ai_prompt('outer {0}', ai_prompt('inner {0}', '世界')), '{}') = 'mock:outer inner 世界' as nested_ok;
+select ai_complete('prompt_regression', ai_prompt('{0}|{1}', json_array(1, json_extract('true', '$')), json_object('k', 2)), '{}') = 'mock:[1, true]|{"k": 2}' as json_ok;
+--error 1210
+select ai_complete('prompt_regression', ai_prompt('{18446744073709551616}', 'x'), '{}');
+--error 1210
+select ai_complete('prompt_regression', ai_prompt('{1}', 'x'), '{}');
+
+create table prompt_regression_lob(id int primary key, t longtext, a longtext);
+insert into prompt_regression_lob values(1, '{0}', repeat('世', 30000)), (2, '{0}', null);
+select char_length(json_unquote(json_extract(ai_prompt(t, a), '$.args[0]'))) = 30000 as long_argument_ok from prompt_regression_lob where id = 1;
+--error 5083
+select ai_prompt(t, a) from prompt_regression_lob where id = 2;
+drop table prompt_regression_lob;
+
+--disable_query_log
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('prompt_regression_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('prompt_regression');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19125
+--enable_query_log
