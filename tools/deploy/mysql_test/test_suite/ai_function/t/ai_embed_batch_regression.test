@@ -1,0 +1,49 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py start 19129
+--disable_query_log
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('embed_batch_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('embed_batch');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('embed_batch', '{"type":"dense_embedding","model_name":"batch-model"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('embed_batch_ep', '{"ai_model_name":"embed_batch","url":"http://127.0.0.1:19129/batch-only/embeddings","provider":"openai","access_key":"test-key"}');
+--disable_warnings
+drop table if exists embed_batch_rows;
+--enable_warnings
+create table embed_batch_rows(id int primary key, content varchar(100), dim int);
+insert into embed_batch_rows values (1,'a',2),(2,null,3),(3,'abc',4),(4,'abcd',2),(5,'abcde',3),(6,null,4),(7,'abcdefg',2),(8,'abcdefgh',3);
+--enable_query_log
+# The mock rejects singleton requests and reverses the response index order.
+select id, ai_embed('embed_batch', content) as embedding from embed_batch_rows order by id;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/valid/embeddings"}');
+select id, json_length(ai_embed('embed_batch', content, dim)) as dimension from embed_batch_rows order by id;
+select id, ai_embed('embed_batch', content, 2) as embedding from embed_batch_rows where id > 2 order by id limit 4;
+select id, ai_embed(case when id % 2 = 0 then null else 'embed_batch' end, content, 2) as embedding from embed_batch_rows order by id;
+--disable_query_log
+truncate table embed_batch_rows;
+--let $row = 1
+while ($row <= 130)
+{
+  eval insert into embed_batch_rows values ($row, repeat('x', 1 + $row % 29), 2);
+  --inc $row
+}
+--enable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/batch-only/embeddings"}');
+select count(*) as total, sum(ai_embed('embed_batch', content, 2) = concat('[', char_length(content), ', ', char_length(content) + 1, ']')) as mapped_correctly from embed_batch_rows;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/truncated/embeddings"}');
+--error 4070
+select ai_embed('embed_batch', content, 2) from embed_batch_rows where id <= 3;
+update embed_batch_rows set content = 'trigger failure' where id = 67;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/fail-selected/embeddings"}');
+--error 4216
+select sum(json_length(ai_embed('embed_batch', content, 2))) from embed_batch_rows;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/valid/embeddings"}');
+select sum(json_length(ai_embed('embed_batch', content, 2))) as recovered_dimensions from embed_batch_rows;
+update embed_batch_rows set content = null;
+select sum(ai_embed('nonexistent-model-no-request', content) is null) as all_null_without_requests from embed_batch_rows;
+--disable_query_log
+drop table embed_batch_rows;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('embed_batch_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('embed_batch');
+--exec python3 mysql_test/test_suite/ai_function/include/ai_protocol_mock.py stop 19129
+--enable_query_log

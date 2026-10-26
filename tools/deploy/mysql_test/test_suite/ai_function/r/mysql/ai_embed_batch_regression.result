@@ -1,0 +1,56 @@
+select id, ai_embed('embed_batch', content) as embedding from embed_batch_rows order by id;
+id	embedding
+1	[1, 2, 3, 4]
+2	NULL
+3	[3, 4, 5, 6]
+4	[4, 5, 6, 7]
+5	[5, 6, 7, 8]
+6	NULL
+7	[7, 8, 9, 10]
+8	[8, 9, 10, 11]
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/valid/embeddings"}');
+select id, json_length(ai_embed('embed_batch', content, dim)) as dimension from embed_batch_rows order by id;
+id	dimension
+1	2
+2	NULL
+3	4
+4	2
+5	3
+6	NULL
+7	2
+8	3
+select id, ai_embed('embed_batch', content, 2) as embedding from embed_batch_rows where id > 2 order by id limit 4;
+id	embedding
+3	[3, 4]
+4	[4, 5]
+5	[5, 6]
+6	NULL
+select id, ai_embed(case when id % 2 = 0 then null else 'embed_batch' end, content, 2) as embedding from embed_batch_rows order by id;
+id	embedding
+1	[1, 2]
+2	NULL
+3	[3, 4]
+4	NULL
+5	[5, 6]
+6	NULL
+7	[7, 8]
+8	NULL
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/batch-only/embeddings"}');
+select count(*) as total, sum(ai_embed('embed_batch', content, 2) = concat('[', char_length(content), ', ', char_length(content) + 1, ']')) as mapped_correctly from embed_batch_rows;
+total	mapped_correctly
+130	130
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/truncated/embeddings"}');
+select ai_embed('embed_batch', content, 2) from embed_batch_rows where id <= 3;
+ERROR HY000: unexpected http message: {"data": [{"index": 1, "embedding": [3, 4]}, {"index": 0, "embedding": [2, 3]}]}
+update embed_batch_rows set content = 'trigger failure' where id = 67;
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/fail-selected/embeddings"}');
+select sum(json_length(ai_embed('embed_batch', content, 2))) from embed_batch_rows;
+ERROR HY000: http status code: 400, error message: {"error": "injected later-batch failure"}
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('embed_batch_ep', '{"url":"http://127.0.0.1:19129/valid/embeddings"}');
+select sum(json_length(ai_embed('embed_batch', content, 2))) as recovered_dimensions from embed_batch_rows;
+recovered_dimensions
+260
+update embed_batch_rows set content = null;
+select sum(ai_embed('nonexistent-model-no-request', content) is null) as all_null_without_requests from embed_batch_rows;
+all_null_without_requests
+130

@@ -69,6 +69,8 @@ def serve(port):
                     inputs = body['input']
                     assert isinstance(inputs, list) and inputs
                     assert all(isinstance(value, str) for value in inputs)
+                    if case == 'batch-only':
+                        assert len(inputs) > 1, 'expected a multi-input embedding request'
                     dim = body.get('dimensions', 4)
                     assert isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
                     data = [{'index': i, 'embedding': [len(value) + j for j in range(dim)]}
@@ -95,6 +97,10 @@ def serve(port):
                         data.append(data[0])
                     elif case == 'wrong-shape':
                         data = {}
+                    elif case == 'truncated':
+                        data = data[:-1]
+                    elif case == 'fail-selected':
+                        assert 'trigger failure' not in inputs, 'injected later-batch failure'
                     response = {'data': list(reversed(data)) if isinstance(data, list) else data}
                 else:
                     raise AssertionError('unrecognized protocol URL')
