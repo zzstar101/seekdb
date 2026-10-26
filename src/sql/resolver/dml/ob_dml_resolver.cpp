@@ -3932,6 +3932,30 @@ int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
   ObRawExpr *function_table_expr = NULL;
   TableItem *item = NULL;
   ObString alias_name;
+  // File table syntax must fail closed before resolving arguments or touching a
+  // path. The normal collection/UDF table path is deliberately unchanged.
+  const ParseNode *function_node = parse_tree.num_child_ == 2 && parse_tree.children_ != nullptr
+      ? parse_tree.children_[0] : nullptr;
+  if (function_node != nullptr && function_node->type_ == T_FUN_SYS
+      && function_node->num_child_ == 2 && function_node->children_ != nullptr
+      && function_node->children_[0] != nullptr) {
+    const ParseNode &name_node = *function_node->children_[0];
+    const ObString function_name(static_cast<int32_t>(name_node.str_len_), name_node.str_value_);
+    if (0 == function_name.case_compare("read_csv") || 0 == function_name.case_compare("read_json")
+        || 0 == function_name.case_compare("read_ndjson") || 0 == function_name.case_compare("read_parquet")
+        || 0 == function_name.case_compare("glob")) {
+      bool enabled = false;
+      if (OB_ISNULL(session_info_)) {
+        ret = OB_NOT_INIT;
+      } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+        LOG_WARN("failed to read file SQL feature gate", K(ret));
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, enabled ? "File table execution" : "File SQL without enable_file_sql");
+      }
+      return ret;
+    }
+  }
   CK (OB_LIKELY(T_TABLE_COLLECTION_EXPRESSION == parse_tree.type_));
   CK (OB_LIKELY(2 == parse_tree.num_child_));
   CK (OB_NOT_NULL(parse_tree.children_[0]));

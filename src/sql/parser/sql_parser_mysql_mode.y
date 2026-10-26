@@ -498,6 +498,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_table_expr file_table_arguments file_table_alias
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10847,6 +10848,61 @@ tbl_name
 | hybrid_search_expr
 {
   $$ = $1;
+}
+| file_table_expr
+{
+  $$ = $1;
+}
+;
+
+/* File functions are table sources, not scalar UDF calls. Keep named options
+ * distinct from comparison expressions so malformed positional options fail. */
+file_table_expr:
+NAME_OB '(' file_table_arguments ')' file_table_alias
+{
+  const char *name = $1->str_value_;
+  const int64_t len = $1->str_len_;
+  if (!((len == 8 && 0 == strncasecmp(name, "read_csv", len))
+      || (len == 9 && 0 == strncasecmp(name, "read_json", len))
+      || (len == 11 && 0 == strncasecmp(name, "read_ndjson", len))
+      || (len == 12 && 0 == strncasecmp(name, "read_parquet", len))
+      || (len == 4 && 0 == strncasecmp(name, "glob", len)))) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  ParseNode *args = NULL;
+  ParseNode *func = NULL;
+  merge_nodes(args, result, T_EXPR_LIST, $3);
+  malloc_non_terminal_node(func, result->malloc_pool_, T_FUN_SYS, 2, $1, args);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, func, $5);
+}
+;
+
+file_table_arguments:
+literal
+{
+  $$ = $1;
+}
+| file_table_arguments ',' relation_name COMP_EQ signed_literal
+{
+  ParseNode *option = NULL;
+  malloc_non_terminal_node(option, result->malloc_pool_, T_ASSIGN_ITEM, 2, $3, $5);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, option);
+}
+;
+
+file_table_alias:
+/* EMPTY */ %prec LOWER_PARENS
+{
+  $$ = NULL;
+}
+| relation_name
+{
+  $$ = $1;
+}
+| AS relation_name
+{
+  $$ = $2;
 }
 ;
 

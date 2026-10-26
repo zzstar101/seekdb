@@ -1,0 +1,30 @@
+# Grammar reaches the disabled feature gate without opening any local file.
+SELECT @@session.enable_file_sql AS disabled_by_default;
+SET SESSION enable_file_sql = ON;
+SELECT @@session.enable_file_sql AS explicitly_enabled;
+SET SESSION enable_file_sql = OFF;
+--error 1235
+SELECT * FROM read_csv('/not-opened.csv');
+--error 1235
+SELECT * FROM READ_CSV('/not-opened.csv', header = true, sample_size = -1) AS c;
+--error 1235
+SELECT * FROM read_json('/not-opened.jsonl', format = 'newline_delimited') j;
+--error 1235
+SELECT * FROM read_ndjson('/not-opened.jsonl');
+--error 1235
+SELECT * FROM read_parquet('/not-opened.parquet') p;
+--error 1235
+SELECT file FROM glob('/not-opened/*');
+--error 1235
+DESCRIBE SELECT * FROM read_csv('/not-opened.csv');
+--error 1235
+SELECT a.id FROM read_csv('/not-opened.csv') a LEFT JOIN read_json('/not-opened.jsonl') b ON a.id = b.id;
+--error 1064
+SELECT * FROM read_csv('/not-opened.csv', 'xml');
+--error 1064
+SELECT * FROM read_csv();
+--error 1064
+SELECT * FROM read_csv('/not-opened.csv', header true);
+--error 1064
+SELECT * FROM not_a_file_function('/not-opened.csv');
+SELECT 1 AS ordinary_sql;

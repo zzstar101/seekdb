@@ -177,7 +177,34 @@ void test_streaming_and_unicode_limits() {
   CHECK(r->open(wide.c_str(), f.root.c_str(), o) == Status::Ok);
   CHECK(r->infer() == Status::ResourceLimit);
 }
+void test_resolver_executor_schema_handoff() {
+  Fixtures f;
+  const auto path = f.put("handoff.csv", "id,label\n1,first\n2,second\n");
+  CsvOptions o; o.enabled = true;
+  auto resolver = std::make_unique<CsvReader>();
+  CHECK(resolver->open(path.c_str(), f.root.c_str(), o) == Status::Ok);
+  CHECK(resolver->infer() == Status::Ok);
+  const auto identity = resolver->identity();
+  std::vector<CsvReader::Column> columns;
+  for (size_t i = 0; i < resolver->column_count(); ++i) columns.push_back(resolver->column(i));
+  resolver.reset(); // execution cannot depend on resolver-owned memory or descriptors
+  auto executor = std::make_unique<CsvReader>();
+  CHECK(executor->open(path.c_str(), f.root.c_str(), o) == Status::Ok);
+  CHECK(executor->bind_schema(columns.data(), columns.size(), identity) == Status::Ok);
+  CHECK(executor->next() == Status::Ok && executor->value(1) == "first");
+  CHECK(executor->next() == Status::Ok && executor->value(1) == "second");
+  CHECK(executor->next() == Status::End);
+  CHECK(executor->rescan() == Status::Ok);
+  CHECK(executor->next() == Status::Ok && executor->value(0) == "1");
+  executor->close();
+  // Same path and same-length contents must not make a stale planned schema valid.
+  f.put("handoff.csv", "id,label\n9,third\n8,fourth\n");
+  CHECK(executor->open(path.c_str(), f.root.c_str(), o) == Status::Ok);
+  CHECK(executor->bind_schema(columns.data(), columns.size(), identity) == Status::Changed);
+  CHECK(executor->next() == Status::Changed);
+}
 int main() {
+  test_resolver_executor_schema_handoff();
   test_types(); test_csv(); test_security_and_mutation(); test_malformed_and_options();
   test_streaming_and_unicode_limits();
   test_descriptor_lifetime_and_replacement();

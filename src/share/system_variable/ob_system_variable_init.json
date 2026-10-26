@@ -10961,6 +10961,21 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Enable local file table functions and COPY, subject to secure_file_priv",
+    "flags": "SESSION | GLOBAL | MYSQL_ONLY | INFLUENCE_PLAN | NEED_SERIALIZE",
+    "min_val": "0",
+    "max_val": "1",
+    "publish_version": "1.4.0.0",
+    "info_cn": "启用受 secure_file_priv 限制的本地文件 SQL",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ob_sparse_drop_ratio_search": {
     "id": 10753,
     "name": "ob_sparse_drop_ratio_search",

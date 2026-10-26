@@ -1,0 +1,35 @@
+SELECT @@session.enable_file_sql AS disabled_by_default;
+disabled_by_default
+0
+SET SESSION enable_file_sql = ON;
+SELECT @@session.enable_file_sql AS explicitly_enabled;
+explicitly_enabled
+1
+SET SESSION enable_file_sql = OFF;
+SELECT * FROM read_csv('/not-opened.csv');
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT * FROM READ_CSV('/not-opened.csv', header = true, sample_size = -1) AS c;
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT * FROM read_json('/not-opened.jsonl', format = 'newline_delimited') j;
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT * FROM read_ndjson('/not-opened.jsonl');
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT * FROM read_parquet('/not-opened.parquet') p;
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT file FROM glob('/not-opened/*');
+ERROR 0A000: File SQL without enable_file_sql not supported
+DESCRIBE SELECT * FROM read_csv('/not-opened.csv');
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT a.id FROM read_csv('/not-opened.csv') a LEFT JOIN read_json('/not-opened.jsonl') b ON a.id = b.id;
+ERROR 0A000: File SQL without enable_file_sql not supported
+SELECT * FROM read_csv('/not-opened.csv', 'xml');
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your OceanBase version for the right syntax to use near ''xml')' at line 1
+SELECT * FROM read_csv();
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your OceanBase version for the right syntax to use near ')' at line 1
+SELECT * FROM read_csv('/not-opened.csv', header true);
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your OceanBase version for the right syntax to use near 'true)' at line 1
+SELECT * FROM not_a_file_function('/not-opened.csv');
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your OceanBase version for the right syntax to use near 'not_a_file_function('/not-opened.csv')' at line 1
+SELECT 1 AS ordinary_sql;
+ordinary_sql
+1

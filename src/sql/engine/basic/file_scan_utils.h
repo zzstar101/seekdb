@@ -16,6 +16,23 @@ Type infer_type(std::string_view text);
 Type widen(Type left, Type right);
 const char *type_name(Type type);
 
+// Serializable file identity passed from schema resolution to execution.
+// Nanosecond modification and change times also catch same-size rewrites.
+struct FileIdentity {
+  uint64_t device = 0;
+  uint64_t inode = 0;
+  int64_t size = 0;
+  int64_t modified_seconds = 0;
+  int64_t modified_nanoseconds = 0;
+  int64_t changed_seconds = 0;
+  int64_t changed_nanoseconds = 0;
+  bool operator==(const FileIdentity &other) const {
+    return device == other.device && inode == other.inode && size == other.size
+        && modified_seconds == other.modified_seconds && modified_nanoseconds == other.modified_nanoseconds
+        && changed_seconds == other.changed_seconds && changed_nanoseconds == other.changed_nanoseconds;
+  }
+};
+
 struct CsvOptions {
   bool enabled = false;
   bool header = true;
@@ -47,6 +64,10 @@ public:
   CsvReader &operator=(const CsvReader &) = delete;
   Status open(const char *path, const char *secure_root, const CsvOptions &options);
   Status infer();
+  FileIdentity identity() const;
+  // Bind only schema inferred from the same file identity and CSV options.
+  // Copies metadata; the resolver and its descriptors need not remain alive.
+  Status bind_schema(const Column *columns, size_t count, const FileIdentity &expected);
   Status next();
   Status rescan();
   void close();

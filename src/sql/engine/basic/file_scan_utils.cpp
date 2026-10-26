@@ -209,6 +209,35 @@ Status CsvReader::open(const char *path, const char *secure_root, const CsvOptio
   options_.null_text = std::string_view(null_text_, options.null_text.size());
   return rewind_file();
 }
+FileIdentity CsvReader::identity() const
+{
+#ifdef __APPLE__
+  const auto modified = snapshot_.st_mtimespec, changed = snapshot_.st_ctimespec;
+#else
+  const auto modified = snapshot_.st_mtim, changed = snapshot_.st_ctim;
+#endif
+  return {static_cast<uint64_t>(snapshot_.st_dev), static_cast<uint64_t>(snapshot_.st_ino), snapshot_.st_size,
+      modified.tv_sec, modified.tv_nsec, changed.tv_sec, changed.tv_nsec};
+}
+Status CsvReader::bind_schema(const Column *columns, size_t count, const FileIdentity &expected)
+{
+  if (check_unchanged() != Status::Ok) return status_;
+  if (!(identity() == expected)) return fail(Status::Changed, "input changed since schema resolution");
+  if (!columns || count == 0 || count > MAX_COLUMNS) return fail(Status::InvalidOption, "invalid planned schema");
+  for (size_t i = 0; i < count; ++i) {
+    if (!std::memchr(columns[i].name, 0, sizeof(columns[i].name)) || !columns[i].name[0]
+        || columns[i].type < Type::Null || columns[i].type > Type::DateTime
+        || columns[i].max_bytes > options_.max_record_bytes) return fail(Status::InvalidOption, "invalid planned column");
+  }
+  for (size_t i = 0; i < count; ++i) columns_[i] = columns[i];
+  column_count_ = count;
+  inferred_ = true;
+  const Status result = rescan();
+  if (result == Status::Ok && options_.header && field_count_ != count) {
+    return fail(Status::Malformed, "CSV header differs from planned schema");
+  }
+  return result;
+}
 Status CsvReader::check_unchanged()
 {
   if (status_ != Status::Ok) return status_;
@@ -373,6 +402,8 @@ Status CsvReader::open(const char *, const char *, const CsvOptions &options)
   return options.enabled ? Status::Unsupported : Status::Disabled;
 }
 Status CsvReader::infer() { return Status::Unsupported; }
+FileIdentity CsvReader::identity() const { return {}; }
+Status CsvReader::bind_schema(const Column *, size_t, const FileIdentity &) { return Status::Unsupported; }
 Status CsvReader::next() { return Status::Unsupported; }
 Status CsvReader::rescan() { return Status::Unsupported; }
 void CsvReader::close() {}
