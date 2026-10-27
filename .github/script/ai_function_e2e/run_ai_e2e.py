@@ -676,6 +676,18 @@ def _task_count_sql(db, table):
             "where d.database_name = '{}' and t.table_name = '{}'".format(db, table))
 
 
+def _task_dump_sql(db, table):
+    """Diagnostic projection of the queue rows of one table."""
+    return ("select task.column_id, task.rowkey_predicate, task.request_id, task.state, "
+            "task.retry_count, task.max_retries, task.definition_version, task.call_type, "
+            "task.result_data is null, task.error_msg, task.lease_owner is not null, "
+            "task.gmt_create, task.gmt_modified from oceanbase.__all_ai_column_task task "
+            "join oceanbase.__all_table t on t.table_id = task.table_id "
+            "join oceanbase.__all_database d on d.database_id = t.database_id "
+            "where d.database_name = '{}' and t.table_name = '{}' "
+            "order by task.column_id").format(db, table)
+
+
 def ai_column_worker_steps():
     """Assertions of ai_column/t/ai_column_worker.test.
 
@@ -755,6 +767,7 @@ def ai_column_worker_steps():
             "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
             "expect": {"rows": [[1]]},
         }),
+        ("debug", "queue-after-grouped", _task_dump_sql(db, "docs")),
         ("mockassert", port, "typed-prompts"),
 
         # ---- a transient 400 must be retried and then succeed ----
@@ -785,6 +798,7 @@ def ai_column_worker_steps():
             "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "retry_docs")),
             "expect": {"rows": [[1]]},
         }),
+        ("debug", "queue-after-retry", _task_dump_sql(db, "retry_docs")),
         ("mockassert", port, "retry-once"),
 
         # ---- terminal failure keeps NULL and drains the task ----
@@ -799,6 +813,7 @@ def ai_column_worker_steps():
             "expect": {"rows": [[1]]},
             "timeout": 15,
         }),
+        ("debug", "queue-after-fail-wait", _task_dump_sql(db, "fail_docs")),
         ("check", {
             "name": "terminal failure keeps null",
             "sql": "select result is null from {}.fail_docs where id = 3".format(db),
@@ -930,6 +945,7 @@ def ai_column_vector_steps():
             "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
             "expect": {"rows": [[1]]},
         }),
+        ("debug", "queue-after-vector", _task_dump_sql(db, "docs")),
         ("check", {
             "name": "regenerated vector visible to ann",
             "sql": ("select count(*) = 2 and sum(id = 1) = 1 and sum(id = 2) = 1 from "
@@ -969,6 +985,7 @@ def ai_column_vector_steps():
             "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
             "expect": {"rows": [[1]]},
         }),
+        ("debug", "queue-after-vector-rollback", _task_dump_sql(db, "docs")),
         ("sleep", 2),
         ("mockassert", port, "no-requests"),
         ("check", {
@@ -1042,6 +1059,8 @@ def ai_column_retry_steps():
             "sql": "select @@ai_column_strict_read",
             "expect": {"rows": [["off"]]},
         }),
+        ("debug", "strict-read-variable",
+         "select @@ai_column_strict_read, @@global.ai_column_strict_read, @@session.ai_column_strict_read"),
 
         # ---- a business predicate retries exactly the selected rows ----
         ("mockstop", port),
@@ -1127,6 +1146,7 @@ def ai_column_retry_steps():
             "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
             "expect": {"rows": [[1]]},
         }),
+        ("debug", "queue-after-zero-match", _task_dump_sql(db, "docs")),
         ("sql", "alter table {} retry ai column result "
                 "where status = 'READY' and category = 'sports'".format(docs)),
         ("check", {
@@ -1304,6 +1324,23 @@ def run_step(cursor, step):
             if time.time() > deadline:
                 return False, "timeout after {}s: {}".format(int(timeout), problem)
             time.sleep(1)
+
+    if kind == "debug":
+        # Diagnostic dump: never asserts anything, only prints what the server holds
+        # now, so a failing replay carries the state that made it fail.
+        label, sql = step[1], step[2]
+        try:
+            cursor.execute(sql)
+            rows = [list(row) for row in cursor.fetchall()]
+            names = [item[0] for item in cursor.description] if cursor.description else []
+            print("DEBUG {} columns={}".format(label, names))
+            for row in rows:
+                print("DEBUG {} row={}".format(label, row))
+            if not rows:
+                print("DEBUG {} no rows".format(label))
+        except Exception as error:  # noqa: BLE001 - a dump must never fail the case
+            print("DEBUG {} error: {}".format(label, error))
+        return True, None
 
     if kind == "error":
         # ``--error N`` in the official case means: the statement must fail with N.
