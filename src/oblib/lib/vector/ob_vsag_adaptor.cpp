@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <cfloat>
 #include <pthread.h>
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
@@ -77,11 +79,37 @@ struct ObCuvsEntry {
   std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
+  // [cosine] cosine indexes store/query unit vectors: CAGRA only ranks by L2, and
+  // for unit vectors L2 order == cosine order, so we normalize a copy for the graph
+  // and rescore the returned rows exactly (see ob_cuvs_cos_dist).
+  bool cosine_ = false;
+  std::vector<float> norm_vecs_;  // unit-length copy of the build matrix (row-major)
 };
+
+// Normalize one row in place (no-op for a zero vector: it has no direction).
+static void ob_cuvs_l2_normalize(float *v, int dim)
+{
+  if (v == nullptr || dim <= 0) { return; }
+  float sq = 0.0f;
+  for (int i = 0; i < dim; ++i) { sq += v[i] * v[i]; }
+  if (sq <= 0.0f) { return; }
+  const float inv = 1.0f / std::sqrt(sq);
+  for (int i = 0; i < dim; ++i) { v[i] *= inv; }
+}
+
+// Exact cosine distance between two unit-length rows, clamped against float drift.
+static inline float ob_cuvs_cos_dist(const float *a, const float *b, int dim)
+{
+  float dot = 0.0f;
+  for (int i = 0; i < dim; ++i) { dot += a[i] * b[i]; }
+  if (dot > 1.0f) { dot = 1.0f; } else if (dot < -1.0f) { dot = -1.0f; }
+  return 1.0f - dot;
+}
 static std::mutex g_ob_cuvs_mu;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
 static std::mutex g_ob_cuvs_marked_mu;
-static std::set<void *> g_ob_cuvs_marked;  // handles of lib=cuvs indexes (marked by the plugin)
+// handle -> true when the lib=cuvs index was declared WITH (distance=cosine).
+static std::map<void *, bool> g_ob_cuvs_marked;
 // GPU backend available? (used by the explicit dbms_vector.batch_knn path)
 static inline bool ob_cuvs_enabled() {
 #ifdef OB_BUILD_CUVS
@@ -95,6 +123,16 @@ static inline bool ob_cuvs_marked(void *key) {
 #ifdef OB_BUILD_CUVS
   std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
   return g_ob_cuvs_marked.find(key) != g_ob_cuvs_marked.end();
+#else
+  (void)key; return false;
+#endif
+}
+// True when the marked handle is a distance=cosine index (unit-vector path).
+static inline bool ob_cuvs_is_cosine(void *key) {
+#ifdef OB_BUILD_CUVS
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+  auto it = g_ob_cuvs_marked.find(key);
+  return it != g_ob_cuvs_marked.end() && it->second;
 #else
   (void)key; return false;
 #endif
@@ -121,10 +159,22 @@ static inline void ob_vsag_trace(const char *fn, const void *h, long a, long b) 
 }
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
-  void *bridge = seekdb_cuvs_build(vectors, size, dim);
+  if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
+  // Read the metric flag first: marked_mu is always taken before g_ob_cuvs_mu.
+  const bool cosine = ob_cuvs_is_cosine(key);
+  // cosine: CAGRA only ranks by L2, so build the graph over unit-length rows
+  // (L2 order == cosine order) and keep that copy for exact rescoring.
+  std::vector<float> norm;
+  if (cosine) {
+    norm.assign(vectors, vectors + static_cast<size_t>(dim) * size);
+    for (int r = 0; r < size; ++r) { ob_cuvs_l2_normalize(norm.data() + r * dim, dim); }
+  }
+  void *bridge = seekdb_cuvs_build(cosine ? norm.data() : vectors, size, dim);
   if (bridge == nullptr) { return; }
   ObCuvsEntry *ent = new ObCuvsEntry();
   ent->bridge_ = bridge; ent->dim_ = dim; ent->ids_.assign(ids, ids + size);
+  ent->cosine_ = cosine;
+  if (cosine) { ent->norm_vecs_.swap(norm); }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot != nullptr) { seekdb_cuvs_free(slot->bridge_); delete slot; }
@@ -136,11 +186,13 @@ static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids
 static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
                         int dim, int size) {
   if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
+  const bool cosine = ob_cuvs_is_cosine(key);
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
   if (slot->dim_ != dim) { return; }
+  if (slot->cosine_ != cosine) { slot->cosine_ = cosine; slot->norm_vecs_.clear(); }
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
@@ -158,18 +210,27 @@ struct ObCuvsJob {
   ObCuvsEntry *ent; const float *query; int64_t topk; int dim; size_t n;
   bool need_build; std::vector<unsigned> *off; std::vector<float> *dst;
   int rc_; bool built_;
+  std::vector<float> qhat;   // [cosine] unit-length query
+  std::vector<float> norm;   // [cosine] unit-length build matrix
 };
 // Runs on a dedicated large-stack pthread: cuVS CAGRA build/search overflow the
 // small (~1.5MB) OB worker-thread stack.
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
+  const int dim = j->dim;
   if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
-                                 static_cast<long>(j->dim));
+    const float *matrix = j->ent->buf_vecs_.data();
+    if (j->ent->cosine_) {
+      j->norm.assign(j->ent->buf_vecs_.begin(), j->ent->buf_vecs_.end());
+      for (size_t r = 0; r < j->n; ++r) { ob_cuvs_l2_normalize(j->norm.data() + r * dim, dim); }
+      matrix = j->norm.data();
+    }
+    void *nb = seekdb_cuvs_build(matrix, static_cast<long>(j->n), static_cast<long>(dim));
     if (nb != nullptr) {
       if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
       j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
       j->built_ = true;
+      if (j->ent->cosine_) { j->ent->norm_vecs_.swap(j->norm); }
     }
   }
   // Freshness/correctness: only serve from the GPU when the cuVS index is
@@ -177,8 +238,24 @@ static void *ob_cuvs_job(void *arg) {
   // caller falls back to CPU VSAG (which is always fresh). This also gives the
   // desired split: streaming delta -> VSAG, stable snapshot -> cuVS.
   if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    j->rc_ = seekdb_cuvs_search(j->ent->bridge_, j->query, 1, j->topk,
+    const float *q = j->query;
+    if (j->ent->cosine_) {
+      j->qhat.assign(j->query, j->query + dim);
+      ob_cuvs_l2_normalize(j->qhat.data(), dim);
+      q = j->qhat.data();
+    }
+    j->rc_ = seekdb_cuvs_search(j->ent->bridge_, q, 1, j->topk,
                                 j->off->data(), j->dst->data());
+    // [cosine] CAGRA ranked by L2 over unit vectors (== cosine order); replace the
+    // L2 distances with the exact cosine distance so scores match the CPU path.
+    if (j->rc_ == 0 && j->ent->cosine_ && j->ent->norm_vecs_.size() >= j->n * dim) {
+      for (int64_t i = 0; i < j->topk; ++i) {
+        const size_t o = (*j->off)[i];
+        (*j->dst)[i] = (o < j->n) ? ob_cuvs_cos_dist(j->qhat.data(),
+                                                     j->ent->norm_vecs_.data() + o * dim, dim)
+                                  : FLT_MAX;
+      }
+    }
   }
   return nullptr;
 }
@@ -188,21 +265,49 @@ static void *ob_cuvs_job(void *arg) {
 struct ObCuvsBatchJob {
   ObCuvsEntry *ent; const float *queries; long nq; long topk; size_t n;
   bool need_build; unsigned *off; float *dst; long served_; bool built_;
+  std::vector<float> qhat;   // [cosine] unit-length queries (nq x dim)
+  std::vector<float> norm;   // [cosine] unit-length build matrix
 };
 static void *ob_cuvs_batch_job(void *arg) {
   ObCuvsBatchJob *j = static_cast<ObCuvsBatchJob *>(arg);
+  const int dim = j->ent->dim_;
   if (j->need_build) {
-    void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
-                                 static_cast<long>(j->ent->dim_));
+    const float *matrix = j->ent->buf_vecs_.data();
+    if (j->ent->cosine_) {
+      j->norm.assign(j->ent->buf_vecs_.begin(), j->ent->buf_vecs_.end());
+      for (size_t r = 0; r < j->n; ++r) { ob_cuvs_l2_normalize(j->norm.data() + r * dim, dim); }
+      matrix = j->norm.data();
+    }
+    void *nb = seekdb_cuvs_build(matrix, static_cast<long>(j->n), static_cast<long>(dim));
     if (nb != nullptr) {
       if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
       j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
       j->built_ = true;
+      if (j->ent->cosine_) { j->ent->norm_vecs_.swap(j->norm); }
     }
   }
   if (j->ent->bridge_ != nullptr && j->ent->built_n_ == j->n) {
-    if (seekdb_cuvs_search(j->ent->bridge_, j->queries, j->nq, j->topk,
-                           j->off, j->dst) == 0) { j->served_ = j->nq; }
+    const float *q = j->queries;
+    if (j->ent->cosine_) {
+      j->qhat.assign(j->queries, j->queries + static_cast<size_t>(j->nq) * dim);
+      for (long i = 0; i < j->nq; ++i) { ob_cuvs_l2_normalize(j->qhat.data() + i * dim, dim); }
+      q = j->qhat.data();
+    }
+    if (seekdb_cuvs_search(j->ent->bridge_, q, j->nq, j->topk,
+                           j->off, j->dst) == 0) {
+      j->served_ = j->nq;
+      if (j->ent->cosine_ && j->ent->norm_vecs_.size() >= j->n * dim) {
+        for (long i = 0; i < j->nq; ++i) {
+          for (long k = 0; k < j->topk; ++k) {
+            const size_t p = static_cast<size_t>(i) * j->topk + k;
+            const unsigned o = j->off[p];
+            j->dst[p] = (o < j->n) ? ob_cuvs_cos_dist(j->qhat.data() + i * dim,
+                                                      j->ent->norm_vecs_.data() + o * dim, dim)
+                                   : FLT_MAX;
+          }
+        }
+      }
+    }
   }
   return nullptr;
 }
@@ -1763,13 +1868,23 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 }
 
 // [hipVS/cuVS] Per-index opt-in hooks called by the plugin for lib=cuvs indexes.
-void mark_cuvs_index(void *key) {
+// cosine=true for WITH (distance=cosine): build/serve over unit vectors.
+void mark_cuvs_index(void *key, bool cosine) {
 #ifdef OB_BUILD_CUVS
   if (key == nullptr) { return; }
-  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
-  g_ob_cuvs_marked.insert(key);
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+    g_ob_cuvs_marked[key] = cosine;
+  }
+  // Keep an already-registered entry in sync (mark can land after the first adds).
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it != g_ob_cuvs_reg.end() && it->second->cosine_ != cosine) {
+    it->second->cosine_ = cosine;
+    it->second->norm_vecs_.clear();
+  }
 #else
-  (void)key;
+  (void)key; (void)cosine;
 #endif
 }
 void unmark_cuvs_index(void *key) {

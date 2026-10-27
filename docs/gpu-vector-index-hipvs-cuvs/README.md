@@ -11,9 +11,10 @@ The backend adds optional hipVS/cuVS acceleration behind seekdb's existing
 vector adaptor. It does not replace VSAG globally.
 
 - GPU support is compiled only with `OB_BUILD_CUVS=ON`; the default is `OFF`.
-- A dense L2 HNSW/HGRAPH index opts in with `WITH (lib=cuvs)`.
+- A dense L2 or cosine HNSW/HGRAPH index opts in with `WITH (lib=cuvs)`.
 - `lib=vsag` indexes keep their existing CPU behavior.
-- Cosine and inner-product metrics are rejected for `lib=cuvs` at DDL time.
+- Cosine is served over unit-length vectors with exact rescoring (see *Cosine
+  support* below); inner product is still rejected for `lib=cuvs` at DDL time.
 - Filters, deletes, stale GPU indexes, and unavailable GPUs fall back to VSAG.
 - `dbms_vector.batch_knn` exposes one-call batched GPU ANN for explicit batch
   workloads.
@@ -26,7 +27,35 @@ The product integration lives in:
 - [`ob_plugin_vector_index_adaptor.cpp`](../../src/observer/vector_index/ob_plugin_vector_index_adaptor.cpp):
   maps declarative `lib=cuvs` indexes to the adaptor handle.
 - [`ob_vector_index_util.cpp`](../../src/observer/vector_index/ob_vector_index_util.cpp):
-  validates the L2-only DDL contract.
+  validates the `lib=cuvs` DDL contract (`distance` in {l2, cosine}).
+
+## Cosine support
+
+cuVS CAGRA ranks by L2 only, so a cosine index is served in three steps:
+
+1. **Build over unit vectors.** For `distance=cosine`, the buffered vectors are
+   copied and L2-normalized before the CAGRA build; the normalized copy is kept
+   in the adaptor (`ObCuvsEntry::norm_vecs_`). For unit vectors,
+   `||a-b||² = 2 - 2·cos(a,b)`, so L2 order **is** cosine order.
+2. **Normalize the probe.** Query vectors are unit-normalized before the GPU call.
+3. **Rescore exactly.** The returned rows are rescored with
+   `1 - dot(q̂, x̂)` clamped to `[0, 2]`, so the distances seekdb returns are exact
+   cosine distances and match the VSAG path bit-for-bit at the ordering level
+   instead of inheriting any cuVS distance convention.
+
+Inner product stays unsupported: it is not a monotone function of L2 distance
+for unnormalized vectors, so it cannot be reduced to the same trick.
+
+The user-visible DDL is unchanged apart from the accepted metric:
+
+```sql
+CREATE TABLE items(
+  id BIGINT PRIMARY KEY,
+  embedding VECTOR(128),
+  VECTOR INDEX idx_embedding(embedding)
+    WITH (distance=cosine, type=hnsw, lib=cuvs)
+);
+```
 - [`ob_dbms_vector_mysql.cpp`](../../src/pl/sys_package/ob_dbms_vector_mysql.cpp):
   implements `dbms_vector.batch_knn`.
 
@@ -113,7 +142,8 @@ LD_LIBRARY_PATH=/work/bridge:/opt/hipvs/lib:/opt/rocm/lib \
 The runner validates:
 
 - cuVS L2 build/serve and same-process VSAG isolation;
-- non-L2 DDL rejection;
+- cosine build/serve on the GPU plus ANN-vs-exact id agreement;
+- inner-product DDL rejection;
 - filter, delete, and freshness fallback;
 - threshold-triggered CAGRA rebuild;
 - one-call `batch_knn`, row cardinality, and recall;
@@ -128,7 +158,7 @@ The no-GPU DDL contract remains covered by
 
 ## Current limitations
 
-- Phase 1 supports dense float32 L2 indexes only.
+- Phase 1 supports dense float32 L2 and cosine indexes only.
 - GPU indexes are process-local and rebuilt lazily; persistence and cache reuse
   are follow-up work.
 - The explicit batch API rebuilds its CAGRA index per call.

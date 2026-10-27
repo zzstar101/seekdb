@@ -233,6 +233,18 @@ ann_ids()
   mysql_cmd "$port" -e "use hipvs_gate; select group_concat(id order by id) from (select id from $table $where_clause order by l2_distance(v,$query) $approximate limit 10) x;"
 }
 
+# Same as ann_ids but ranked by cosine_distance: used by the lib=cuvs cosine case.
+cos_ids()
+{
+  local port=$1
+  local table=$2
+  local query=$3
+  local mode=$4
+  local approximate=""
+  [[ "$mode" == "approx" ]] && approximate="APPROXIMATE"
+  mysql_cmd "$port" -e "use hipvs_gate; select group_concat(id order by id) from (select id from $table order by cosine_distance(v,$query) $approximate limit 10) x;"
+}
+
 python3 - "$DATA_DIR" <<'PY'
 import pathlib
 import sys
@@ -273,6 +285,7 @@ def write_insert(path, table, ids, vectors, chunk=250):
 write_insert(out / "cuvs-0.sql", "t_cuvs", np.arange(0, 300), base[0:300])
 write_insert(out / "cuvs-1.sql", "t_cuvs", np.arange(300, 400), base[300:400])
 write_insert(out / "cuvs-2.sql", "t_cuvs", np.arange(400, 700), base[400:700])
+write_insert(out / "cos.sql", "t_cos", np.arange(0, 300), base[0:300])
 write_insert(out / "vsag.sql", "t_vsag", np.arange(0, 300), base[0:300])
 write_insert(out / "no-gpu.sql", "t_cuvs", np.arange(0, 300), base[0:300])
 write_insert(out / "batch-base.sql", "batch_base", np.arange(n), base)
@@ -310,15 +323,30 @@ vsag_cuvs=$(trace_cuvs_count "$TRACE" "$offset")
 [[ -n "$vsag_approx" && "$vsag_cuvs" -eq 0 ]] || fail_case vsag_cpu_route "cuvs_markers=$vsag_cuvs"
 record_case vsag_cpu_route PASS "cuvs_markers=0"
 
-if mysql_cmd "$PORT" -e 'use hipvs_gate; create table bad_cos(id int primary key, v vector(128), vector index idx(v) with (distance=cosine,type=hnsw,lib=cuvs));' >"$EVIDENCE/ddl-cosine.log" 2>&1; then
-  fail_case ddl_non_l2 "lib=cuvs cosine unexpectedly succeeded"
+# [cosine] lib=cuvs now accepts distance=cosine: the graph is built over unit
+# vectors (CAGRA ranks by L2, which preserves cosine order) and results are
+# rescored to exact cosine distance. Assert the DDL is accepted, that the GPU
+# actually served the query, and that ANN ids match the exact plan.
+if mysql_cmd "$PORT" -e 'use hipvs_gate; create table t_cos(id int primary key, v vector(128), vector index idx_cos(v) with (distance=cosine,type=hnsw,lib=cuvs,m=16,ef_construction=200,ef_search=200));' >"$EVIDENCE/ddl-cosine.log" 2>&1; then
+  :
+else
+  fail_case cosine_metric "lib=cuvs cosine DDL rejected: $(tail -n 2 "$EVIDENCE/ddl-cosine.log" | tr '\n' ' ')"
 fi
+mysql_cmd "$PORT" < "$DATA_DIR/cos.sql" >/dev/null
+offset=$(trace_offset "$TRACE")
+cos_approx=$(cos_ids "$PORT" t_cos "$QUERY" approx)
+cos_exact=$(cos_ids "$PORT" t_cos "$QUERY" exact)
+cos_serves=$(trace_count "$TRACE" "$offset" cuvs_serve)
+cos_overlap=$(python3 -c 'import sys;a=set(sys.argv[1].split(","));b=set(sys.argv[2].split(","));print(len(a&b))' "$cos_approx" "$cos_exact")
+[[ "$cos_serves" -ge 1 ]] || fail_case cosine_metric "cosine query did not use the GPU path (serve=$cos_serves)"
+[[ -n "$cos_approx" && "$cos_overlap" -ge 9 ]] || fail_case cosine_metric "cosine ANN mismatch serve=$cos_serves overlap=$cos_overlap/10 approx=$cos_approx exact=$cos_exact"
+record_case cosine_metric PASS "serve=$cos_serves overlap=$cos_overlap/10"
+
 if mysql_cmd "$PORT" -e 'use hipvs_gate; create table bad_ip(id int primary key, v vector(128), vector index idx(v) with (distance=inner_product,type=hnsw,lib=cuvs));' >"$EVIDENCE/ddl-inner-product.log" 2>&1; then
   fail_case ddl_non_l2 "lib=cuvs inner_product unexpectedly succeeded"
 fi
-grep -q 'lib=cuvs only supports distance=l2' "$EVIDENCE/ddl-cosine.log" || fail_case ddl_non_l2 "cosine error text mismatch"
-grep -q 'lib=cuvs only supports distance=l2' "$EVIDENCE/ddl-inner-product.log" || fail_case ddl_non_l2 "inner_product error text mismatch"
-record_case ddl_non_l2 PASS "cosine and inner_product rejected"
+grep -q 'lib=cuvs supports distance=l2 and distance=cosine only' "$EVIDENCE/ddl-inner-product.log" || fail_case ddl_non_l2 "inner_product error text mismatch"
+record_case ddl_non_l2 PASS "inner_product rejected"
 
 mysql_cmd "$PORT" < "$DATA_DIR/cuvs-1.sql" >/dev/null
 offset=$(trace_offset "$TRACE")

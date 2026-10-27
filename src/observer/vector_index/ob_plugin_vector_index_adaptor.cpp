@@ -1362,16 +1362,19 @@ int ObPluginVectorIndexAdaptor::init_sparse_vector_type()
 }
 
 // [hipVS/cuVS] Mark a just-populated index handle for the GPU path when the
-// vector index was declared WITH (lib=cuvs) on a dense L2 HNSW index. Idempotent.
+// vector index was declared WITH (lib=cuvs) on a dense HNSW index. L2 is served
+// directly; cosine is served over unit vectors with exact rescoring. Idempotent.
 static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
 {
   ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data);
   if (handle != nullptr && param != nullptr
       && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
-      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && (param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+          || param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_COS)
       && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
           || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
-    oceanbase::common::obvsag::mark_cuvs_index(handle);
+    oceanbase::common::obvsag::mark_cuvs_index(
+        handle, param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_COS);
   }
 }
 

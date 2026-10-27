@@ -541,9 +541,13 @@ int ObVectorIndexUtil::parser_params_from_string(
     }
     if (OB_SUCC(ret)
         && param.lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
-        && param.dist_algorithm_ != ObVectorIndexDistAlgorithm::VIDA_L2) {
+        && param.dist_algorithm_ != ObVectorIndexDistAlgorithm::VIDA_L2
+        && param.dist_algorithm_ != ObVectorIndexDistAlgorithm::VIDA_COS) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("lib=cuvs only supports distance=l2", K(ret), K(param.dist_algorithm_));
+      LOG_WARN("lib=cuvs supports distance=l2 and distance=cosine only",
+               K(ret), K(param.dist_algorithm_));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                     "lib=cuvs supports distance=l2 and distance=cosine only");
     }
   }
   return ret;
@@ -3308,10 +3312,13 @@ int ObVectorIndexUtil::check_index_param(
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "hnsw vector index lib name not equal to 'VSAG' or 'CUVS' is");
         }
         if (OB_FAIL(ret)) {
-        } else if (lib_is_set && lib_name == "CUVS" && distance_name != "L2") {
+        } else if (lib_is_set && lib_name == "CUVS"
+                   && distance_name != "L2" && distance_name != "COSINE") {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("lib=cuvs only supports distance=l2", K(ret), K(distance_name));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "lib=cuvs only supports distance=l2");
+          LOG_WARN("lib=cuvs supports distance=l2 and distance=cosine only",
+                   K(ret), K(distance_name));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "lib=cuvs supports distance=l2 and distance=cosine only");
         }
         if (OB_FAIL(ret)) {
         } else if (ef_construction_value <= m_value) {
