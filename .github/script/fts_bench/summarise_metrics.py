@@ -50,27 +50,35 @@ def render(metrics: dict[str, list[float]], categories: dict[str, list[float]]) 
     if not metrics:
         return "\n_no scoreable benchmark output_\n"
 
+    rounds = max(len(values) for values in metrics.values())
+    header = "| metric | " + " | ".join(f"round {i + 1}" for i in range(rounds))
+    header += " | mean | spread (max-min)/mean |"
+    divider = "| --- |" + " --- |" * (rounds + 2)
+
     lines = [
         "",
-        "### Measured values (mean over repeats)",
+        "### Per-round measured values",
         "",
-        "Compare the `mean` column with the same table of the pristine run;",
-        "`improvement` versus the upstream CI baseline is a reference only.",
+        "Read the per-round columns before the mean: a difference between two runs",
+        "that sits inside the spread below is not evidence of a speed-up.",
         "",
-        "| metric | n | mean | min | max |",
-        "| --- | --- | --- | --- | --- |",
+        header,
+        divider,
     ]
     for name in sorted(metrics):
         values = metrics[name]
-        lines.append(
-            f"| `{name}` | {len(values)} | {statistics.mean(values):.6g} "
-            f"| {min(values):.6g} | {max(values):.6g} |"
-        )
+        cells = " | ".join(f"{value:.6g}" for value in values)
+        cells += " |" * (rounds - len(values))
+        mean = statistics.mean(values)
+        spread = (max(values) - min(values)) / mean * 100 if mean else float("nan")
+        lines.append(f"| `{name}` | {cells} | {mean:.6g} | {spread:.1f}% |")
 
     if categories:
         lines += [
             "",
             "### Category improvements versus the upstream CI baseline",
+            "",
+            "Reference only: the baseline was measured on the slower VLDB CI.",
             "",
             "| category | mean improvement |",
             "| --- | --- |",

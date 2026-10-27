@@ -36,7 +36,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: fts-bench-${{ github.ref }}
+  # Keyed on the ref under test as well: two dispatch runs (e.g. pristine vs
+  # candidate) must be able to run side by side, and a push to the workflow
+  # branch must not cancel an in-flight measurement of another ref.
+  group: fts-bench-${{ github.ref }}-${{ inputs.ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -93,6 +96,8 @@ jobs:
             echo "| --- | --- |"
             echo "| ref | \`${{ inputs.ref || github.ref }}\` |"
             echo "| head sha | \`$(git rev-parse HEAD)\` |"
+            echo "| runner name | \`${RUNNER_NAME}\` |"
+            echo "| cpu model | $(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//') |"
             echo "| nproc | $(nproc) |"
             echo "| memory | $(awk '/MemTotal/ {printf \"%.1f GiB\", $2/1024/1024}' /proc/meminfo) |"
             echo "| mysql client | $(mysql --version 2>/dev/null || echo missing) |"
@@ -127,6 +132,20 @@ jobs:
         run: |
           set -euo pipefail
           ls -l build_release/src/observer/seekdb build_release/src/observer/observer
+
+      - name: Upload seekdb binary
+        uses: actions/upload-artifact@v4
+        with:
+          # Kept so a later comparison of another ref can try to reuse this
+          # build instead of paying another ~90 min compile. Reuse has not been
+          # proven to work for a full server start yet (the AI E2E attempt saw
+          # the server never open its port), so treat it as unverified.
+          name: seekdb-binary
+          path: |
+            build_release/src/observer/seekdb
+            build_release/src/observer/observer
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Run fts_large_bench
         shell: bash
