@@ -137,6 +137,20 @@ public:
   ObFTParserProperty();
   ~ObFTParserProperty() = default;
   int parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str);
+  /**
+   * Same as parse_for_parser_helper(), but reads the configuration from an already
+   * parsed property object, so callers that hold one do not have to print it to
+   * json and parse it back again.
+   */
+  int parse_from_json_props(const ObFTParser &parser, const ObFTParserJsonProps &props);
+
+  /**
+   * @param[in] props_empty, whether the caller provided no property at all, in which
+   *            case the type specific defaults are used.
+   */
+  int do_parse_from_props(const ObFTParser &parser,
+                          const ObFTParserJsonProps &props,
+                          const bool props_empty);
 
   bool is_equal(const ObFTParserProperty &other) const
   {

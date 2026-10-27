@@ -162,6 +162,15 @@ public:
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
   /**
+   * Same as init() above, but takes the already parsed parser properties. It exists
+   * because callers that just built the properties object would otherwise have to
+   * print it to json and parse it back before calling init().
+   */
+  int init(
+      common::ObIAllocator *allocator,
+      const common::ObString &parser_name,
+      const ObFTParserJsonProps &parser_properties);
+  /**
    * Split document into multiple words
    *
    * @param[in] type, collation type for fulltext

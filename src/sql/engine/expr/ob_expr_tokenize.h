@@ -69,6 +69,9 @@ private:
   public:
     // for property and tmp json string
     mutable ObArenaAllocator allocator_;
+    // the reformed parser properties, passed to the parser helper as an object so that
+    // tokenize does not have to print it to json and parse it back per row
+    storage::ObFTParserJsonProps parser_props_;
     ObString parser_name_;
     ObString properties_;
     ObObjMeta meta_;
