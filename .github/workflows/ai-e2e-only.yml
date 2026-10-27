@@ -1,0 +1,108 @@
+name: AI E2E replay (reuse a compiled seekdb)
+
+# Iteration loop for the official 600069 cases: instead of paying a full release
+# build (about 1h30) for every change to the replay harness, download the
+# seekdb binary produced by an earlier "Compile check (fork)" run and replay the
+# harness on top of it.  The binary is the only slow artifact; everything the
+# harness asserts lives in this repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: 'Run id of "Compile check (fork)" that uploaded the seekdb-binary artifact'
+        required: true
+      harness_ref:
+        description: 'Ref that provides the E2E harness (empty: the ref this workflow runs on)'
+        required: false
+        default: ''
+      harness_args:
+        description: 'Extra arguments for run_ai_e2e.py (e.g. --skip-file-sql)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ai-e2e-${{ github.ref }}-${{ github.event.inputs.source_run }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  SEEKDB_BINARY_PATH: build_release/src/observer/seekdb
+
+jobs:
+  replay:
+    name: Replay the official AI cases on a reused binary
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the harness
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.harness_ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Report platform
+        run: |
+          set -euo pipefail
+          uname -a
+          nproc
+          python3 --version
+          echo "source run: ${{ inputs.source_run }}"
+          git log --oneline -3
+
+      - name: Download the compiled binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$SEEKDB_BINARY_PATH")"
+          GH_TOKEN="${{ github.token }}" gh run download "${{ inputs.source_run }}" \
+            --repo "${{ github.repository }}" \
+            --name seekdb-binary \
+            --dir "$(dirname "$SEEKDB_BINARY_PATH")"
+          chmod +x "$SEEKDB_BINARY_PATH"
+          ls -l "$SEEKDB_BINARY_PATH"
+
+      - name: Prepare dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build.sh release --init
+
+      - name: Install MySQL client library
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check pymysql cryptography
+
+      - name: Replay the official cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lib_dir in \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib" \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib64"; do
+            [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+          python3 .github/script/ai_function_e2e/run_ai_e2e.py \
+            --seekdb "$SEEKDB_BINARY_PATH" \
+            --base-dir "$RUNNER_TEMP/seekdb-ai-e2e" \
+            --port 2881 \
+            --mock-port 8000 \
+            --work-dir "$RUNNER_TEMP/ai-e2e" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            ${{ inputs.harness_args }}
+
+      - name: Upload evaluation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-e2e-logs-reuse
+          path: |
+            ${{ runner.temp }}/ai-e2e
+            ${{ runner.temp }}/seekdb-ai-e2e/log
+            /tmp/seekdb_ai_column_mock_*
+          if-no-files-found: ignore
+          retention-days: 7

@@ -6,6 +6,11 @@ name: Compile check (fork)
 # `buildbase` recipe (init deps + release build) without the Rust unit tests, so
 # a C++ patch can be proven to compile before it is handed to the competition
 # evaluation queue.
+#
+# The same job then replays the official AI-function evaluation case against the
+# freshly built `seekdb` binary, so a behaviour patch (not only a compile fix)
+# can be verified here instead of waiting for the queue:
+#   .github/script/ai_function_e2e/run_ai_e2e.py
 
 on:
   # Upstream keeps compile.yml behind workflow_call only, and a fork cannot
@@ -21,6 +26,11 @@ on:
         description: 'Branch, tag or SHA to build (empty = the dispatched ref)'
         required: false
         type: string
+      run_ai_e2e:
+        description: 'Replay the AI-function evaluation case after the build'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -28,6 +38,10 @@ permissions:
 concurrency:
   group: compile-check-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Set to '0' to skip the behavioural replay and only prove compilation.
+  RUN_AI_E2E: ${{ github.event_name == 'workflow_dispatch' && (inputs.run_ai_e2e && '1' || '0') || '1' }}
 
 jobs:
   build:
@@ -65,7 +79,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git wget rpm rpm2cpio cpio make build-essential binutils \
-            m4 libtool-bin libncurses5 python3
+            m4 libtool-bin libncurses5 python3 python3-pip
 
       - name: Cache third-party deps
         uses: actions/cache@v4
@@ -95,3 +109,50 @@ jobs:
         run: |
           set -euo pipefail
           ls -l build_release/src/observer/seekdb build_release/src/observer/observer
+
+      - name: Upload seekdb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: seekdb-binary
+          path: |
+            build_release/src/observer/seekdb
+            build_release/src/observer/observer
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Install MySQL client library
+        if: env.RUN_AI_E2E == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check pymysql cryptography
+
+      - name: Replay official AI-function, file-SQL and AI-column evaluation
+        if: env.RUN_AI_E2E == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lib_dir in \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib" \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib64"; do
+            [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+          python3 .github/script/ai_function_e2e/run_ai_e2e.py \
+            --seekdb build_release/src/observer/seekdb \
+            --base-dir "$RUNNER_TEMP/seekdb-ai-e2e" \
+            --port 2881 \
+            --mock-port 8000 \
+            --work-dir "$RUNNER_TEMP/ai-e2e" \
+            --repo-root "$GITHUB_WORKSPACE"
+
+      - name: Upload evaluation logs
+        if: always() && env.RUN_AI_E2E == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-e2e-logs
+          path: |
+            ${{ runner.temp }}/ai-e2e
+            ${{ runner.temp }}/seekdb-ai-e2e/log
+            /tmp/seekdb_ai_column_mock_*
+          if-no-files-found: ignore
+          retention-days: 7
