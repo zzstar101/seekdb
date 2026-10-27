@@ -31,6 +31,12 @@ on:
         default: '3'
         type: choice
         options: ['1', '2', '3', '4', '5']
+      replay:
+        description: 'Also replay the FTS correctness checks on the same build'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 permissions:
   contents: read
@@ -229,6 +235,39 @@ jobs:
             cp -r "$base/log" "$OUT/log-$i" 2>/dev/null || true
           done
 
+      - name: Replay FTS correctness checks
+        if: ${{ inputs.replay == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lib_dir in \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib" \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib64"; do
+            [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+
+          python3 -m pip install --quiet pymysql cryptography
+
+          SERVER="$GITHUB_WORKSPACE/build_release/src/observer/seekdb"
+          OUT="$RUNNER_TEMP/fts-replay"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/db"
+
+          # A fresh instance: the checks must not inherit the benchmark's data.
+          "$SERVER" --base-dir="$OUT/db" --port=2881 --nodaemon > "$OUT/server.log" 2>&1 &
+          server_pid=$!
+          python3 "$RUNNER_TEMP/fts_tools/wait_for_port.py" --port 2881 --timeout 900
+
+          set +e
+          python3 "$RUNNER_TEMP/fts_tools/replay_fts_regression.py" --port 2881 2>&1 | tee "$OUT/replay.log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          kill "$server_pid" 2>/dev/null || true
+          wait "$server_pid" 2>/dev/null || true
+          cp -r "$OUT/db/log" "$OUT/log" 2>/dev/null || true
+          exit "$status"
+
       - name: Summarise metrics across repeats
         if: always()
         shell: bash
@@ -244,5 +283,6 @@ jobs:
           name: fts-bench-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/fts-bench
+            ${{ runner.temp }}/fts-replay
           if-no-files-found: warn
           retention-days: 14
