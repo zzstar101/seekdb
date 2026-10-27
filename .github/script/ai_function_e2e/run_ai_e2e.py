@@ -18,6 +18,9 @@ tolerated so the replay keeps the official ordering.
 """
 
 import argparse
+import base64
+import datetime
+import decimal
 import json
 import os
 import shutil
@@ -183,6 +186,122 @@ STEPS = [
 ]
 
 
+FILE_SQL_DATA_SOURCE = Path("tools/deploy/mysql_test/test_suite/file_sql/data")
+
+
+def prepare_file_sql_fixtures(repo_root, target):
+    """Reproduce include/copy_file_sql_data.inc without ssh/scp.
+
+    The official case copies the fixtures into the observer working directory and
+    decodes simple.parquet.b64 there; locally we only need a plain directory the
+    server can read.
+    """
+    source = Path(repo_root) / FILE_SQL_DATA_SOURCE
+    if not source.is_dir():
+        return None
+    target = Path(target)
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    for item in source.iterdir():
+        if item.suffix == ".b64":
+            (target / item.stem).write_bytes(base64.b64decode(item.read_text(encoding="utf-8")))
+        else:
+            shutil.copy2(item, target / item.name)
+    return target
+
+
+def file_sql_steps(data_dir):
+    """Assertions of tools/deploy/mysql_test/test_suite/file_sql/t/file_sql_basic.test."""
+    root = str(Path(data_dir)).replace("\\", "/")
+    csv_path = "{}/basic.csv".format(root)
+    jsonl_path = "{}/basic.jsonl".format(root)
+    parquet_path = "{}/simple.parquet".format(root)
+    export_path = "{}/export.csv".format(root)
+    return [
+        ("check", {
+            "name": "enable_file_sql defaults to OFF",
+            "sql": "select @@session.enable_file_sql",
+            "expect": {"rows": [[0]]},
+        }),
+        ("error", "select count(*) from read_csv('{}')".format(csv_path), (1235,),
+         "read_csv rejected while the gate is off"),
+        ("sql", "set session enable_file_sql = ON"),
+        ("check", {
+            "name": "read_csv scans once the gate is on",
+            "sql": "select count(*) from read_csv('{}')".format(csv_path),
+            "expect": {"rows": [[3]]},
+        }),
+        ("error", "select * from read_csv('{}', 'xml')".format(csv_path), (1064,),
+         "unknown reader format is a syntax error"),
+        ("error", "select * from read_csv('{}', sample_size = 10)".format(csv_path), (1235,),
+         "unsupported reader option is rejected"),
+        ("check", {
+            "name": "csv scan: type conversion, duplicate header, multiline quote",
+            "sql": "select id, name, score, active, day, created, "
+                   "replace(note, char(10), '<NL>') as note, id__2 "
+                   "from read_csv('{}') f order by id".format(csv_path),
+            "expect": {"rows": [
+                [1, "Alice", 98.5, 1, "2026-08-01", "2026-08-01 10:11:12", "hello,<NL>world", 101],
+                [2, "Bob", 87, 0, None, None, "plain", 102],
+                [3, "Chen", 90.25, 1, "2026-08-03", "2026-08-03 12:13:14", 'say "hi"', 103],
+            ]},
+        }),
+        ("check", {
+            "name": "csv aggregate over inferred schema",
+            "sql": "select count(*) as row_count, sum(id) as id_sum, "
+                   "round(avg(score), 2) as score_avg, sum(active) as active_count "
+                   "from read_csv('{}', header = true, sample_size = -1) f".format(csv_path),
+            "expect": {"rows": [[3, 6, 91.92, 2]]},
+        }),
+        ("check", {
+            "name": "jsonl union schema with missing fields",
+            "sql": "select id, name, score, active, day, note "
+                   "from read_json('{}', format = 'newline_delimited') f order by id".format(jsonl_path),
+            "expect": {"rows": [
+                [1, "Alice", 98.5, 1, None, None],
+                [2, "Bob", None, 0, "2026-08-02", None],
+                [3, "Chen", 90, 1, None, "ok"],
+            ]},
+        }),
+        ("check", {
+            "name": "describe renders the inferred csv schema",
+            "sql": "describe select * from read_csv('{}')".format(csv_path),
+            "expect": {"lenient_null": True, "rows": [
+                ["id", "BIGINT", "NO", None, None, None],
+                ["name", "VARCHAR", "NO", None, None, None],
+                ["score", "DOUBLE", "NO", None, None, None],
+                ["active", "BOOLEAN", "NO", None, None, None],
+                ["day", "DATE", "YES", None, None, None],
+                ["created", "DATETIME", "YES", None, None, None],
+                ["note", "VARCHAR", "NO", None, None, None],
+                ["id__2", "BIGINT", "NO", None, None, None],
+            ]},
+        }),
+        ("check", {
+            "name": "parquet scan aggregates projected columns",
+            "sql": "select count(*) as row_count, min(c1) as min_c1, "
+                   "max(c1) as max_c1, sum(c1) as sum_c1 "
+                   "from read_parquet('{}') p".format(parquet_path),
+            "expect": {"rows": [[7, 0, 6, 21]]},
+        }),
+        ("check", {
+            "name": "glob lists every fixture as one file column",
+            "sql": "select substring_index(file, '/', -1) as file from glob('{}/*') "
+                   "order by file".format(root),
+            "expect": {"rows": [["basic.csv"], ["basic.jsonl"], ["invalid.txt"], ["simple.parquet"]]},
+        }),
+        ("sql", "copy (select id, name, score from read_csv('{}') order by id) "
+                "to '{}' (format csv, header, nullstr 'NULL')".format(csv_path, export_path)),
+        ("check", {
+            "name": "csv written by copy reads back",
+            "sql": "select id, name, score from read_csv('{}') order by id".format(export_path),
+            "expect": {"rows": [[1, "Alice", 98.5], [2, "Bob", 87], [3, "Chen", 90.25]]},
+        }),
+        ("sql", "set session enable_file_sql = OFF"),
+    ]
+
+
 def wait_port(port, timeout, host="127.0.0.1"):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -207,6 +326,13 @@ def normalise(value):
         return None
     if isinstance(value, bool):
         return int(value)
+    if isinstance(value, datetime.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, datetime.date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, decimal.Decimal):
+        integral = value.to_integral_value()
+        return int(value) if value == integral else float(value)
     if isinstance(value, (int, float)):
         return value
     text = str(value)
@@ -220,7 +346,7 @@ def normalise(value):
         return text
 
 
-def compare_rows(actual, expected):
+def compare_rows(actual, expected, lenient_null=False):
     if len(actual) != len(expected):
         return "row count {} != expected {}".format(len(actual), expected)
     for index, (got, want) in enumerate(zip(actual, expected)):
@@ -229,7 +355,7 @@ def compare_rows(actual, expected):
         for column, (got_value, want_value) in enumerate(zip(got, want)):
             got_normalised = normalise(got_value)
             if want_value is None:
-                if got_normalised is not None:
+                if got_normalised is not None and not (lenient_null and got_normalised == "NULL"):
                     return "row {} column {} = {!r}, expected NULL".format(index, column, got_value)
             elif got_normalised != want_value:
                 return "row {} column {} = {!r}, expected {!r}".format(index, column, got_value, want_value)
@@ -238,6 +364,19 @@ def compare_rows(actual, expected):
 
 def run_step(cursor, step):
     kind = step[0]
+    if kind == "error":
+        # ``--error N`` in the official case means: the statement must fail with N.
+        sql, allowed = step[1], step[2]
+        try:
+            cursor.execute(sql)
+            cursor.fetchall()
+            return False, "expected error {}, got success".format(list(allowed))
+        except Exception as error:  # noqa: BLE001 - errno matters, not the class
+            errno = error.args[0] if error.args else None
+            if errno in allowed:
+                return True, None
+            return False, "{}: {}".format(errno, error)
+
     if kind == "sql":
         sql = step[1]
         tolerated = step[2] if len(step) > 2 else (0,)
@@ -273,7 +412,7 @@ def run_step(cursor, step):
                 json.dumps(expect["json"], ensure_ascii=False, sort_keys=True))
         return True, None
 
-    problem = compare_rows(rows, expect["rows"])
+    problem = compare_rows(rows, expect["rows"], expect.get("lenient_null", False))
     return (problem is None), problem
 
 
@@ -285,6 +424,10 @@ def main():
     parser.add_argument("--mock-port", type=int, default=8000)
     parser.add_argument("--work-dir", default="")
     parser.add_argument("--keep-running", action="store_true")
+    parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[3]),
+                        help="checkout root, used to locate the official file_sql fixtures")
+    parser.add_argument("--skip-file-sql", action="store_true",
+                        help="only replay the AI-function case")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir or os.environ.get("RUNNER_TEMP") or "/tmp") / "ai-e2e"
@@ -298,6 +441,15 @@ def main():
     mock_log = work_dir / "mock.log"
     for path in (seekdb_log, mock_log):
         path.write_text("", encoding="utf-8")
+
+    steps = list(STEPS)
+    if not args.skip_file_sql:
+        fixtures = prepare_file_sql_fixtures(args.repo_root, work_dir / "file_sql_data")
+        if fixtures is None:
+            print("SKIP  file_sql fixtures not found under {}".format(args.repo_root), flush=True)
+        else:
+            steps.extend(file_sql_steps(fixtures))
+            print("file_sql fixtures at {}".format(fixtures), flush=True)
 
     mock_script = Path(__file__).with_name("mock_ai_endpoints.py")
     mock = subprocess.Popen(
@@ -350,15 +502,16 @@ def main():
         with connection.cursor() as cursor:
             cursor.execute("create database if not exists ai_e2e")
             cursor.execute("use ai_e2e")
-            for step in STEPS:
+            for step in steps:
                 ok, problem = run_step(cursor, step)
-                if step[0] == "check":
-                    name = step[1]["name"]
+                if step[0] in ("check", "error"):
+                    name = step[1]["name"] if step[0] == "check" else step[3]
                     if ok:
                         print("PASS  {}".format(name), flush=True)
                     else:
                         print("FAIL  {} :: {}".format(name, problem), flush=True)
-                        failures.append((name, step[1]["sql"], problem))
+                        failures.append((name, step[1]["sql"] if step[0] == "check" else step[1],
+                                         problem))
                 elif not ok:
                     print("FAIL  setup statement :: {}".format(problem), flush=True)
                     failures.append(("setup", step[1], problem))
@@ -385,7 +538,7 @@ def main():
         for name, sql, problem in failures:
             print("- {} :: {} :: {}".format(name, " ".join(sql.split())[:160], problem))
         return 1
-    print("\nall AI-function assertions passed")
+    print("\nall assertions passed")
     return 0
 
 
