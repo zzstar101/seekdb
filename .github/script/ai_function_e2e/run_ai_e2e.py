@@ -676,6 +676,19 @@ def _task_count_sql(db, table):
             "where d.database_name = '{}' and t.table_name = '{}'".format(db, table))
 
 
+def _tasks_absent_sql(db, table):
+    """``count(*) = 0`` over the task rows of one table.
+
+    ``_task_count_sql`` already aggregates, so wrapping it in another
+    ``count(*)`` would compare 1 to 0 and always fail; this helper keeps the
+    aggregate in the top position instead.
+    """
+    return ("select count(*) = 0 from oceanbase.__all_ai_column_task task "
+            "join oceanbase.__all_table t on t.table_id = task.table_id "
+            "join oceanbase.__all_database d on d.database_id = t.database_id "
+            "where d.database_name = '{}' and t.table_name = '{}'".format(db, table))
+
+
 def ai_column_worker_steps():
     """Assertions of ai_column/t/ai_column_worker.test.
 
@@ -752,7 +765,7 @@ def ai_column_worker_steps():
         }),
         ("check", {
             "name": "grouped tasks removed",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "sql": _tasks_absent_sql(db, "docs"),
             "expect": {"rows": [[1]]},
         }),
         ("mockassert", port, "typed-prompts"),
@@ -765,6 +778,7 @@ def ai_column_worker_steps():
         ("sql", "insert into {}.retry_docs(id, content) values(2, 'retry-once')".format(db)),
         ("wait", {
             "name": "retry state committed",
+            "interval": 0.05,
             "sql": ("select count(*) > 0 from oceanbase.__all_ai_column_task task "
                     "join oceanbase.__all_table t on t.table_id = task.table_id "
                     "join oceanbase.__all_database d on d.database_id = t.database_id "
@@ -782,7 +796,7 @@ def ai_column_worker_steps():
         }),
         ("check", {
             "name": "retry task removed",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "retry_docs")),
+            "sql": _tasks_absent_sql(db, "retry_docs"),
             "expect": {"rows": [[1]]},
         }),
         ("mockassert", port, "retry-once"),
@@ -795,7 +809,7 @@ def ai_column_worker_steps():
         ("sql", "insert into {}.fail_docs(id, content) values(3, 'terminal-failure')".format(db)),
         ("wait", {
             "name": "terminal failure removes task",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "fail_docs")),
+            "sql": _tasks_absent_sql(db, "fail_docs"),
             "expect": {"rows": [[1]]},
             "timeout": 15,
         }),
@@ -927,7 +941,7 @@ def ai_column_vector_steps():
         }),
         ("check", {
             "name": "vector task removed",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "sql": _tasks_absent_sql(db, "docs"),
             "expect": {"rows": [[1]]},
         }),
         ("check", {
@@ -966,7 +980,7 @@ def ai_column_vector_steps():
         }),
         ("check", {
             "name": "vector rollback removes task",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "sql": _tasks_absent_sql(db, "docs"),
             "expect": {"rows": [[1]]},
         }),
         ("sleep", 2),
@@ -1039,8 +1053,8 @@ def ai_column_retry_steps():
         }),
         ("check", {
             "name": "strict read defaults off",
-            "sql": "select @@ai_column_strict_read",
-            "expect": {"rows": [["off"]]},
+            "sql": "select @@ai_column_strict_read = 0",
+            "expect": {"rows": [[1]]},
         }),
 
         # ---- a business predicate retries exactly the selected rows ----
@@ -1085,7 +1099,7 @@ def ai_column_retry_steps():
         }),
         ("wait", {
             "name": "failed task rows cleaned",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "sql": _tasks_absent_sql(db, "docs"),
             "expect": {"rows": [[1]]},
             "timeout": 20,
         }),
@@ -1124,7 +1138,7 @@ def ai_column_retry_steps():
         }),
         ("check", {
             "name": "zero match creates no tasks",
-            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "sql": _tasks_absent_sql(db, "docs"),
             "expect": {"rows": [[1]]},
         }),
         ("sql", "alter table {} retry ai column result "
@@ -1279,6 +1293,7 @@ def run_step(cursor, step):
         # "this must never be visible" assertions: seeing it is a failure.
         payload = step[1]
         timeout = float(payload.get("timeout", 30))
+        interval = float(payload.get("interval", 1.0))
         deadline = time.time() + timeout
         rows = []
         problem = "no attempt"
@@ -1303,7 +1318,7 @@ def run_step(cursor, step):
                 problem = "{}: {}".format(error.args[0] if error.args else None, error)
             if time.time() > deadline:
                 return False, "timeout after {}s: {}".format(int(timeout), problem)
-            time.sleep(1)
+            time.sleep(interval)
 
     if kind == "error":
         # ``--error N`` in the official case means: the statement must fail with N.
