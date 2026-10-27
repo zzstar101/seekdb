@@ -458,6 +458,11 @@ Status Walker::walk(int dir_fd, size_t index, const std::string &prefix, size_t 
   const std::string &component = components_[index];
   const bool last = index + 1 == components_.size();
   const bool globstar = component == "**";
+  // Shell-style expansion requires a literal dot at the start of each hidden
+  // path component. In particular, '**' must not descend into hidden folders.
+  // Apply this in the filesystem walker, not the general string matcher.
+  const bool explicit_dot = component[0] == '.'
+      || (component.size() > 1 && component[0] == '\\' && component[1] == '.');
   {
     auto found = expanded_.find(std::make_pair(prefix, index));
     if (found == expanded_.end()) {
@@ -497,6 +502,7 @@ Status Walker::walk(int dir_fd, size_t index, const std::string &prefix, size_t 
       const char *name = entry->d_name;
       // "." and ".." are never candidates, whatever the pattern says.
       if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+      if (name[0] == '.' && !explicit_dot) continue;
       if (!glob_match(component, name)) continue;
       struct stat metadata;
       // No symlink is ever followed; an entry that raced away is simply skipped.

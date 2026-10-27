@@ -321,7 +321,7 @@ void test_traversal_ordering_and_bounds()
   GlobResult result;
 
   CHECK(glob_files("**/*.csv", f.root.c_str(), options, result) == Status::Ok);
-  std::vector<std::string> expected{f.at(".hidden.csv"), f.at("a/b/c/three.csv"), f.at("a/b/two.csv"),
+  std::vector<std::string> expected{f.at("a/b/c/three.csv"), f.at("a/b/two.csv"),
                                     f.at("a/one.csv"), f.at("top.csv"), f.at("z/zed.csv")};
   std::sort(expected.begin(), expected.end());
   CHECK(listed(result) == expected);
@@ -354,7 +354,7 @@ void test_traversal_ordering_and_bounds()
 
   // Directories are never returned.
   CHECK(glob_files("*", f.root.c_str(), options, result) == Status::Ok);
-  CHECK((files_are(result, {f.at(".hidden.csv"), f.at("note.txt"), f.at("top.csv")})));
+  CHECK((files_are(result, {f.at("note.txt"), f.at("top.csv")})));
   CHECK(glob_files("a/b/*", f.root.c_str(), options, result) == Status::Ok);
   CHECK((files_are(result, {f.at("a/b/notes.txt"), f.at("a/b/two.csv")})));
 
@@ -363,7 +363,7 @@ void test_traversal_ordering_and_bounds()
   CHECK(mkfifo(fifo.c_str(), 0600) == 0);
   f.own(fifo);
   CHECK(glob_files("*.csv", f.root.c_str(), options, result) == Status::Ok);
-  CHECK((files_are(result, {f.at(".hidden.csv"), f.at("top.csv")})));
+  CHECK((files_are(result, {f.at("top.csv")})));
 
   // A pattern without wildcards returns exactly that file, and no-match is not an error.
   CHECK(glob_files("a/b/two.csv", f.root.c_str(), options, result) == Status::Ok);
@@ -395,7 +395,7 @@ void test_traversal_ordering_and_bounds()
   for (const auto &relative : under_a) under_a_expected.push_back(f.at(relative));
   std::sort(under_a_expected.begin(), under_a_expected.end());
   CHECK(listed(result) == under_a_expected);
-  std::vector<std::string> all{".hidden.csv", "a/b/c/three.csv", "a/b/notes.txt", "a/b/two.csv",
+  std::vector<std::string> all{"a/b/c/three.csv", "a/b/notes.txt", "a/b/two.csv",
                                "a/one.csv", "note.txt", "top.csv", "z/zed.csv"};
   std::vector<std::string> all_expected;
   for (const auto &relative : all) all_expected.push_back(f.at(relative));
@@ -410,6 +410,66 @@ void test_traversal_ordering_and_bounds()
   hostile += "*.csv";
   CHECK(glob_files(hostile.c_str(), f.root.c_str(), options, result) == Status::Ok);
   CHECK(listed(result) == expected);
+}
+
+void test_hidden_path_components()
+{
+  Fixture f;
+  f.put("top.csv");
+  f.put("._top.csv");
+  f.put(".hidden.csv");
+  f.put("数据.csv");
+  f.dir("visible");
+  f.put("visible/child.csv");
+  f.put("visible/.hidden.csv");
+  f.dir(".cache");
+  f.put(".cache/cached.csv");
+  f.put(".cache/.hidden.csv");
+  f.dir("visible/.cache");
+  f.put("visible/.cache/nested.csv");
+
+  GlobOptions options;
+  GlobResult result;
+  // A filesystem wildcard never implicitly matches a leading dot. This also
+  // excludes metadata sidecars without special-casing their names or contents.
+  CHECK(glob_files("*", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("top.csv"), f.at("数据.csv")})));
+  CHECK(glob_files("*.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("top.csv"), f.at("数据.csv")})));
+  CHECK(glob_files("?hidden.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK(result.count() == 0);
+  CHECK(glob_files("[.]hidden.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK(result.count() == 0);
+  CHECK(glob_files("*.hidden.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK(result.count() == 0);
+
+  // Explicit and escaped leading dots still allow hidden files to be found.
+  CHECK(glob_files(".*", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("._top.csv"), f.at(".hidden.csv")})));
+  CHECK(glob_files("\\.*", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("._top.csv"), f.at(".hidden.csv")})));
+  CHECK(glob_files(".hidden.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at(".hidden.csv")})));
+  CHECK(glob_files((f.root + "/.*").c_str(), f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("._top.csv"), f.at(".hidden.csv")})));
+
+  // Apply the rule at every path segment, including recursive globstars.
+  CHECK(glob_files("*/*.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("visible/child.csv")})));
+  CHECK(glob_files("**/*.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("top.csv"), f.at("visible/child.csv"), f.at("数据.csv")})));
+  CHECK(glob_files("**", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("top.csv"), f.at("visible/child.csv"), f.at("数据.csv")})));
+  CHECK(glob_files("**/.*", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at("._top.csv"), f.at(".hidden.csv"), f.at("visible/.hidden.csv")})));
+  CHECK(glob_files(".cache/*.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at(".cache/cached.csv")})));
+  CHECK(glob_files("\\.cache/*.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at(".cache/cached.csv")})));
+  CHECK(glob_files("**/.cache/*.csv", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at(".cache/cached.csv"), f.at("visible/.cache/nested.csv")})));
+  CHECK(glob_files(".cache/.*", f.root.c_str(), options, result) == Status::Ok);
+  CHECK((files_are(result, {f.at(".cache/.hidden.csv")})));
 }
 
 void test_resource_limits()
@@ -503,6 +563,7 @@ int main()
   test_disabled_and_denials();
   test_symlink_escape();
   test_traversal_ordering_and_bounds();
+  test_hidden_path_components();
   test_resource_limits();
   test_descriptor_hygiene();
   test_directory_refill_keeps_descriptor_alive();

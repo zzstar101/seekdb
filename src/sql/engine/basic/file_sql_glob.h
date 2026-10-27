@@ -37,13 +37,16 @@ class GlobResult {
 };
 
 // Expand a shell-style pattern into regular files beneath secure_root.
+// A leading '.' in a file or directory name must be explicitly matched by a
+// literal or escaped dot in that path component; wildcards do not match it.
 // Mirrors the security model of file_scan_utils.cpp: descriptor-relative
 // traversal that never follows a symlink, denies "..", NUL and oversized
 // patterns, and returns a human-readable error through result.error().
 Status glob_files(const char *pattern, const char *secure_root,
                   const GlobOptions &options, GlobResult &result);
 
-// Filesystem-free pattern matcher used by glob_files() and by tests.
+// Filesystem-free pattern matcher used by glob_files() and by tests. The walker
+// applies the leading-dot rule separately before calling this string matcher.
 // '*' matches a run of non-'/' characters, '?' exactly one non-'/' character,
 // "**" a run including '/', "/**/" also a single '/', "[...]" a character class
 // (ranges, leading '!'/'^' negates, a leading ']' is literal) and '\' escapes
