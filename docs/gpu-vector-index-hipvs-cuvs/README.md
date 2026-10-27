@@ -156,6 +156,24 @@ validation comment rather than in the source tree.
 The no-GPU DDL contract remains covered by
 [`vector_index_cuvs_ddl.test`](../../tools/deploy/mysql_test/test_suite/vector_index/t/vector_index_cuvs_ddl.test).
 
+## Build benchmark
+
+`validation/run_gpu_smoke.sh` proves the plumbing works; it does not measure build
+time. [`bench/run_build_bench.sh`](bench/run_build_bench.sh) does, using the
+protocol the challenge asks for: start when the index does not exist yet, stop
+when `create vector index` has returned (index queryable), inputs already loaded.
+
+```bash
+docs/gpu-vector-index-hipvs-cuvs/bench/run_build_bench.sh \
+  --port 2981 --rows 2000,10000,50000 --repeat 3 \
+  --metric "l2 cosine" --out /tmp/seekdb-cuvs-bench
+```
+
+For every (rows, metric) group it runs the identical statement with `lib=vsag`
+and `lib=cuvs`, takes the **median of `--repeat` runs**, and records recall@k
+against ground truth computed from the generated vectors plus per-query latency.
+Output: `bench.jsonl` (machine readable) and `bench.md` (the summary table).
+
 ## Current limitations
 
 - Phase 1 supports dense float32 L2 and cosine indexes only.
