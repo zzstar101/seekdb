@@ -454,6 +454,7 @@ def ai_column_dml_steps():
     doc = "ai_column_p0_t1.docs"
     hidden = [("sql", "drop table if exists {}.docs".format("ai_column_p0_t1"), COLUMN_ANY)]
     steps = [
+        ("mockstart", AI_COLUMN_DML_PORT),
         ("sql", "drop database if exists ai_column_p0_t1", COLUMN_ANY),
         ("sql", "create database ai_column_p0_t1"),
         ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_t1_complete_ep')",
@@ -504,7 +505,7 @@ def ai_column_dml_steps():
         }),
 
         # ---- unrelated update: no invalidation, no request ----
-        ("mockreset", "unrelated update"),
+        ("mockreset", AI_COLUMN_DML_PORT),
         ("sql", "update {} set title = 'title-2' where id = 1".format(doc)),
         ("sleep", 2),
         ("check", {
@@ -517,7 +518,7 @@ def ai_column_dml_steps():
             "sql": task_count.format(0),
             "expect": {"rows": [[1]]},
         }),
-        ("mockassert", "no-requests", "unrelated update sends no request"),
+        ("mockassert", AI_COLUMN_DML_PORT, "no-requests"),
 
         # ---- dependent column update invalidates ----
         ("sql", "start transaction"),
@@ -577,7 +578,7 @@ def ai_column_dml_steps():
         }),
 
         # ---- rollback restores the row and drops the task ----
-        ("mockreset", "rollback"),
+        ("mockreset", AI_COLUMN_DML_PORT),
         ("sql", "start transaction"),
         ("sql", "update {} set content = 'rollback-value' where id = 2".format(doc)),
         ("check", {
@@ -604,7 +605,7 @@ def ai_column_dml_steps():
             "expect": {"rows": [[1]]},
         }),
         ("sleep", 2),
-        ("mockassert", "no-rollback-value", "rolled back value never reaches the model"),
+        ("mockassert", AI_COLUMN_DML_PORT, "no-rollback-value"),
 
         # ---- batch insert then delete inside one transaction ----
         ("sql", "start transaction"),
@@ -659,6 +660,336 @@ def ai_column_dml_cleanup_steps():
          COLUMN_DROP_ENDPOINT),
         ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_t1_complete')", COLUMN_DROP_MODEL),
         ("sql", "drop database if exists ai_column_p0_t1", COLUMN_ANY),
+        ("mockstop", AI_COLUMN_DML_PORT),
+    ]
+
+
+AI_COLUMN_WORKER_PORT = 19122
+AI_COLUMN_VECTOR_PORT = 19123
+
+
+def _task_count_sql(db, table):
+    return ("select count(*) from oceanbase.__all_ai_column_task task "
+            "join oceanbase.__all_table t on t.table_id = task.table_id "
+            "join oceanbase.__all_database d on d.database_id = t.database_id "
+            "where d.database_name = '{}' and t.table_name = '{}'".format(db, table))
+
+
+def ai_column_worker_steps():
+    """Assertions of ai_column/t/ai_column_worker.test.
+
+    Covers the grouped (one request per row, several AI columns) visibility rule,
+    a transient 400 that must be retried and then succeed, a terminal failure that
+    must leave NULL behind, and the stale-result guard: a slow request for the old
+    value must never overwrite the result of the newer value.
+    """
+    db = "ai_column_p0_worker"
+    docs = db + ".docs"
+    port = AI_COLUMN_WORKER_PORT
+    steps = [
+        ("mockstart", port),
+        ("sql", "drop database if exists {}".format(db), COLUMN_ANY),
+        ("sql", "create database {}".format(db)),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_worker_complete_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_worker_fail_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_worker_complete')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_worker_fail')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_worker_complete', "
+                "'{\"type\":\"completion\",\"model_name\":\"mock-complete\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_worker_fail', "
+                "'{\"type\":\"completion\",\"model_name\":\"mock-fail\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_worker_complete_ep', "
+                "'{\"ai_model_name\":\"p0_worker_complete\","
+                "\"url\":\"http://127.0.0.1:%d/v1/chat/completions\","
+                "\"access_key\":\"p0-worker-key\",\"provider\":\"openai\","
+                "\"request_model_name\":\"mock-complete\"}')" % port),
+        # ``always-fail`` is a path the official mock answers with HTTP 400.
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_worker_fail_ep', "
+                "'{\"ai_model_name\":\"p0_worker_fail\","
+                "\"url\":\"http://127.0.0.1:%d/v1/always-fail/completions\","
+                "\"access_key\":\"p0-worker-key\",\"provider\":\"openai\","
+                "\"request_model_name\":\"mock-fail\"}')" % port),
+        ("sql", "drop table if exists {}".format(docs), COLUMN_ANY),
+        ("sql", "create table {}(id bigint primary key, content varchar(200), "
+                "tags json AI COLUMN (AI_COMPLETE('p0_worker_complete', "
+                "concat('Classify: ', content))) WITH (sync_mode='async', max_retries=2), "
+                "score bigint AI COLUMN (AI_COMPLETE('p0_worker_complete', "
+                "concat('Score: ', content))) WITH (sync_mode='async', max_retries=2))".format(docs)),
+
+        # ---- one request group feeds two AI columns, and both appear together ----
+        ("sql", "start transaction"),
+        ("sql", "insert into {}(id, content) values(1, 'typed-prompts')".format(docs)),
+        ("check", {
+            "name": "group starts hidden",
+            "sql": "select tags is null and score is null from {} where id = 1".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "one request group for two columns",
+            "sql": ("select count(*) = 2 and count(distinct task.request_id) = 1 "
+                    "from oceanbase.__all_ai_column_task task "
+                    "join oceanbase.__all_table t on t.table_id = task.table_id "
+                    "join oceanbase.__all_database d on d.database_id = t.database_id "
+                    "where d.database_name = '{}' and t.table_name = 'docs'").format(db),
+            "expect": {"rows": [[1]]},
+        }),
+        ("sql", "commit"),
+        ("wait", {
+            "name": "no partial visibility",
+            "sql": ("select ifnull((tags is not null) + (score is not null), 0) "
+                    "from {} where id = 1".format(docs)),
+            "expect": {"rows": [[2]]},
+            "forbid": {"rows": [[1]]},
+            "timeout": 20,
+        }),
+        ("check", {
+            "name": "grouped results visible",
+            "sql": "select tags is not null and score = 7 from {} where id = 1".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "grouped tasks removed",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "expect": {"rows": [[1]]},
+        }),
+        ("mockassert", port, "typed-prompts"),
+
+        # ---- a transient 400 must be retried and then succeed ----
+        ("sql", "drop table if exists {}.retry_docs".format(db), COLUMN_ANY),
+        ("sql", "create table {}.retry_docs(id bigint primary key, content varchar(200), "
+                "result varchar(400) AI COLUMN (AI_COMPLETE('p0_worker_complete', content)) "
+                "WITH (sync_mode='async', max_retries=2))".format(db)),
+        ("sql", "insert into {}.retry_docs(id, content) values(2, 'retry-once')".format(db)),
+        ("wait", {
+            "name": "retry state committed",
+            "sql": ("select count(*) > 0 from oceanbase.__all_ai_column_task task "
+                    "join oceanbase.__all_table t on t.table_id = task.table_id "
+                    "join oceanbase.__all_database d on d.database_id = t.database_id "
+                    "where d.database_name = '{}' and t.table_name = 'retry_docs' "
+                    "and task.state = 3 and task.retry_count = 1").format(db),
+            "expect": {"rows": [[1]]},
+            "timeout": 15,
+        }),
+        ("wait", {
+            "name": "retry eventually completes",
+            "sql": "select ifnull(result = 'mock:retry-once', 0) from {}.retry_docs "
+                   "where id = 2".format(db),
+            "expect": {"rows": [[1]]},
+            "timeout": 20,
+        }),
+        ("check", {
+            "name": "retry task removed",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "retry_docs")),
+            "expect": {"rows": [[1]]},
+        }),
+        ("mockassert", port, "retry-once"),
+
+        # ---- terminal failure keeps NULL and drains the task ----
+        ("sql", "drop table if exists {}.fail_docs".format(db), COLUMN_ANY),
+        ("sql", "create table {}.fail_docs(id bigint primary key, content varchar(200), "
+                "result varchar(400) AI COLUMN (AI_COMPLETE('p0_worker_fail', content)) "
+                "WITH (sync_mode='async', max_retries=0))".format(db)),
+        ("sql", "insert into {}.fail_docs(id, content) values(3, 'terminal-failure')".format(db)),
+        ("wait", {
+            "name": "terminal failure removes task",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "fail_docs")),
+            "expect": {"rows": [[1]]},
+            "timeout": 15,
+        }),
+        ("check", {
+            "name": "terminal failure keeps null",
+            "sql": "select result is null from {}.fail_docs where id = 3".format(db),
+            "expect": {"rows": [[1]]},
+        }),
+
+        # ---- stale guard: slow old request must not overwrite the new value ----
+        ("mockreset", port),
+        ("sql", "insert into {}(id, content) values(4, 'slow-old')".format(docs)),
+        ("sleep", 0.3),
+        ("sql", "update {} set content = 'fast-new' where id = 4".format(docs)),
+        ("wait", {
+            "name": "latest request wins",
+            "sql": "select ifnull(tags is not null and score is not null, 0) "
+                   "from {} where id = 4".format(docs),
+            "expect": {"rows": [[1]]},
+            "timeout": 25,
+        }),
+        ("sleep", 2),
+        ("check", {
+            "name": "late old result cannot overwrite",
+            "sql": ("select json_unquote(json_extract(tags, '$.input')) = 'Classify: fast-new' "
+                    "and score = 7 from {} where id = 4".format(docs)),
+            "expect": {"rows": [[1]]},
+        }),
+        ("mockassert", port, "stale-guard"),
+    ]
+    return steps
+
+
+def ai_column_worker_cleanup_steps():
+    db = "ai_column_p0_worker"
+    return [
+        ("sql", "drop table if exists {}.fail_docs".format(db), COLUMN_ANY),
+        ("sql", "drop table if exists {}.retry_docs".format(db), COLUMN_ANY),
+        ("sql", "drop table if exists {}.docs".format(db), COLUMN_ANY),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_worker_fail_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_worker_complete_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_worker_fail')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_worker_complete')", COLUMN_DROP_MODEL),
+        ("sql", "drop database if exists {}".format(db), COLUMN_ANY),
+        ("mockstop", AI_COLUMN_WORKER_PORT),
+    ]
+
+
+def ai_column_vector_steps():
+    """Assertions of ai_column/t/ai_column_vector_index.test.
+
+    Checks that a regenerated AI vector leaves the ANN index (so a stale vector
+    cannot be hit), comes back when the new embedding is ready, and that a rollback
+    restores both the row and its index entry.
+    """
+    db = "ai_column_p0_vector"
+    docs = db + ".docs"
+    port = AI_COLUMN_VECTOR_PORT
+    ann = ("(select id from {} order by l2_distance(emb, [0,0,0,0]) "
+           "approximate limit {}) ann")
+    steps = [
+        ("mockstart", port),
+        ("sql", "drop database if exists {}".format(db), COLUMN_ANY),
+        ("sql", "create database {}".format(db)),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_vector_embed_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_vector_embed')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_vector_embed', "
+                "'{\"type\":\"dense_embedding\",\"model_name\":\"mock-embed\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_vector_embed_ep', "
+                "'{\"ai_model_name\":\"p0_vector_embed\","
+                "\"url\":\"http://127.0.0.1:%d/v1/embeddings\","
+                "\"access_key\":\"p0-vector-key\",\"provider\":\"openai\","
+                "\"request_model_name\":\"mock-embed\"}')" % port),
+        ("sql", "drop table if exists {}".format(docs), COLUMN_ANY),
+        ("sql", "create table {}(id bigint primary key, content varchar(200), "
+                "emb vector(4) AI COLUMN (AI_EMBED('p0_vector_embed', content)) "
+                "WITH (sync_mode='async', max_retries=2))".format(docs)),
+        ("sql", "insert into {}(id, content) values (1, 'vec-zero'), (2, 'vec-ten'), "
+                "(3, 'vec-twenty')".format(docs)),
+        ("wait", {
+            "name": "initial embeddings ready",
+            "sql": "select count(*) = 3 from {} where emb is not null".format(docs),
+            "expect": {"rows": [[1]]},
+            "timeout": 25,
+        }),
+        ("check", {
+            "name": "mock vectors are stored verbatim",
+            "sql": "select id from {} where emb is not null order by id".format(docs),
+            "expect": {"rows": [[1], [2], [3]]},
+        }),
+        ("sql", "create vector index idx_p0_ai_emb on {}(emb) "
+                "with(distance=l2, type=hnsw, lib=vsag, m=10, "
+                "ef_construction=12, ef_search=40)".format(docs)),
+        ("sql", "select id, l2_distance(emb, [0,0,0,0]) as distance from {} "
+                "order by distance approximate limit 3".format(docs)),
+
+        # ---- in-transaction regeneration: the stale vector must leave the index ----
+        ("sql", "start transaction"),
+        ("sql", "update {} set content = 'vec-zero' where id = 2".format(docs)),
+        ("check", {
+            "name": "vector hidden during regeneration",
+            "sql": "select content = 'vec-zero' and emb is null from {} "
+                   "where id = 2".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "vector update task created",
+            "sql": ("select count(*) = 1 from oceanbase.__all_ai_column_task task "
+                    "join oceanbase.__all_table t on t.table_id = task.table_id "
+                    "join oceanbase.__all_database d on d.database_id = t.database_id "
+                    "where d.database_name = '{}' and t.table_name = 'docs' "
+                    "and task.rowkey_predicate = '`id` = 2'").format(db),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "old vector removed from ann",
+            "sql": "select count(*) = 2 and sum(id = 2) = 0 from " + ann.format(docs, 3),
+            "expect": {"rows": [[1]]},
+        }),
+        ("sql", "commit"),
+        ("wait", {
+            "name": "regenerated vector ready",
+            "sql": "select emb = [0,0,0,0] from {} where id = 2".format(docs),
+            "expect": {"rows": [[1]]},
+            "timeout": 25,
+        }),
+        ("check", {
+            "name": "vector task removed",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "regenerated vector visible to ann",
+            "sql": ("select count(*) = 2 and sum(id = 1) = 1 and sum(id = 2) = 1 from "
+                    + ann.format(docs, 2)),
+            "expect": {"rows": [[1]]},
+        }),
+        ("mockassert", port, "embedding"),
+
+        # ---- rollback restores the row and its index entry, and sends no request ----
+        ("mockreset", port),
+        ("sql", "start transaction"),
+        ("sql", "update {} set content = 'vec-ten' where id = 3".format(docs)),
+        ("check", {
+            "name": "vector transaction sees invalidation",
+            "sql": "select content = 'vec-ten' and emb is null from {} "
+                   "where id = 3".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "vector transaction sees task",
+            "sql": ("select count(*) = 1 from oceanbase.__all_ai_column_task task "
+                    "join oceanbase.__all_table t on t.table_id = task.table_id "
+                    "join oceanbase.__all_database d on d.database_id = t.database_id "
+                    "where d.database_name = '{}' and t.table_name = 'docs' "
+                    "and task.rowkey_predicate = '`id` = 3'").format(db),
+            "expect": {"rows": [[1]]},
+        }),
+        ("sql", "rollback"),
+        ("check", {
+            "name": "vector rollback restores row",
+            "sql": "select content = 'vec-twenty' and emb = [20,0,0,0] from {} "
+                   "where id = 3".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "vector rollback removes task",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "expect": {"rows": [[1]]},
+        }),
+        ("sleep", 2),
+        ("mockassert", port, "no-requests"),
+        ("check", {
+            "name": "rollback vector still visible to ann",
+            "sql": ("select count(*) = 1 and sum(id = 3) = 1 from "
+                    "(select id from {} order by l2_distance(emb, [20,0,0,0]) "
+                    "approximate limit 1) ann").format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+    ]
+    return steps
+
+
+def ai_column_vector_cleanup_steps():
+    db = "ai_column_p0_vector"
+    return [
+        ("sql", "drop table if exists {}.docs".format(db), COLUMN_ANY),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_vector_embed_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_vector_embed')", COLUMN_DROP_MODEL),
+        ("sql", "drop database if exists {}".format(db), COLUMN_ANY),
+        ("mockstop", AI_COLUMN_VECTOR_PORT),
     ]
 
 
@@ -722,7 +1053,7 @@ def compare_rows(actual, expected, lenient_null=False):
     return None
 
 
-RUNTIME = {"mock": None}
+RUNTIME = {"mock": None, "started": set()}
 
 
 def mock_action(action, port, assertion=None):
@@ -746,29 +1077,52 @@ def run_step(cursor, step):
         time.sleep(float(step[1]))
         return True, None
 
+    if kind == "mockstart":
+        ok, problem = mock_action("start", step[1])
+        if ok:
+            RUNTIME["started"].add(step[1])
+        return ok, problem
+
+    if kind == "mockstop":
+        ok, problem = mock_action("stop", step[1])
+        RUNTIME["started"].discard(step[1])
+        return ok, problem
+
     if kind == "mockreset":
-        return mock_action("reset", AI_COLUMN_DML_PORT)
+        return mock_action("reset", step[1])
 
     if kind == "mockassert":
-        return mock_action("assert", AI_COLUMN_DML_PORT, step[1])
+        return mock_action("assert", step[1], step[2])
 
     if kind == "wait":
-        deadline = time.time() + float(step[1].get("timeout", 30))
+        # Poll like the official ``while`` loop.  ``forbid`` expresses the
+        # "this must never be visible" assertions: seeing it is a failure.
         payload = step[1]
+        timeout = float(payload.get("timeout", 30))
+        deadline = time.time() + timeout
         rows = []
         problem = "no attempt"
         while True:
             try:
                 cursor.execute(payload["sql"])
                 rows = [list(row) for row in cursor.fetchall()]
-                problem = compare_rows(rows, payload["expect"]["rows"],
-                                       payload["expect"].get("lenient_null", False))
-                if problem is None:
-                    return True, None
+                if "forbid" in payload:
+                    if compare_rows(rows, payload["forbid"]["rows"],
+                                    payload["forbid"].get("lenient_null", False)) is None:
+                        return False, "observed forbidden state {!r}".format(rows)
+                    problem = "still {!r}".format(rows)
+                    if compare_rows(rows, payload["expect"]["rows"],
+                                    payload["expect"].get("lenient_null", False)) is None:
+                        return True, None
+                else:
+                    problem = compare_rows(rows, payload["expect"]["rows"],
+                                           payload["expect"].get("lenient_null", False))
+                    if problem is None:
+                        return True, None
             except Exception as error:  # noqa: BLE001 - keep polling on transient errors
                 problem = "{}: {}".format(error.args[0] if error.args else None, error)
             if time.time() > deadline:
-                return False, "timeout after {}s: {}".format(payload.get("timeout", 30), problem)
+                return False, "timeout after {}s: {}".format(int(timeout), problem)
             time.sleep(1)
 
     if kind == "error":
@@ -839,6 +1193,10 @@ def main():
                         help="skip the AI-column DDL case")
     parser.add_argument("--skip-ai-column-dml", action="store_true",
                         help="skip the AI-column async DML case")
+    parser.add_argument("--skip-ai-column-worker", action="store_true",
+                        help="skip the AI-column worker/retry/stale case")
+    parser.add_argument("--skip-ai-column-vector", action="store_true",
+                        help="skip the AI-column vector index case")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir or os.environ.get("RUNNER_TEMP") or "/tmp") / "ai-e2e"
@@ -857,15 +1215,24 @@ def main():
     if not args.skip_ai_column:
         steps.extend(ai_column_steps())
         steps.extend(ai_column_cleanup_steps())
-    if not args.skip_ai_column_dml:
+    ai_column_cases = (not args.skip_ai_column_dml or not args.skip_ai_column_worker
+                       or not args.skip_ai_column_vector)
+    if ai_column_cases:
         mock_script = (Path(args.repo_root) / "tools/deploy/mysql_test/test_suite/"
                        "ai_column/include/ai_column_mock.py")
         if mock_script.is_file():
             RUNTIME["mock"] = mock_script.resolve()
-            steps.extend(ai_column_dml_steps())
-            steps.extend(ai_column_dml_cleanup_steps())
         else:
             print("SKIP  ai_column_mock.py not found under {}".format(args.repo_root), flush=True)
+    if not args.skip_ai_column_dml and RUNTIME["mock"] is not None:
+        steps.extend(ai_column_dml_steps())
+        steps.extend(ai_column_dml_cleanup_steps())
+    if not args.skip_ai_column_worker and RUNTIME["mock"] is not None:
+        steps.extend(ai_column_worker_steps())
+        steps.extend(ai_column_worker_cleanup_steps())
+    if not args.skip_ai_column_vector and RUNTIME["mock"] is not None:
+        steps.extend(ai_column_vector_steps())
+        steps.extend(ai_column_vector_cleanup_steps())
     if not args.skip_file_sql:
         fixtures = prepare_file_sql_fixtures(args.repo_root, work_dir / "file_sql_data")
         if fixtures is None:
@@ -880,20 +1247,11 @@ def main():
         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, start_new_session=True)
     seekdb = None
     failures = []
-    column_mock_started = False
     try:
         if not wait_port(args.mock_port, 30):
             print("FAIL  mock endpoints did not open port {}".format(args.mock_port))
             print(tail(mock_log))
             return 1
-
-        if RUNTIME["mock"] is not None:
-            started, problem = mock_action("start", AI_COLUMN_DML_PORT)
-            if not started:
-                print("FAIL  ai_column_mock.py start :: {}".format(problem))
-                return 1
-            column_mock_started = True
-            print("ai_column mock on port {}".format(AI_COLUMN_DML_PORT), flush=True)
 
         seekdb = subprocess.Popen(
             [str(Path(args.seekdb).resolve()), "--base-dir={}".format(base_dir),
@@ -938,7 +1296,7 @@ def main():
                 ok, problem = run_step(cursor, step)
                 if step[0] in ("check", "wait", "mockassert", "error"):
                     if step[0] == "mockassert":
-                        name, sql = step[2], "mock assertion {}".format(step[1])
+                        name, sql = step[2], "mock assertion {}".format(step[2])
                     elif step[0] == "error":
                         name, sql = step[3], step[1]
                     else:
@@ -955,8 +1313,9 @@ def main():
 
         connection.close()
     finally:
-        if column_mock_started:
-            mock_action("stop", AI_COLUMN_DML_PORT)
+        for port in sorted(RUNTIME["started"]):
+            mock_action("stop", port)
+        RUNTIME["started"].clear()
         if seekdb is not None and not args.keep_running:
             seekdb.terminate()
             try:
