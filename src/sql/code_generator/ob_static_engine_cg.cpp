@@ -5459,6 +5459,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_escaped_cht(), spec.escaped_cht_))) {
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
+  } else if (OB_FAIL(spec.column_names_.init(op.get_column_names().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
   } else {
     ObString var;
@@ -5466,6 +5467,12 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       var.reset();
       if (OB_FAIL(ob_write_string(alloc, op.get_user_vars().at(i), var))) {
       } else if (OB_FAIL(spec.user_vars_.push_back(var))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_names().count(); ++i) {
+      var.reset();
+      if (OB_FAIL(ob_write_string(alloc, op.get_column_names().at(i), var))) {
+      } else if (OB_FAIL(spec.column_names_.push_back(var))) {
       }
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_select_exprs().count(); ++i) {
@@ -5487,6 +5494,19 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
       spec.plan_->need_drive_dml_query_ = true;
+    }
+    if (OB_SUCC(ret) && op.is_copy_export()) {
+      // COPY ... TO ... export options; the physical operator builds the CsvWriter from them.
+      ObString nullstr;
+      spec.copy_header_ = op.get_copy_header();
+      spec.copy_delimiter_ = op.get_copy_delimiter();
+      spec.copy_quote_ = op.get_copy_quote();
+      spec.copy_escape_ = op.get_copy_escape();
+      spec.copy_force_quote_ = op.get_copy_force_quote();
+      if (OB_FAIL(ob_write_string(alloc, op.get_copy_nullstr(), nullstr))) {
+      } else {
+        spec.copy_nullstr_ = nullstr;
+      }
     }
   }
   return ret;

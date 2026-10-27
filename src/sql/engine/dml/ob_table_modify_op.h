@@ -188,6 +188,81 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTableModifyOpInput);
 };
 
+enum AiColumnRowEvent
+{
+  AI_COLUMN_ROW_INSERTED = 0,
+  AI_COLUMN_ROW_UPDATED = 1,
+  AI_COLUMN_ROW_DELETED = 2,
+};
+
+struct AiColumnKeyColumn
+{
+  AiColumnKeyColumn() : column_id_(common::OB_INVALID_ID), column_name_() {}
+  TO_STRING_KV(K_(column_id), K_(column_name));
+  uint64_t column_id_;
+  common::ObString column_name_;
+};
+
+// One row touched by the current DML statement. The rowkey predicates are the
+// printed form of the primary key ("`id` = 1"), which is also the key under
+// which the runtime queues its tasks, so the engine - not the runtime - has to
+// build them: only the engine has the evaluated row expressions.
+struct AiColumnRowChange
+{
+  AiColumnRowChange()
+    : event_(AI_COLUMN_ROW_INSERTED), old_rowkey_(), new_rowkey_() {}
+  TO_STRING_KV(K_(event), K_(old_rowkey), K_(new_rowkey));
+  AiColumnRowEvent event_;
+  common::ObString old_rowkey_;  // deleted or updated row, empty when inserted
+  common::ObString new_rowkey_;  // inserted or updated row, empty when deleted
+};
+
+// The AI column runtime is owned by the observer (it talks to the model
+// endpoints and runs the background worker) while the DML operators live in the
+// engine, so the engine reaches it through a server service slot instead of a
+// link dependency. A server without the runtime installed simply has no service
+// and every AI column table then behaves like a plain table.
+class IAiColumnDmlHook
+{
+public:
+  virtual ~IAiColumnDmlHook() {}
+  // Coordinator precondition for strict user reads. Implementations ignore
+  // ordinary columns and reject if any row in a referenced AI column is not READY.
+  virtual int check_strict_read(const uint64_t table_id,
+                               const common::ObIArray<uint64_t> &column_ids) = 0;
+  // Whether the table has AI columns, plus the primary key columns the engine
+  // must print to build the task rowkey predicate. The caller caches the answer
+  // so this runs at most once per DML statement.
+  virtual int get_table_ai_columns(common::ObIAllocator &allocator,
+                                   const uint64_t table_id,
+                                   bool &has_ai_column,
+                                   common::ObIArray<AiColumnKeyColumn> &pk_columns) = 0;
+  // Statements that must commit or roll back together with the business DML:
+  // they reset the AI column results of the touched rows, reset the hidden
+  // state / request columns and (re)queue one task per AI column and row. The
+  // caller runs them through the operator inner connection, i.e. inside the
+  // current transaction. updated_column_ids is the column list of the SET clause
+  // of an update, so that an AI column whose dependencies are not touched keeps
+  // its result; it is empty for an insert or a delete.
+  virtual int build_row_change_sql(common::ObIAllocator &allocator,
+                                   const uint64_t table_id,
+                                   const common::ObIArray<AiColumnRowChange> &changes,
+                                   const common::ObIArray<uint64_t> &updated_column_ids,
+                                   common::ObIArray<common::ObString> &stmts) = 0;
+};
+
+// Guards against re-entering the hook from the statements the runtime itself
+// issues, i.e. the AI column result reset and the result publication.
+class AiColumnHookGuard
+{
+public:
+  AiColumnHookGuard();
+  ~AiColumnHookGuard();
+  AiColumnHookGuard(const AiColumnHookGuard &) = delete;
+  AiColumnHookGuard &operator=(const AiColumnHookGuard &) = delete;
+  static bool is_active();
+};
+
 class ObTableModifyOp: public ObOperator
 {
 public:
@@ -253,7 +328,27 @@ public:
   int submit_all_dml_task();
 
   int perform_batch_fk_check();
+
+  // ---- AI column runtime hooks -------------------------------------------
+  // Collect one row touched by the current statement. Called from the per row
+  // loops of the insert / update / delete operators right after the row has
+  // been handed to DAS, so the rowkey predicate can be printed from the
+  // evaluated row expressions. Nothing happens for a table without AI column.
+  int ai_column_collect_row(const ObDMLBaseCtDef &dml_ctdef,
+                            const AiColumnRowEvent event,
+                            const ExprFixedArray *old_row,
+                            const ExprFixedArray *new_row);
+  // Run the collected statements through the inner connection. Called after the
+  // DAS tasks of the statement have been flushed (submit_all_dml_task) and
+  // before the statement returns, so that the queued task rows commit or roll
+  // back together with the business rows.
+  int ai_column_run_hook();
 protected:
+  int ai_column_prepare_table(const ObDMLBaseCtDef &dml_ctdef, bool &enabled);
+  int ai_column_build_rowkey(const ObDMLBaseCtDef &dml_ctdef,
+                             const ExprFixedArray &row_exprs,
+                             common::ObString &rowkey_predicate);
+
   OperatorOpenOrder get_operator_open_order() const;
   virtual int inner_open();
   virtual int inner_close();
@@ -313,6 +408,18 @@ public:
   ObDMLModifyRowsList dml_modify_rows_;
   ObSEArray<ObForeignKeyChecker *, 4> fk_checkers_;
   ObChunkDatumStore::ShadowStoredRow last_store_row_;
+  // AI column runtime state, see ai_column_collect_row().
+  common::ObArenaAllocator ai_column_allocator_;
+  ObSEArray<AiColumnKeyColumn, 4> ai_column_pk_columns_;
+  ObSEArray<AiColumnRowChange, 8> ai_column_changes_;
+  ObSEArray<uint64_t, 8> ai_column_updated_column_ids_;
+  uint64_t ai_column_table_id_;
+  // the table the collected row changes belong to; a statement that touches rows of
+  // two ai column tables is refused instead of writing tasks of one table with the
+  // row key of another
+  uint64_t ai_column_changes_table_id_;
+  bool ai_column_checked_;
+  bool ai_column_enabled_;
 private:
   ObSQLSessionInfo::StmtSavedValue *saved_session_;
   char saved_session_buf_[sizeof(ObSQLSessionInfo::StmtSavedValue)] __attribute__((aligned (16)));;

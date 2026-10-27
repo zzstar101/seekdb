@@ -27,6 +27,8 @@
 #include "sql/engine/expr/ob_expr_regexp_context.h"  // ObExprRegexpSessionVariables (unity regroup)
 #include "sql/engine/cmd/ob_index_executor.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
+#include "sql/engine/cmd/ob_ai_column_retry_executor.h"
+#include "sql/resolver/ddl/ob_ai_column_retry_stmt.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
 #include "sql/resolver/ddl/ob_drop_table_stmt.h"
@@ -754,6 +756,13 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  // ALTER TABLE ... RETRY AI COLUMN ... is an alter table statement (it is checked
+  // and dispatched as one) but it changes no schema: it re-queues the AI column
+  // tasks of the rows the predicate selects, so it executes elsewhere.
+  ObAIColumnRetryStmt *ai_column_retry_stmt = dynamic_cast<ObAIColumnRetryStmt *>(&stmt);
+  if (OB_NOT_NULL(ai_column_retry_stmt)) {
+    return ObAIColumnRetryExecutor().execute(ctx, *ai_column_retry_stmt);
+  }
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
   obcall::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();

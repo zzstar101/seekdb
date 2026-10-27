@@ -1,0 +1,137 @@
+# glob() and COPY ... TO are gated by enable_file_sql, which defaults to OFF
+SELECT @@session.enable_file_sql AS default_enabled;
+default_enabled
+0
+SELECT COUNT(*) FROM glob('/tmp/seekdb-file-sql-surface-*.csv');
+ERROR 0A000: File SQL without enable_file_sql not supported
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-gated.csv' (FORMAT CSV);
+ERROR 0A000: COPY without enable_file_sql not supported
+SELECT COUNT(*) FROM read_csv('/tmp/seekdb-file-sql-surface-in.csv');
+ERROR 0A000: File SQL without enable_file_sql not supported
+SET SESSION enable_file_sql = ON;
+# a rejected statement must not create its target
+SELECT COUNT(*) AS gated_target FROM glob('/tmp/seekdb-file-sql-surface-gated*.csv');
+gated_target
+0
+# fixtures
+# glob returns exactly one column named file, sorted and deduplicated
+SELECT * FROM glob('/tmp/seekdb-file-sql-surface-*.csv');
+file
+/tmp/seekdb-file-sql-surface-a.csv
+/tmp/seekdb-file-sql-surface-b.csv
+/tmp/seekdb-file-sql-surface-c.csv
+SELECT file FROM glob('/tmp/seekdb-file-sql-surface-*.csv') ORDER BY file;
+file
+/tmp/seekdb-file-sql-surface-a.csv
+/tmp/seekdb-file-sql-surface-b.csv
+/tmp/seekdb-file-sql-surface-c.csv
+SELECT COUNT(*) AS matched FROM glob('/tmp/seekdb-file-sql-surface-*.csv');
+matched
+3
+SELECT COUNT(*) AS empty_match FROM glob('/tmp/seekdb-file-sql-surface-none-*.csv');
+empty_match
+0
+# glob wildcards: single character, character class, no wildcard, recursion
+SELECT COUNT(*) AS single_char FROM glob('/tmp/seekdb-file-sql-surface-?.csv');
+single_char
+3
+SELECT COUNT(*) AS class_match FROM glob('/tmp/seekdb-file-sql-surface-[ab].csv');
+class_match
+2
+SELECT COUNT(*) AS literal_name FROM glob('/tmp/seekdb-file-sql-surface-b.csv');
+literal_name
+1
+SELECT COUNT(*) AS recursive FROM glob('/tmp/seekdb-file-sql-surface-dir/**/nested.csv');
+recursive
+1
+# glob never escapes secure_file_priv
+SELECT COUNT(*) FROM glob('/tmp/../etc/*.conf');
+ERROR 42501: Access denied; you need (at least one of) the secure_file_priv privilege(s) for this operation
+SELECT COUNT(*) FROM glob('../*.csv');
+ERROR 42501: Access denied; you need (at least one of) the secure_file_priv privilege(s) for this operation
+# COPY (query) TO CSV writes a header row and round-trips through read_csv
+COPY (SELECT id, name, score
+FROM read_csv('/tmp/seekdb-file-sql-surface-a.csv')
+ORDER BY id)
+TO '/tmp/seekdb-file-sql-surface-out1.csv' (FORMAT CSV, HEADER);
+# three physical lines: one header plus two data rows
+SELECT COUNT(*) AS physical_rows
+FROM read_csv('/tmp/seekdb-file-sql-surface-out1.csv', header = false);
+physical_rows
+3
+SELECT id, name, score
+FROM read_csv('/tmp/seekdb-file-sql-surface-out1.csv')
+ORDER BY id;
+id	name	score
+1	alpha	1.5
+2	beta	2.5
+# COPY keeps NULL distinct from the empty string
+COPY (SELECT id, name, score
+FROM read_csv('/tmp/seekdb-file-sql-surface-c.csv'))
+TO '/tmp/seekdb-file-sql-surface-outnull.csv' (FORMAT CSV, HEADER, NULLSTR 'NIL');
+SELECT id, name, score IS NULL AS score_is_null
+FROM read_csv('/tmp/seekdb-file-sql-surface-outnull.csv', nullstr = 'NIL')
+ORDER BY id;
+id	name	score_is_null
+4	delta	1
+# delimiter, quote, escape and no header
+COPY (SELECT id, name, score
+FROM read_csv('/tmp/seekdb-file-sql-surface-a.csv')
+ORDER BY id)
+TO '/tmp/seekdb-file-sql-surface-out2.csv'
+      (FORMAT CSV, HEADER false, DELIMITER ';', QUOTE '''', ESCAPE '\\', NULLSTR 'NIL');
+SELECT * FROM read_csv('/tmp/seekdb-file-sql-surface-out2.csv', header = false,
+delimiter = ';', quote = '''', escape = '\\')
+ORDER BY column0;
+column0	column1	column2
+1	alpha	1.5
+2	beta	2.5
+# COPY of a table, including a NULL and an embedded delimiter
+CREATE TABLE file_sql_surface_t (id INT, name VARCHAR(16), score DOUBLE);
+INSERT INTO file_sql_surface_t VALUES (1, 'a', 1.5), (2, NULL, 2.5), (3, 'c,d', 3.5);
+COPY file_sql_surface_t TO '/tmp/seekdb-file-sql-surface-out3.csv' (FORMAT CSV, HEADER);
+SELECT id, name, score
+FROM read_csv('/tmp/seekdb-file-sql-surface-out3.csv')
+ORDER BY id;
+id	name	score
+1	a	1.5
+2	NULL	2.5
+3	c,d	3.5
+DROP TABLE file_sql_surface_t;
+# an existing target fails and is left untouched
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-out1.csv' (FORMAT CSV);
+ERROR 58000: File already exist
+SELECT COUNT(*) AS original_preserved
+FROM read_csv('/tmp/seekdb-file-sql-surface-out1.csv');
+original_preserved
+2
+# a failed statement leaves neither the target nor a temporary file
+COPY (SELECT * FROM read_csv('/tmp/seekdb-file-sql-surface-missing.csv'))
+TO '/tmp/seekdb-file-sql-surface-failed.csv' (FORMAT CSV);
+ERROR 42501: Access denied; you need (at least one of) the secure_file_priv privilege(s) for this operation
+SELECT COUNT(*) AS failed_target FROM glob('/tmp/seekdb-file-sql-surface-failed*.csv');
+failed_target
+0
+CREATE TABLE file_sql_surface_error (id INT PRIMARY KEY, j VARCHAR(64));
+INSERT INTO file_sql_surface_error VALUES (1, '{"x":1}'), (2, 'not json');
+COPY (SELECT id, JSON_EXTRACT(j, '$.x') AS x FROM file_sql_surface_error ORDER BY id)
+TO '/tmp/seekdb-file-sql-surface-exec-failed.csv' (FORMAT CSV, HEADER);
+ERROR 22032: Invalid JSON text in argument.
+SELECT COUNT(*) AS execution_failed_target
+FROM glob('/tmp/seekdb-file-sql-surface-exec-failed.csv');
+execution_failed_target
+0
+SELECT COUNT(*) AS execution_failed_temp
+FROM glob('/tmp/.seekdb-file-sql-surface-exec-failed.csv.seekdb-tmp.*');
+execution_failed_temp
+0
+DROP TABLE file_sql_surface_error;
+SELECT file FROM glob('/tmp/seekdb-file-sql-surface-out1.csv');
+file
+/tmp/seekdb-file-sql-surface-out1.csv
+# malformed COPY options are rejected
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-bad1.csv' (FORMAT XML);
+ERROR 0A000: COPY format other than CSV not supported
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-bad2.csv' (FORMAT CSV, DELIMITER ';;');
+ERROR HY000: Incorrect arguments to COPY DELIMITER
+SET SESSION enable_file_sql = OFF;

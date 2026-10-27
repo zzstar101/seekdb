@@ -38,6 +38,13 @@ struct ObExplainDisplayOpt
   bool with_real_info_;
 };
 
+struct FileDescribeColumn
+{
+  common::ObString name_;
+  common::ObString type_;
+  bool nullable_ = true;
+};
+
 class ObExplainStmt : public ObDMLStmt
 {
 public:
@@ -50,6 +57,16 @@ public:
   ObDMLStmt* get_explain_query_stmt() const { return explain_query_stmt_; }
   void set_explain_query_stmt(ObDMLStmt *stmt) { explain_query_stmt_ = stmt; }
   bool is_select_explain() const;
+  bool is_file_describe() const { return file_describe_; }
+  void set_file_describe() { file_describe_ = true; }
+  common::ObSEArray<FileDescribeColumn, 16> &get_describe_columns() { return describe_columns_; }
+  const common::ObSEArray<FileDescribeColumn, 16> &get_describe_columns() const { return describe_columns_; }
+  static constexpr int64_t DESCRIBE_FIELD_COUNT = 6;
+  static const char *describe_field_name(int64_t index)
+  {
+    const char *names[] = {"column_name", "column_type", "null", "key", "default", "extra"};
+    return index >= 0 && index < DESCRIBE_FIELD_COUNT ? names[index] : "";
+  }
   const common::ObString& get_into_table() const { return into_table_; }
   void set_into_table(const common::ObString& into_table) { into_table_ = into_table; }
   const common::ObString& get_statement_id() const { return statement_id_; }
@@ -66,6 +83,8 @@ private:
   ObDMLStmt *explain_query_stmt_;
   common::ObString into_table_;
   common::ObString statement_id_;
+  bool file_describe_ = false;
+  common::ObSEArray<FileDescribeColumn, 16> describe_columns_;
   DISALLOW_COPY_AND_ASSIGN(ObExplainStmt);
 };
 

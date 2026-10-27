@@ -6830,6 +6830,23 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
+      if (OB_SUCC(ret) && T_INTO_COPY == into_item->into_type_) {
+        // COPY ... TO ...: the header row is built from the select item aliases, so they have
+        // to travel with the plan. They are only consumed when copy_header_ is set.
+        ObSEArray<ObString, 8> column_names;
+        select_into->set_copy_header(into_item->copy_header_);
+        select_into->set_copy_delimiter(into_item->copy_delimiter_);
+        select_into->set_copy_quote(into_item->copy_quote_);
+        select_into->set_copy_escape(into_item->copy_escape_);
+        select_into->set_copy_nullstr(into_item->copy_nullstr_);
+        select_into->set_copy_force_quote(into_item->copy_force_quote_);
+        for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
+          if (OB_FAIL(column_names.push_back(stmt->get_select_item(i).alias_name_))) {
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(select_into->set_column_names(column_names))) {
+        }
+      }
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property
       if (OB_FAIL(select_into->compute_property())) {

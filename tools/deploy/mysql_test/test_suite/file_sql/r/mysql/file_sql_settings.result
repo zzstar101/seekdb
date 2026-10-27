@@ -1,0 +1,13 @@
+SELECT @@session.enable_file_sql AS default_enabled;
+default_enabled
+0
+SET SESSION enable_file_sql = ON;
+SELECT @@session.enable_file_sql AS enabled;
+enabled
+1
+SET SESSION enable_file_sql = OFF;
+SELECT @@session.enable_file_sql AS disabled;
+disabled
+0
+SET SESSION enable_file_sql = 2;
+ERROR 42000: Variable 'enable_file_sql' can't be set to the value of '2'

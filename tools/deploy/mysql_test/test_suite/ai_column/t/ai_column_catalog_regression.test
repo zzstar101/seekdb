@@ -1,0 +1,34 @@
+# DDL only: no row insertion and no model request.
+--disable_warnings
+DROP DATABASE IF EXISTS ai_catalog_regression;
+--enable_warnings
+CREATE DATABASE ai_catalog_regression;
+--error 0,11118
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('catalog_model');
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL('catalog_model', '{"type":"completion","model_name":"mock-complete"}');
+CREATE TABLE ai_catalog_regression.docs (
+  id BIGINT PRIMARY KEY,
+  tags JSON AI COLUMN (AI_COMPLETE('catalog_model', 'literal')) WITH(sync_mode='async')
+);
+SELECT a.prompt_expr = '''literal''' AS literal_sql,
+       a.deps = '' AS empty_dependencies, a.comment = '' AS empty_comment
+FROM oceanbase.__all_ai_column a
+JOIN oceanbase.__all_table t ON t.table_id = a.table_id
+JOIN oceanbase.__all_database d ON d.database_id = t.database_id
+WHERE d.database_name = 'ai_catalog_regression' AND t.table_name = 'docs';
+--error 1210
+CREATE TABLE ai_catalog_regression.bad_retries (
+  id BIGINT PRIMARY KEY, content VARCHAR(100),
+  tags JSON AI COLUMN (AI_COMPLETE('catalog_model', content)) WITH(max_retries='2')
+);
+--error 1060
+CREATE TABLE ai_catalog_regression.bad_hidden (
+  id BIGINT PRIMARY KEY, content VARCHAR(100), __ai_state_tags BIGINT,
+  tags JSON AI COLUMN (AI_COMPLETE('catalog_model', content))
+);
+SELECT COUNT(*) AS rejected_tables
+FROM oceanbase.__all_table t
+JOIN oceanbase.__all_database d ON d.database_id = t.database_id
+WHERE d.database_name = 'ai_catalog_regression' AND t.table_name IN ('bad_retries', 'bad_hidden');
+DROP DATABASE ai_catalog_regression;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('catalog_model');

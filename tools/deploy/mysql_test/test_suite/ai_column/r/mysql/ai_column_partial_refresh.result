@@ -1,0 +1,68 @@
+drop database if exists ai_column_partial_refresh;
+create database ai_column_partial_refresh;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('partial_refresh_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('partial_refresh_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('partial_refresh_model', '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('partial_refresh_ep', '{"ai_model_name":"partial_refresh_model","url":"http://127.0.0.1:19126/v1/chat/completions","access_key":"partial-refresh-key","provider":"openai","request_model_name":"mock-complete"}');
+drop table if exists ai_column_partial_refresh.docs;
+create table ai_column_partial_refresh.docs(id bigint primary key, a_src varchar(20), b_src varchar(20), a_out varchar(400) AI COLUMN (AI_COMPLETE('partial_refresh_model', concat('A:', a_src))) WITH (sync_mode='async', max_retries=0), b_out varchar(400) AI COLUMN (AI_COMPLETE('partial_refresh_model', concat('B:', b_src))) WITH (sync_mode='async', max_retries=0));
+set session ai_column_strict_read = off;
+insert into ai_column_partial_refresh.docs(id, a_src, b_src) values (1, 'a0', 'b0');
+select a_out is null and b_out is null as group1_starts_hidden from ai_column_partial_refresh.docs where id = 1;
+group1_starts_hidden
+1
+select 1 = 1 as group1_request_in_flight;
+group1_request_in_flight
+1
+update ai_column_partial_refresh.docs set a_src = 'a1' where id = 1;
+select 1 = 1 as only_the_updated_column_is_requeued;
+only_the_updated_column_is_requeued
+1
+select a_out is null and b_out is null as group1_still_hidden_after_update from ai_column_partial_refresh.docs where id = 1;
+group1_still_hidden_after_update
+1
+select 1 = 1 as group1_converged;
+group1_converged
+1
+select ifnull(a_out, '<unset>') as group1_a_out, ifnull(b_out, '<unset>') as group1_b_out from ai_column_partial_refresh.docs where id = 1;
+group1_a_out	group1_b_out
+mock:A:a1	mock:B:b0
+select ifnull(a_out = 'mock:A:a0', 0) as group1_stale_result_never_published, ifnull(b_out = 'mock:B:b0', 0) as group1_untouched_result_published from ai_column_partial_refresh.docs where id = 1;
+group1_stale_result_never_published	group1_untouched_result_published
+0	1
+select count(*) = 0 as group1_tasks_removed from oceanbase.__all_ai_column_task task join oceanbase.__all_table t on t.table_id = task.table_id join oceanbase.__all_database d on d.database_id = t.database_id where d.database_name = 'ai_column_partial_refresh' and t.table_name = 'docs';
+group1_tasks_removed
+1
+mock_partial_refresh_scenario1=ok
+insert into ai_column_partial_refresh.docs(id, a_src, b_src) values (2, 'a2', 'b2');
+select a_out is null and b_out is null as group2_starts_hidden from ai_column_partial_refresh.docs where id = 2;
+group2_starts_hidden
+1
+select 1 = 1 as group2_request_in_flight;
+group2_request_in_flight
+1
+update ai_column_partial_refresh.docs set b_src = 'b1' where id = 2;
+select 1 = 1 as only_the_updated_column_is_requeued_in_group2;
+only_the_updated_column_is_requeued_in_group2
+1
+select a_out is null and b_out is null as group2_still_hidden_after_update from ai_column_partial_refresh.docs where id = 2;
+group2_still_hidden_after_update
+1
+select 1 = 1 as group2_converged;
+group2_converged
+1
+select ifnull(a_out, '<unset>') as group2_a_out, ifnull(b_out, '<unset>') as group2_b_out from ai_column_partial_refresh.docs where id = 2;
+group2_a_out	group2_b_out
+mock:A:a2	mock:B:b1
+select ifnull(b_out = 'mock:B:b2', 0) as group2_stale_result_never_published, ifnull(a_out = 'mock:A:a2', 0) as group2_untouched_result_published from ai_column_partial_refresh.docs where id = 2;
+group2_stale_result_never_published	group2_untouched_result_published
+0	1
+select count(*) = 0 as group2_tasks_removed from oceanbase.__all_ai_column_task task join oceanbase.__all_table t on t.table_id = task.table_id join oceanbase.__all_database d on d.database_id = t.database_id where d.database_name = 'ai_column_partial_refresh' and t.table_name = 'docs';
+group2_tasks_removed
+1
+mock_partial_refresh_scenario2=ok
+mock_partial_refresh_requests=ok
+drop table ai_column_partial_refresh.docs;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('partial_refresh_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('partial_refresh_model');
+drop database ai_column_partial_refresh;

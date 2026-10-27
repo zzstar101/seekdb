@@ -58,6 +58,10 @@ private:
   int check_safe_update_mode(ObUpdateStmt *update_stmt);
   int resolve_update_constraints();
   int generate_batched_stmt_info();
+  // The result of an AI column is produced by the AI column runtime, so an
+  // UPDATE may not assign it.
+  int check_ai_column_write(const common::ObIArray<ObTableAssignment> &tables_assign);
+  int check_ai_column_target(const uint64_t table_id, const uint64_t column_id);
 };
 
 } // namespace sql

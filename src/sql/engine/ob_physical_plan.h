@@ -57,6 +57,20 @@ typedef common::ObFixedArray<common::ObFixedArray<int64_t, common::ObIAllocator>
 typedef common::ObFixedArray<ObTableLocation, common::ObIAllocator> TableLocationFixedArray;
 typedef common::ObFixedArray<ObPlanPwjConstraint, common::ObIAllocator> PlanPwjConstraintArray;
 
+// Coordinator-local pre-rewrite references. These live with the cached plan,
+// not the optimized scan list, so an empty plan still has read preconditions.
+struct AiColumnReadReference
+{
+  AiColumnReadReference() : table_id_(common::OB_INVALID_ID), column_id_(common::OB_INVALID_ID) {}
+  AiColumnReadReference(uint64_t table_id, uint64_t column_id)
+    : table_id_(table_id), column_id_(column_id) {}
+  bool operator==(const AiColumnReadReference &other) const
+  { return table_id_ == other.table_id_ && column_id_ == other.column_id_; }
+  TO_STRING_KV(K_(table_id), K_(column_id));
+  uint64_t table_id_;
+  uint64_t column_id_;
+};
+
 class ObPhysicalPlan : public ObPlanCacheObject
 {
 public:
@@ -81,6 +95,10 @@ public:
   //user var
   bool is_contains_assignment() const {return is_contains_assignment_;}
   void set_contains_assignment(bool v) {is_contains_assignment_ = v;}
+  int set_ai_column_read_references(const common::ObIArray<AiColumnReadReference> &refs)
+  { return ai_column_read_references_.assign(refs); }
+  const common::ObIArray<AiColumnReadReference> &get_ai_column_read_references() const
+  { return ai_column_read_references_; }
   int set_vars(const common::ObIArray<ObVarInfo> &vars);
   const common::ObIArray<ObVarInfo> &get_vars() const { return vars_; }
   /**
@@ -415,6 +433,9 @@ private:
   share::schema::ObStmtNeedPrivs stmt_need_privs_;
   // Involved system variables and user variables
   common::ObFixedArray<ObVarInfo, common::ObIAllocator> vars_;
+  // Checked by the coordinator on every open, including plan-cache hits.
+  // Not serialized: remote workers execute only after the coordinator check.
+  common::ObFixedArray<AiColumnReadReference, common::ObIAllocator> ai_column_read_references_;
   ObSqlExpressionFactory sql_expression_factory_;
   ObExprOperatorFactory expr_op_factory_;
   stmt::StmtType literal_stmt_type_; // meaning reference ObBasicStmt corresponding definition

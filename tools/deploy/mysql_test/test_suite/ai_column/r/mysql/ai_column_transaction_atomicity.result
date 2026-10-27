@@ -1,0 +1,46 @@
+drop database if exists ai_column_atomicity;
+create database ai_column_atomicity;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('atomicity_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('atomicity_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('atomicity_model', '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('atomicity_ep', '{"ai_model_name":"atomicity_model","url":"http://127.0.0.1:19121/v1/chat/completions","access_key":"test","provider":"openai"}');
+create table ai_column_atomicity.docs (
+id bigint primary key,
+content varchar(100),
+tags json AI COLUMN (AI_COMPLETE('atomicity_model', content)) WITH (sync_mode='async')
+);
+show columns from oceanbase.__all_ai_column_task where Field in ('lease_owner','lease_expire_ts','result_data','error_msg');
+Field	Type	Null	Key	Default	Extra
+lease_owner	varchar(128)	YES		NULL	
+lease_expire_ts	timestamp(6)	YES		CURRENT_TIMESTAMP(6)	
+result_data	longtext	YES		NULL	
+error_msg	varchar(512)	YES		NULL	
+start transaction;
+insert into ai_column_atomicity.docs(id,content) values (1,'first'),(2,'second');
+select count(*) = 2 and sum(tags is null) = 2 as pending_rows from ai_column_atomicity.docs;
+pending_rows
+1
+select count(*) = 2 as transactional_tasks from oceanbase.__all_ai_column_task
+where table_id = (select t.table_id from oceanbase.__all_table t join oceanbase.__all_database d
+on d.database_id=t.database_id where d.database_name='ai_column_atomicity' and t.table_name='docs');
+transactional_tasks
+1
+mock_no_requests=ok
+rollback;
+select count(*) = 0 as rolled_back_rows from ai_column_atomicity.docs;
+rolled_back_rows
+1
+select count(*) = 0 as rolled_back_tasks from oceanbase.__all_ai_column_task
+where table_id = (select t.table_id from oceanbase.__all_table t join oceanbase.__all_database d
+on d.database_id=t.database_id where d.database_name='ai_column_atomicity' and t.table_name='docs');
+rolled_back_tasks
+1
+insert into ai_column_atomicity.docs(id,content) values (3,'third'),(3,'duplicate');
+ERROR 23000: Duplicate entry '3' for key 'PRIMARY'
+select count(*) = 0 as failed_statement_rows from ai_column_atomicity.docs;
+failed_statement_rows
+1
+mock_no_requests=ok
+drop database ai_column_atomicity;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('atomicity_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('atomicity_model');

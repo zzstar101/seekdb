@@ -15,6 +15,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/dml/ob_table_modify_op.h"
+#include "sql/resolver/dml/ai_column_write_guard.h"
 #include "sql/resolver/dml/ob_insert_resolver.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -130,6 +132,10 @@ int ObInsertResolver::resolve_insert_clause(const ParseNode &node)
       } else if (OB_FAIL(view_pullup_special_column_exprs())) {
       } else if (OB_FAIL(view_pullup_part_exprs())) {
       } else { /*do nothing*/ }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(check_ai_column_target_write(insert_stmt->get_insert_table_info()))) {
     }
   }
   if (OB_SUCC(ret)) {
@@ -1037,6 +1043,7 @@ int ObInsertResolver::resolve_insert_update_assignment(const ParseNode *node, Ob
   } else if (FALSE_IT(is_resolve_insert_update_ = true)) {
     //do nothing
   } else if (OB_FAIL(ObDelUpdResolver::resolve_insert_update_assignment(node, table_info))) {
+  } else if (OB_FAIL(check_ai_column_odku_write(table_info))) {
   }
   return ret;
 }
@@ -1156,6 +1163,107 @@ int ObInsertResolver::check_view_insertable()
     if (ret == OB_ERR_NON_INSERTABLE_TABLE) {
       LOG_USER_ERROR(OB_ERR_NON_INSERTABLE_TABLE,
           table->get_table_name().length(), table->get_table_name().ptr());
+    }
+  }
+  return ret;
+}
+
+int ObInsertResolver::check_ai_column_target_write(const ObInsertTableInfo &table_info)
+{
+  int ret = OB_SUCCESS;
+  ObInsertStmt *insert_stmt = get_insert_stmt();
+  const TableItem *table_item = NULL;
+  const ObIArray<ObColumnRefRawExpr *> &target_columns = table_info.values_desc_;
+  if (OB_ISNULL(insert_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the insert statement is null", K(ret));
+  } else if (target_columns.empty()) {
+    // the statement names no column, the AI column runtime fills the row itself
+  } else if (OB_ISNULL(table_item = insert_stmt->get_table_item(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the insert target table item is null", K(ret));
+  } else if (OB_FAIL(check_ai_column_target(*table_item,
+                                            target_columns,
+                                            false /*is_odku_write*/))) {
+  }
+  return ret;
+}
+
+int ObInsertResolver::check_ai_column_odku_write(const ObInsertTableInfo &table_info)
+{
+  int ret = OB_SUCCESS;
+  ObInsertStmt *insert_stmt = get_insert_stmt();
+  const TableItem *table_item = NULL;
+  ObSEArray<ObColumnRefRawExpr *, 4> target_columns;
+  if (OB_ISNULL(insert_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the insert statement is null", K(ret));
+  } else if (OB_ISNULL(table_item = insert_stmt->get_table_item(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the insert target table item is null", K(ret));
+  }
+  // the assignments of the referenced tables belong to the cascade of a foreign
+  // key, they do not assign a column of the insert target
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_info.assignments_.count(); ++i) {
+    ObColumnRefRawExpr *target_column = table_info.assignments_.at(i).column_expr_;
+    if (OB_ISNULL(target_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the assignment target column is null", K(ret), K(i));
+    } else if (OB_INVALID_ID != target_column->get_table_id() &&
+               table_info.table_id_ != target_column->get_table_id()) {
+      // the assignment targets another table
+    } else if (OB_FAIL(target_columns.push_back(target_column))) {
+      LOG_WARN("failed to record the assignment target column", K(ret), K(i));
+    } else { /*do nothing*/ }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(check_ai_column_target(*table_item,
+                                                     target_columns,
+                                                     true /*is_odku_write*/))) {
+  }
+  return ret;
+}
+
+int ObInsertResolver::check_ai_column_target(const TableItem &table_item,
+                                             const ObIArray<ObColumnRefRawExpr *> &target_columns,
+                                             const bool is_odku_write)
+{
+  int ret = OB_SUCCESS;
+  bool is_protected = false;
+  const TableItem &base_table_item = table_item.get_base_table_item();
+  // the table item of a statement carries the id the resolver generated for the
+  // item, the AI column flag lives on the table the item refers to
+  const uint64_t table_id = base_table_item.ref_id_;
+  if (OB_ISNULL(schema_checker_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the schema checker is null", K(ret));
+  } else if (AiColumnWriteGuard::is_internal_write(session_info_, AiColumnHookGuard::is_active())) {
+    // the AI column runtime maintains the AI columns of the row itself
+  } else if (!base_table_item.is_basic_table()) {
+    // the column of a view is not the column of a table, the AI column flag is
+    // checked on the table the statement writes when a view is not involved
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < target_columns.count(); ++i) {
+      const ObColumnRefRawExpr *target_column = target_columns.at(i);
+      if (OB_ISNULL(target_column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the target column is null", K(ret), K(i));
+      } else if (OB_FAIL(AiColumnWriteGuard::is_protected_column(*schema_checker_, table_id,
+                                                                target_column->get_column_id(),
+                                                                is_protected))) {
+        if (OB_ERR_BAD_FIELD_ERROR == ret) {
+          // a target column the schema does not hold carries no AI column flag
+          LOG_DEBUG("the assigned column is not in the schema", K(table_id), K(i));
+          ret = OB_SUCCESS;
+        }
+      } else if (is_protected) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("assigning an ai column directly is not allowed", K(ret), K(table_id),
+                 K(target_columns.at(i)->get_column_id()), K(is_odku_write));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       AiColumnWriteGuard::write_subject(
+                           is_odku_write ? AiColumnWriteGuard::ON_DUPLICATE_KEY_UPDATE_CLAUSE
+                                         : AiColumnWriteGuard::INSERT_CLAUSE));
+      }
     }
   }
   return ret;

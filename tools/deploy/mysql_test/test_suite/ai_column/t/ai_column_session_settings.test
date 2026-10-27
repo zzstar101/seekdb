@@ -1,0 +1,9 @@
+# Session-only strict-read setting; ordinary SQL remains usable in strict mode.
+SELECT @@session.ai_column_strict_read AS default_strict_read;
+SET SESSION ai_column_strict_read = ON;
+SELECT @@session.ai_column_strict_read AS enabled, 42 AS ordinary_expression;
+--error 1231
+SET SESSION ai_column_strict_read = 2;
+SELECT @@session.ai_column_strict_read AS retained_after_invalid_value;
+SET SESSION ai_column_strict_read = OFF;
+SELECT @@session.ai_column_strict_read AS disabled;

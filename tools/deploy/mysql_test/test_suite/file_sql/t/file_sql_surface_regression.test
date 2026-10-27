@@ -1,0 +1,158 @@
+# owner: database-competition
+# owner group: SQL
+# description: File SQL surface regression: DuckDB-style glob() table function
+#              and COPY ... TO CSV export (header/delimiter/quote/escape/nullstr,
+#              existing-target failure, no residue after a failed statement).
+# tags: sql,executor,file_sql
+#
+# Error-code contract this file asserts, so the SQL glue must keep mapping the
+# engine codes onto these mysql codes:
+#   1235 ER_NOT_SUPPORTED_YET          enable_file_sql is OFF (the default)
+#   1235 ER_NOT_SUPPORTED_YET          unknown COPY format
+#   1086 ER_FILE_EXISTS_ERROR          COPY target already exists
+#   1210 ER_WRONG_ARGUMENTS            invalid option value / unreadable source
+#   1227 ER_SPECIFIC_ACCESS_DENIED     secure_file_priv policy denies the path
+
+# The fixtures below live in /tmp because the local regression observer runs
+# with secure_file_priv=/tmp (same convention as file_sql_csv_regression.test).
+
+--echo # glob() and COPY ... TO are gated by enable_file_sql, which defaults to OFF
+SELECT @@session.enable_file_sql AS default_enabled;
+--error 1235
+SELECT COUNT(*) FROM glob('/tmp/seekdb-file-sql-surface-*.csv');
+--error 1235
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-gated.csv' (FORMAT CSV);
+--error 1235
+SELECT COUNT(*) FROM read_csv('/tmp/seekdb-file-sql-surface-in.csv');
+SET SESSION enable_file_sql = ON;
+--echo # a rejected statement must not create its target
+SELECT COUNT(*) AS gated_target FROM glob('/tmp/seekdb-file-sql-surface-gated*.csv');
+
+--echo # fixtures
+--write_file /tmp/seekdb-file-sql-surface-a.csv
+id,name,score
+1,alpha,1.5
+2,beta,2.5
+EOF
+--write_file /tmp/seekdb-file-sql-surface-b.csv
+id,name,score
+3,gamma,3.5
+EOF
+--write_file /tmp/seekdb-file-sql-surface-c.csv
+id,name,score
+4,delta,NULL
+EOF
+
+--echo # glob returns exactly one column named file, sorted and deduplicated
+--sorted_result
+--replace_result /private/tmp /tmp
+SELECT * FROM glob('/tmp/seekdb-file-sql-surface-*.csv');
+--replace_result /private/tmp /tmp
+SELECT file FROM glob('/tmp/seekdb-file-sql-surface-*.csv') ORDER BY file;
+SELECT COUNT(*) AS matched FROM glob('/tmp/seekdb-file-sql-surface-*.csv');
+SELECT COUNT(*) AS empty_match FROM glob('/tmp/seekdb-file-sql-surface-none-*.csv');
+
+--echo # glob wildcards: single character, character class, no wildcard, recursion
+SELECT COUNT(*) AS single_char FROM glob('/tmp/seekdb-file-sql-surface-?.csv');
+SELECT COUNT(*) AS class_match FROM glob('/tmp/seekdb-file-sql-surface-[ab].csv');
+SELECT COUNT(*) AS literal_name FROM glob('/tmp/seekdb-file-sql-surface-b.csv');
+# Keep recursive discovery in an owned fixture tree, not the machine-wide /tmp.
+--mkdir /tmp/seekdb-file-sql-surface-dir
+--mkdir /tmp/seekdb-file-sql-surface-dir/sub
+--write_file /tmp/seekdb-file-sql-surface-dir/sub/nested.csv
+id
+1
+EOF
+SELECT COUNT(*) AS recursive FROM glob('/tmp/seekdb-file-sql-surface-dir/**/nested.csv');
+--remove_file /tmp/seekdb-file-sql-surface-dir/sub/nested.csv
+--rmdir /tmp/seekdb-file-sql-surface-dir/sub
+--rmdir /tmp/seekdb-file-sql-surface-dir
+
+--echo # glob never escapes secure_file_priv
+--error 1227
+SELECT COUNT(*) FROM glob('/tmp/../etc/*.conf');
+--error 1227
+SELECT COUNT(*) FROM glob('../*.csv');
+
+--echo # COPY (query) TO CSV writes a header row and round-trips through read_csv
+COPY (SELECT id, name, score
+         FROM read_csv('/tmp/seekdb-file-sql-surface-a.csv')
+        ORDER BY id)
+   TO '/tmp/seekdb-file-sql-surface-out1.csv' (FORMAT CSV, HEADER);
+--echo # three physical lines: one header plus two data rows
+SELECT COUNT(*) AS physical_rows
+  FROM read_csv('/tmp/seekdb-file-sql-surface-out1.csv', header = false);
+SELECT id, name, score
+  FROM read_csv('/tmp/seekdb-file-sql-surface-out1.csv')
+ ORDER BY id;
+
+--echo # COPY keeps NULL distinct from the empty string
+COPY (SELECT id, name, score
+         FROM read_csv('/tmp/seekdb-file-sql-surface-c.csv'))
+   TO '/tmp/seekdb-file-sql-surface-outnull.csv' (FORMAT CSV, HEADER, NULLSTR 'NIL');
+SELECT id, name, score IS NULL AS score_is_null
+  FROM read_csv('/tmp/seekdb-file-sql-surface-outnull.csv', nullstr = 'NIL')
+ ORDER BY id;
+
+--echo # delimiter, quote, escape and no header
+COPY (SELECT id, name, score
+         FROM read_csv('/tmp/seekdb-file-sql-surface-a.csv')
+        ORDER BY id)
+   TO '/tmp/seekdb-file-sql-surface-out2.csv'
+      (FORMAT CSV, HEADER false, DELIMITER ';', QUOTE '''', ESCAPE '\\', NULLSTR 'NIL');
+SELECT * FROM read_csv('/tmp/seekdb-file-sql-surface-out2.csv', header = false,
+                       delimiter = ';', quote = '''', escape = '\\')
+ ORDER BY column0;
+
+--echo # COPY of a table, including a NULL and an embedded delimiter
+CREATE TABLE file_sql_surface_t (id INT, name VARCHAR(16), score DOUBLE);
+INSERT INTO file_sql_surface_t VALUES (1, 'a', 1.5), (2, NULL, 2.5), (3, 'c,d', 3.5);
+COPY file_sql_surface_t TO '/tmp/seekdb-file-sql-surface-out3.csv' (FORMAT CSV, HEADER);
+SELECT id, name, score
+  FROM read_csv('/tmp/seekdb-file-sql-surface-out3.csv')
+ ORDER BY id;
+DROP TABLE file_sql_surface_t;
+
+--echo # an existing target fails and is left untouched
+--error 1086
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-out1.csv' (FORMAT CSV);
+SELECT COUNT(*) AS original_preserved
+  FROM read_csv('/tmp/seekdb-file-sql-surface-out1.csv');
+
+--echo # a failed statement leaves neither the target nor a temporary file
+# A missing input cannot pass canonical-path authorization and is denied.
+--error 1227
+COPY (SELECT * FROM read_csv('/tmp/seekdb-file-sql-surface-missing.csv'))
+   TO '/tmp/seekdb-file-sql-surface-failed.csv' (FORMAT CSV);
+SELECT COUNT(*) AS failed_target FROM glob('/tmp/seekdb-file-sql-surface-failed*.csv');
+CREATE TABLE file_sql_surface_error (id INT PRIMARY KEY, j VARCHAR(64));
+INSERT INTO file_sql_surface_error VALUES (1, '{"x":1}'), (2, 'not json');
+--error 3141
+COPY (SELECT id, JSON_EXTRACT(j, '$.x') AS x FROM file_sql_surface_error ORDER BY id)
+  TO '/tmp/seekdb-file-sql-surface-exec-failed.csv' (FORMAT CSV, HEADER);
+SELECT COUNT(*) AS execution_failed_target
+  FROM glob('/tmp/seekdb-file-sql-surface-exec-failed.csv');
+SELECT COUNT(*) AS execution_failed_temp
+  FROM glob('/tmp/.seekdb-file-sql-surface-exec-failed.csv.seekdb-tmp.*');
+DROP TABLE file_sql_surface_error;
+--sorted_result
+--replace_result /private/tmp /tmp
+SELECT file FROM glob('/tmp/seekdb-file-sql-surface-out1.csv');
+
+--echo # malformed COPY options are rejected
+# An unknown FORMAT is a semantic rejection (same class as read_csv's
+# "this file format"), not a parse error.
+--error 1235
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-bad1.csv' (FORMAT XML);
+--error 1210
+COPY (SELECT 1 AS id) TO '/tmp/seekdb-file-sql-surface-bad2.csv' (FORMAT CSV, DELIMITER ';;');
+
+SET SESSION enable_file_sql = OFF;
+
+--remove_file /tmp/seekdb-file-sql-surface-a.csv
+--remove_file /tmp/seekdb-file-sql-surface-b.csv
+--remove_file /tmp/seekdb-file-sql-surface-c.csv
+--remove_file /tmp/seekdb-file-sql-surface-out1.csv
+--remove_file /tmp/seekdb-file-sql-surface-out2.csv
+--remove_file /tmp/seekdb-file-sql-surface-out3.csv
+--remove_file /tmp/seekdb-file-sql-surface-outnull.csv

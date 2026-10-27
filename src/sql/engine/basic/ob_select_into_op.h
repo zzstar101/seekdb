@@ -22,12 +22,17 @@
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
 #include "sql/engine/basic/ob_external_file_writer.h"
+#include "sql/engine/basic/file_scan_utils.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+namespace file_sql
+{
+class CsvWriter;
+}
 class ObSelectIntoOpInput : public ObOpInput
 {
   OB_UNIS_VERSION_V(1);
@@ -71,7 +76,14 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      copy_header_(false),
+      copy_delimiter_(','),
+      copy_quote_('"'),
+      copy_escape_('"'),
+      copy_nullstr_(),
+      copy_force_quote_(false),
+      column_names_(alloc)
   {
   }
 
@@ -91,6 +103,15 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  // COPY ... TO ... export options, only read when into_type_ == T_INTO_COPY.
+  bool copy_header_;
+  char copy_delimiter_;
+  char copy_quote_;
+  char copy_escape_;
+  common::ObString copy_nullstr_;
+  bool copy_force_quote_;
+  // Header names of the exported columns, in select item order.
+  common::ObFixedArray<common::ObString, common::ObIAllocator> column_names_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +147,12 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      copy_writer_(NULL),
+      copy_started_(false),
+      copy_finished_(false),
+      copy_path_(),
+      copy_row_alloc_(NULL)
   {
   }
 
@@ -256,6 +282,14 @@ private:
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
+  // COPY ... TO ... support: streams rows into sql::file_sql::CsvWriter.
+  int init_copy_env();
+  int check_copy_gate();
+  int copy_get_next_row();
+  int copy_write_row();
+  int copy_finish();
+  int copy_error(file_sql::Status status);
+  int copy_print_field(const ObExpr &expr, const ObDatum &datum, ObString &text, bool &is_null);
   char *get_json_buf() { return json_buf_; }
   int64_t get_json_buf_len() { return json_buf_len_; }
   char *get_shared_buf() { return shared_buf_; }
@@ -293,6 +327,13 @@ private:
   uint32_t block_id_;
   bool need_commit_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
+  // COPY ... TO ... state. The writer is ~71 KiB (64 KiB buffer + path caches), so it is always
+  // heap allocated from the execution allocator instead of living in the operator object.
+  file_sql::CsvWriter *copy_writer_;
+  bool copy_started_;   // open() succeeded, a temp file is owned by the writer
+  bool copy_finished_;  // every child row was handed to the writer, commit() is safe
+  ObString copy_path_;  // NUL terminated target path
+  common::ObArenaAllocator *copy_row_alloc_;  // per row scratch for the printed field texts
 
 };
 

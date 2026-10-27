@@ -333,7 +333,7 @@ END_P SET_VAR DELIMITER
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
         RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
-        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
+        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETRY RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
@@ -373,6 +373,7 @@ END_P SET_VAR DELIMITER
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
 %type <node> select_stmt update_stmt delete_stmt
+%type <node> copy_stmt copy_source copy_option_list_opt copy_option_list copy_option copy_option_value
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -443,6 +444,7 @@ END_P SET_VAR DELIMITER
 %type <ival> opt_with_consistent_snapshot opt_config_scope opt_index_keyname opt_full opt_mode_flag opt_extended opt_extended_or_full
 %type <node> opt_priority opt_low_priority delete_option delete_option_list opt_delete_option_list
 %type <node> opt_work begin_stmt commit_stmt rollback_stmt opt_ignore opt_ignore_or_replace ignore_or_replace alter_table_stmt alter_table_actions alter_table_action_list alter_table_action alter_column_option alter_index_option alter_constraint_option standalone_alter_action alter_partition_option opt_to opt_table
+%type <node> retry_ai_column_where
 %type <node> alter_column_behavior opt_set opt_position_column
 %type <node> alter_system_stmt alter_system_set_parameter_actions alter_system_settp_actions settp_option alter_system_set_parameter_action alter_system_reset_parameter_actions alter_system_reset_parameter_action
 %type <node> opt_comment opt_as
@@ -497,6 +499,8 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%type <node> opt_ai_column_with_option ai_column_option_list ai_column_option
+%type <node> ai_column_expr ai_column_argument_list ai_column_argument
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> file_table_expr file_table_arguments file_table_alias
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
@@ -557,6 +561,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -6240,6 +6245,77 @@ not NULLX
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
 }
+| AI COLUMN '(' ai_column_expr ')' opt_ai_column_with_option
+{
+  (void)($1);
+  (void)($2);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN, 2, $4, $6);
+  dup_expr_string($$, result, @4.first_column, @4.last_column);
+}
+;
+
+// Capture only outer AI-call arguments; ordinary expression parsing is unchanged.
+ai_column_expr:
+function_name '(' ai_column_argument_list ')'
+{
+  ParseNode *args = NULL;
+  merge_nodes(args, result, T_EXPR_LIST, $3);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_SYS, 2, $1, args);
+}
+| function_name '(' ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FUN_SYS, 2, $1, NULL);
+}
+;
+
+ai_column_argument_list:
+ai_column_argument { $$ = $1; }
+| ai_column_argument_list ',' ai_column_argument
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_argument:
+expr
+{
+  ParseNode *source = NULL;
+  malloc_terminal_node(source, result->malloc_pool_, T_VARCHAR);
+  dup_expr_string(source, result, @1.first_column, @1.last_column);
+  $$ = $1;
+  $$->raw_text_ = source->str_value_;
+  $$->text_len_ = source->str_len_;
+}
+;
+
+opt_ai_column_with_option:
+/*empty*/
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  merge_nodes($$, result, T_AI_COLUMN_OPTION_LIST, $3);
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+relation_name COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ASSIGN_ITEM, 2, $1, $3);
+}
 ;
 
 opt_column_default_value_list:
@@ -8428,6 +8504,85 @@ expr { $$ = $1;}
  *	select grammar
  *
  *****************************************************************************/
+
+// COPY reuses the SELECT INTO pipeline, without changing the source query.
+copy_stmt:
+COPY copy_source TO STRING_VALUE copy_option_list_opt
+{
+  $$ = $2;
+  if (NULL != $$->children_[PARSE_SELECT_INTO]
+      || NULL != $$->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@2, result, "COPY source must not contain an INTO clause");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$->children_[PARSE_SELECT_INTO_EXTRA],
+                          result->malloc_pool_, T_INTO_COPY, 2, $4, $5);
+  // The resolver consumes path and format options as literals, not runtime parameters.
+  $$->children_[PARSE_SELECT_INTO_EXTRA]->is_tree_not_param_ = true;
+}
+;
+
+copy_source:
+relation_factor
+{
+  ParseNode *star_node = NULL;
+  malloc_terminal_node(star_node, result->malloc_pool_, T_STAR);
+  dup_string_to_node(star_node, result->malloc_pool_, "*");
+  ParseNode *project_node = NULL;
+  malloc_non_terminal_node(project_node, result->malloc_pool_, T_PROJECT_STRING, 1, star_node);
+  ParseNode *project_list = NULL;
+  merge_nodes(project_list, result, T_PROJECT_LIST, project_node);
+  ParseNode *alias_node = NULL;
+  // Match tbl_name: relation_factor. Resolver reads partition/sample slots too.
+  malloc_non_terminal_node(alias_node, result->malloc_pool_, T_ORG, 4, $1, NULL, NULL, NULL);
+  ParseNode *from_list = NULL;
+  merge_nodes(from_list, result, T_FROM_LIST, alias_node);
+  malloc_select_node($$, result->malloc_pool_);
+  $$->children_[PARSE_SELECT_SELECT] = project_list;
+  $$->children_[PARSE_SELECT_FROM] = from_list;
+}
+| select_with_parens
+{
+  $$ = $1;
+}
+;
+
+copy_option_list_opt:
+/* empty */ { $$ = NULL; }
+| '(' copy_option_list ')' { $$ = $2; }
+;
+
+copy_option_list:
+copy_option { $$ = $1; }
+| copy_option ',' copy_option_list
+{
+  // The resolver consumes a right-linked chain directly; keep each head an option.
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, NULL);
+}
+| relation_name copy_option_value
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
+}
+;
+
+copy_option_value:
+STRING_VALUE { $$ = $1; }
+| INTNUM { $$ = $1; }
+| relation_name { $$ = $1; }
+| BOOL_VALUE
+{
+  // The lexer emits T_BOOL, while COPY's value contract accepts integer booleans.
+  $$ = $1;
+  $$->type_ = T_INT;
+}
+;
 
 select_stmt:
 select_no_parens opt_when
@@ -12323,7 +12478,11 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  $$->is_file_describe_ = ($1->value_ == 1);
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12363,9 +12522,9 @@ explain_or_desc relation_factor opt_desc_column_option
 ;
 
 explain_or_desc:
-EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+EXPLAIN { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 0; }
+| DESCRIBE { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1; }
+| DESC { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1; }
 ;
 
 explainable_stmt:
@@ -14799,6 +14958,15 @@ DROP CONSTRAINT constraint_name
   (void)($3);
   $$ = NULL;
 }
+| RETRY AI COLUMN relation_name retry_ai_column_where
+{
+  // ALTER TABLE ... RETRY AI COLUMN <col> [WHERE <predicate>]:
+  // child 0 is the AI column, child 1 the predicate (NULL selects every row).
+  // The action is parsed as an alter table action, not as a statement of its own,
+  // so that combining it with another action is refused as an unsupported
+  // combination instead of being a syntax error.
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+}
 ;
 
 algorithm_opt:
@@ -14806,6 +14974,25 @@ DEFAULT { $$ = NULL; }
 | INPLACE { $$ = NULL; }
 | COPY { $$ = NULL; }
 | INSTANT { $$ = NULL; }
+;
+
+// The optional predicate of ALTER TABLE ... RETRY AI COLUMN <col> [WHERE ...].
+// It is kept as the text the user wrote instead of being resolved against the
+// schema: an unquoted `status` in it is the AI column state pseudo column
+// (PENDING/READY/FAILED) while a backquoted `status` is the user column, and only
+// the AI column runtime knows the hidden state column, so the predicate is handed
+// over verbatim and rewritten there.
+retry_ai_column_where:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| WHERE opt_hint_value expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_WHERE_CLAUSE, 2, $3, $2);
+  // The runner supplies WHERE; retain only the predicate, byte for byte.
+  dup_expr_string($$, result, @3.first_column, @3.last_column);
+}
 ;
 
 lock_opt:
@@ -18017,6 +18204,7 @@ ACCOUNT
 |       RESTART
 |       RESTORE
 |       RESUME
+|       RETRY
 |       RETURNED_SQLSTATE
 |       RETURNING
 |       RETURNS

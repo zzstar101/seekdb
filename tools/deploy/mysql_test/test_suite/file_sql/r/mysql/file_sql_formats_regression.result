@@ -1,0 +1,35 @@
+SET SESSION enable_file_sql = ON;
+SELECT id, name, score, active, day, note FROM read_json('/tmp/seekdb-file-formats.jsonl') ORDER BY id;
+id	name	score	active	day	note
+1	世界	1.5	1	NULL	NULL
+2	NULL	NULL	0	2026-08-02	NULL
+3	third	3	NULL	NULL	ok
+SELECT COUNT(*) AS n, SUM(score) AS total FROM read_ndjson('/tmp/seekdb-file-formats.jsonl');
+n	total
+3	4.5
+SELECT c.id, c.label, j.name, j.note FROM read_csv('/tmp/seekdb-file-formats.csv') AS c
+LEFT JOIN read_json('/tmp/seekdb-file-formats.jsonl') AS j ON c.id = j.id ORDER BY c.id;
+id	label	name	note
+1	first	世界	NULL
+2	second	NULL	NULL
+4	fourth	NULL	NULL
+SELECT COUNT(*) AS n, MIN(c1) AS lo, MAX(c1) AS hi, SUM(c1) AS total
+FROM read_parquet('/tmp/seekdb-file-formats.parquet');
+n	lo	hi	total
+7	0	6	21
+SELECT p.c1, j.name FROM read_parquet('/tmp/seekdb-file-formats.parquet') AS p
+JOIN read_json('/tmp/seekdb-file-formats.jsonl') AS j ON p.c1 = j.id ORDER BY p.c1;
+c1	name
+1	世界
+2	NULL
+3	third
+SELECT c1 FROM read_parquet('/tmp/seekdb-file-formats.parquet') WHERE c1 > 2 ORDER BY c1 DESC LIMIT 2;
+c1
+6
+5
+SELECT * FROM read_json('/tmp/seekdb-file-formats-nested.jsonl');
+SELECT * FROM read_json('/tmp/seekdb-file-formats.jsonl', header = true);
+SET SESSION enable_file_sql = OFF;
+SELECT 'format regression complete' AS outcome;
+outcome
+format regression complete

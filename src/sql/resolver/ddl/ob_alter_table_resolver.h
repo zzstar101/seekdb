@@ -67,6 +67,11 @@ public:
   int resolve_convert_to_character(const ParseNode &node);
   int resolve_foreign_key_options(const ParseNode &node);
   int resolve_add_column(const ParseNode &node, ObColumnNameSet &resolve_add_column);
+  // Append the three hidden columns of an AI column added by ALTER TABLE ... ADD
+  // COLUMN (state / request id / result spec), idempotent per column name.
+  int append_ai_column_hidden_columns(
+      const share::schema::AlterColumnSchema &ai_column,
+      ObColumnNameSet &add_column_names_set);
   int resolve_alter_column(const ParseNode &node);
   int resolve_change_column(const ParseNode &node);
   int check_modify_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,

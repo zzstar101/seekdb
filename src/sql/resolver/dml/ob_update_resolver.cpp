@@ -15,6 +15,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/dml/ob_table_modify_op.h"
+#include "sql/resolver/dml/ai_column_write_guard.h"
 #include "sql/resolver/dml/ob_update_resolver.h"
 
 namespace oceanbase
@@ -87,6 +89,13 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(resolve_assignments(*assign_list,
                                            tables_assign,
                                            current_scope_))) {
+    }
+  }
+
+  // the cascaded assignments of a foreign key and the columns the table scan
+  // needs are added later, only the assignments of the statement are checked
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(check_ai_column_write(tables_assign))) {
     }
   }
 
@@ -534,6 +543,67 @@ int ObUpdateResolver::resolve_update_constraints()
         }
       }
     }
+  }
+  return ret;
+}
+
+int ObUpdateResolver::check_ai_column_write(const ObIArray<ObTableAssignment> &tables_assign)
+{
+  int ret = OB_SUCCESS;
+  ObUpdateStmt *update_stmt = get_update_stmt();
+  if (OB_ISNULL(update_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the update statement is null", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < tables_assign.count(); ++i) {
+    const ObTableAssignment &table_assign = tables_assign.at(i);
+    const TableItem *table_item = update_stmt->get_table_item_by_id(table_assign.table_id_);
+    const TableItem *base_table_item = NULL == table_item ? NULL : &table_item->get_base_table_item();
+    if (OB_ISNULL(table_item)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the update table item is not found", K(ret), K(table_assign.table_id_));
+    } else if (!base_table_item->is_basic_table()) {
+      // the column of a view is not the column of a table, the AI column flag is
+      // checked on the table the statement writes when the target is not a view
+    } else {
+      // the table item of a statement carries the id the resolver generated for
+      // the item, the AI column flag lives on the table the item refers to
+      const uint64_t table_id = base_table_item->ref_id_;
+      for (int64_t j = 0; OB_SUCC(ret) && j < table_assign.assignments_.count(); ++j) {
+        const ObColumnRefRawExpr *target_column = table_assign.assignments_.at(j).column_expr_;
+        if (OB_ISNULL(target_column)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("the update target column is null", K(ret), K(i), K(j));
+        } else if (OB_FAIL(check_ai_column_target(table_id,
+                                                 target_column->get_column_id()))) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObUpdateResolver::check_ai_column_target(const uint64_t table_id, const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  bool is_ai_column = false;
+  if (OB_ISNULL(schema_checker_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the schema checker is null", K(ret));
+  } else if (AiColumnWriteGuard::is_internal_write(session_info_, AiColumnHookGuard::is_active())) {
+    // the AI column runtime maintains the AI columns of the row itself
+  } else if (OB_FAIL(AiColumnWriteGuard::is_protected_column(*schema_checker_, table_id, column_id,
+                                                            is_ai_column))) {
+    if (OB_ERR_BAD_FIELD_ERROR == ret) {
+      // a target column the schema does not hold carries no AI column flag
+      LOG_DEBUG("the assigned column is not in the schema", K(table_id), K(column_id));
+      ret = OB_SUCCESS;
+    }
+  } else if (is_ai_column) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("assigning an ai column directly is not allowed", K(ret), K(table_id), K(column_id));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   AiColumnWriteGuard::write_subject(AiColumnWriteGuard::UPDATE_CLAUSE));
   }
   return ret;
 }

@@ -27,6 +27,8 @@
 #include "common/udt/ob_collection_type.h"
 #include "share/config/ob_server_config.h"
 #include "share/ob_lob_access_utils.h"
+#include "share/system_variable/ob_system_variable_alias.h"
+#include "sql/engine/basic/file_sql_export.h"
 
 namespace oceanbase
 {
@@ -38,7 +40,8 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, copy_header_, copy_delimiter_, copy_quote_, copy_escape_,
+    copy_nullstr_, copy_force_quote_, column_names_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -53,14 +56,20 @@ int ObSelectIntoOp::inner_open()
     if (OB_FAIL(session->get_sql_select_limit(top_limit_cnt_))) {
     }
   }
-  if (OB_SUCC(ret) && !MY_SPEC.external_properties_.str_.empty()) {
+  if (OB_SUCC(ret) && T_INTO_COPY == MY_SPEC.into_type_) {
+    // COPY ... TO ...: the export sink owns the CSV grammar and publishes atomically, so none
+    // of the external-properties / ObExternalFileWriter setup below applies.
+    if (OB_FAIL(init_copy_env())) {
+      LOG_WARN("failed to init COPY export environment", K(ret));
+    }
+  } else if (OB_SUCC(ret) && !MY_SPEC.external_properties_.str_.empty()) {
     if (OB_FAIL(external_properties_.load_from_string(MY_SPEC.external_properties_.str_,
                                                       ctx_.get_allocator()))) {
     } else {
       format_type_ = external_properties_.format_type_;
     }
   }
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && T_INTO_COPY != MY_SPEC.into_type_) {
     switch (format_type_)
     {
       case ObExternalFileFormat::FormatType::CSV_FORMAT:
@@ -188,6 +197,10 @@ int ObSelectIntoOp::calc_outfile_path()
 }
 int ObSelectIntoOp::inner_get_next_row()
 {
+  if (T_INTO_COPY == MY_SPEC.into_type_) {
+    // A COPY is a pure sink: one call drains the child and publishes the file.
+    return copy_get_next_row();
+  }
   int ret = 0 == top_limit_cnt_ ? OB_ITER_END : OB_SUCCESS;
   int64_t row_count = 0;
   const ObItemType into_type = MY_SPEC.into_type_;
@@ -236,6 +249,20 @@ int ObSelectIntoOp::inner_get_next_row()
 
 int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
 {
+  if (T_INTO_COPY == MY_SPEC.into_type_) {
+    UNUSED(max_row_cnt);
+    // COPY never produces rows for a parent operator: drain the child in row mode so the
+    // writer sees exactly the same row sequence as the non-vectorized path.
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(copy_get_next_row())) {
+      if (OB_LIKELY(OB_ITER_END == ret)) {
+        ret = OB_SUCCESS;
+      }
+    }
+    brs_.size_ = 0;
+    brs_.end_ = true;
+    return ret;
+  }
   int ret = OB_SUCCESS;
   const ObBatchRows *child_brs = NULL;
   int64_t batch_size = min(max_row_cnt, MY_SPEC.max_batch_size_);
@@ -325,7 +352,13 @@ int ObSelectIntoOp::inner_rescan()
 int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+  if (T_INTO_COPY == MY_SPEC.into_type_) {
+    if (OB_NOT_NULL(copy_writer_) && !copy_writer_->is_committed()) {
+      // Unpublished temp file: dropping it is the only cleanup needed, the target never
+      // came into existence.
+      copy_writer_->abort();
+    }
+  } else if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
   }
   return ret;
 }
@@ -1273,10 +1306,359 @@ int ObSelectIntoOp::new_data_writer(ObExternalFileWriter *&data_writer)
   return ret;
 }
 
+int ObSelectIntoOp::check_copy_gate()
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = NULL;
+  bool enabled = false;
+  if (OB_ISNULL(session = ctx_.get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+    LOG_WARN("failed to read File SQL feature gate", K(ret));
+  } else if (!enabled) {
+    // A plan can outlive the session settings it was built under (plan cache), so the gate is
+    // enforced again here and never derived from the statement text.
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY without enable_file_sql");
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::init_copy_env()
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = NULL;
+  ObPhysicalPlanCtx *phy_plan_ctx = NULL;
+  ObString path;
+  ObString secure_root;
+  ObString root_copy;
+  void *ptr = NULL;
+  bool need_check = false;
+  file_sql::CsvWriteOptions options;
+  file_sql::Status status = file_sql::Status::Ok;
+  // get_param_value only replaces unknown (parameterized) objects; keep literal paths too.
+  file_name_ = MY_SPEC.outfile_name_;
+  if (OB_ISNULL(ptr = ctx_.get_allocator().alloc(sizeof(ObArenaAllocator)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    copy_row_alloc_ = new (ptr) ObArenaAllocator();
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(session = ctx_.get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(check_copy_gate())) {
+  } else if (OB_FAIL(ObSQLUtils::get_param_value(MY_SPEC.outfile_name_,
+                                                 phy_plan_ctx->get_param_store(),
+                                                 file_name_,
+                                                 need_check))) {
+  } else if (!ob_is_string_type(file_name_.get_type())
+             || file_name_.get_string().empty()
+             || nullptr != MEMCHR(file_name_.get_string().ptr(), '\0', file_name_.get_string().length())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY requires a nonempty path without NUL bytes");
+  } else if (OB_FAIL(ob_write_string(ctx_.get_allocator(),
+                                     file_name_.get_string(),
+                                     copy_path_,
+                                     true))) {
+  } else if (OB_FAIL(session->get_secure_file_priv(secure_root))) {
+    LOG_WARN("failed to get secure_file_priv", K(ret));
+  } else if (OB_FAIL(ob_write_string(ctx_.get_allocator(), secure_root, root_copy, true))) {
+  } else if (OB_ISNULL(ptr = ctx_.get_allocator().alloc(sizeof(file_sql::CsvWriter)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    print_params_.tz_info_ = session->get_timezone_info();
+    print_params_.use_memcpy_ = true;
+    print_params_.cs_type_ = MY_SPEC.cs_type_;
+    options.enabled = true;  // the gate was checked just above
+    options.header = MY_SPEC.copy_header_;
+    options.delimiter = MY_SPEC.copy_delimiter_;
+    options.quote = MY_SPEC.copy_quote_;
+    options.escape = MY_SPEC.copy_escape_;
+    options.force_quote = MY_SPEC.copy_force_quote_;
+    if (!MY_SPEC.copy_nullstr_.empty()) {
+      options.null_text = std::string_view(MY_SPEC.copy_nullstr_.ptr(),
+                                          MY_SPEC.copy_nullstr_.length());
+    }
+    copy_writer_ = new (ptr) file_sql::CsvWriter();
+    // Open before the child produces any row: a bad target path or an existing file must fail
+    // fast and must not cost the whole query first.
+    if (file_sql::Status::Ok != (status = copy_writer_->open(copy_path_.ptr(),
+                                                            root_copy.ptr(),
+                                                            options))) {
+      LOG_WARN("failed to open COPY target", K(copy_path_), KCSTRING(copy_writer_->error()));
+      ret = copy_error(status);
+    } else {
+      copy_started_ = true;
+    }
+    if (OB_SUCC(ret) && MY_SPEC.copy_header_) {
+      const int64_t column_count = MY_SPEC.select_exprs_.count();
+      std::string_view *names = NULL;
+      if (OB_UNLIKELY(MY_SPEC.column_names_.count() != column_count)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("COPY column name count mismatch", K(ret),
+                 K(MY_SPEC.column_names_.count()), K(column_count));
+      } else if (column_count > 0
+                 && OB_ISNULL(names = static_cast<std::string_view *>(
+                                ctx_.get_allocator().alloc(column_count * sizeof(std::string_view))))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+          const ObString &name = MY_SPEC.column_names_.at(i);
+          new (&names[i]) std::string_view(name.empty() ? "" : name.ptr(), name.length());
+        }
+        if (OB_SUCC(ret)
+            && file_sql::Status::Ok != (status = copy_writer_->write_header(names, column_count))) {
+          LOG_WARN("failed to write COPY header", KCSTRING(copy_writer_->error()));
+          ret = copy_error(status);
+        }
+      }
+    }
+  }
+  LOG_TRACE("init COPY export", K(ret), K(copy_path_), K(secure_root),
+            K(MY_SPEC.copy_header_), K(MY_SPEC.copy_delimiter_));
+  return ret;
+}
+
+int ObSelectIntoOp::copy_error(file_sql::Status status)
+{
+  int ret = OB_SUCCESS;
+  const char *message = OB_NOT_NULL(copy_writer_) ? copy_writer_->error() : NULL;
+  if (OB_ISNULL(message) || '\0' == message[0]) {
+    message = "COPY export";
+  }
+  switch (status) {
+    case file_sql::Status::Ok:
+      break;
+    case file_sql::Status::Disabled:
+    case file_sql::Status::Unsupported:
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, message);
+      break;
+    case file_sql::Status::Denied:
+      // secure_file_priv: same error class as the file readers deny with.
+      ret = OB_ERR_NO_PRIVILEGE;
+      LOG_USER_ERROR(OB_ERR_NO_PRIVILEGE, "secure_file_priv");
+      break;
+    case file_sql::Status::Changed:
+      // The writer publishes with a no-replace primitive, so a target that appeared between
+      // planning and publishing is reported as an existing file and never overwritten.
+      ret = OB_FILE_ALREADY_EXIST;
+      LOG_USER_ERROR(OB_FILE_ALREADY_EXIST);
+      break;
+    case file_sql::Status::Io:
+      ret = OB_IO_ERROR;
+      break;
+    case file_sql::Status::InvalidOption:
+    case file_sql::Status::ResourceLimit:
+    case file_sql::Status::Malformed:
+    default:
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, message);
+      break;
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::copy_print_field(const ObExpr &expr,
+                                     const ObDatum &datum,
+                                     ObString &text,
+                                     bool &is_null)
+{
+  int ret = OB_SUCCESS;
+  text.reset();
+  is_null = datum.is_null();
+  if (!is_null) {
+    if (ob_is_text_tc(expr.obj_meta_.get_type())) {
+      // Text/lob values are the only ones that do not fit into a single datum: materialize
+      // this row's value only, never the whole result.
+      ObTextStringIter text_iter(expr.datum_meta_.type_, expr.datum_meta_.cs_type_,
+                                 datum.get_string(), expr.obj_meta_.has_lob_header());
+      ObTextStringIterState state = TEXTSTRING_ITER_INIT;
+      ObString block;
+      char *buf = NULL;
+      int64_t buf_len = 0;
+      if (OB_FAIL(ObTextStringHelper::build_text_iter(text_iter,
+                                                      eval_ctx_.exec_ctx_,
+                                                      copy_row_alloc_))) {
+      }
+      while (OB_SUCC(ret) && TEXTSTRING_ITER_NEXT == (state = text_iter.get_next_block(block))) {
+        const int64_t needed = buf_len + block.length();
+        if (OB_UNLIKELY(needed > static_cast<int64_t>(file_sql::CsvWriter::MAX_FIELD_BYTES))) {
+          ret = OB_SIZE_OVERFLOW;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY field length");
+        } else {
+          char *new_buf = buf;
+          if (0 == buf_len) {
+            new_buf = static_cast<char *>(copy_row_alloc_->alloc(needed > 0 ? needed : 1));
+          } else if (needed > buf_len) {
+            if (OB_ISNULL(new_buf = static_cast<char *>(copy_row_alloc_->alloc(needed)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              MEMCPY(new_buf, buf, buf_len);
+            }
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_ISNULL(new_buf)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            if (block.length() > 0) {
+              MEMCPY(new_buf + buf_len, block.ptr(), block.length());
+            }
+            buf = new_buf;
+            buf_len = needed;
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (TEXTSTRING_ITER_END != state) {
+        ret = (OB_SUCCESS != text_iter.get_inner_ret()) ? text_iter.get_inner_ret() : OB_INVALID_DATA;
+      } else {
+        text.assign_ptr(buf, static_cast<int32_t>(buf_len));
+      }
+    } else {
+      ObObj obj;
+      const int64_t max_len = static_cast<int64_t>(file_sql::CsvWriter::MAX_FIELD_BYTES);
+      int64_t buf_len = 256;
+      bool printed = false;
+      if (OB_FAIL(datum.to_obj(obj, expr.obj_meta_, expr.obj_datum_map_))) {
+      }
+      while (OB_SUCC(ret) && !printed) {
+        char *buf = NULL;
+        int64_t pos = 0;
+        if (OB_ISNULL(buf = static_cast<char *>(copy_row_alloc_->alloc(buf_len)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_FAIL(obj.print_plain_str_literal(buf, buf_len, pos, print_params_))) {
+          if (OB_SIZE_OVERFLOW != ret) {
+          } else if (buf_len >= max_len) {
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY field length");
+          } else {
+            ret = OB_SUCCESS;
+            buf_len = (buf_len * 2 > max_len) ? max_len : buf_len * 2;
+          }
+        } else {
+          text.assign_ptr(buf, static_cast<int32_t>(pos));
+          printed = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::copy_write_row()
+{
+  int ret = OB_SUCCESS;
+  const int64_t column_count = MY_SPEC.select_exprs_.count();
+  std::string_view *values = NULL;
+  bool *is_null = NULL;
+  file_sql::Status status = file_sql::Status::Ok;
+  if (OB_NOT_NULL(copy_row_alloc_)) {
+    copy_row_alloc_->reuse();
+  }
+  if (OB_UNLIKELY(column_count <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_UNLIKELY(column_count > static_cast<int64_t>(file_sql::CsvWriter::MAX_HEADER_COLUMNS))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY with too many columns");
+  } else if (OB_ISNULL(values = static_cast<std::string_view *>(
+                       copy_row_alloc_->alloc(column_count * sizeof(std::string_view))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_ISNULL(is_null = static_cast<bool *>(
+                       copy_row_alloc_->alloc(column_count * sizeof(bool))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const ObExpr *expr = MY_SPEC.select_exprs_.at(i);
+    ObDatum *datum = NULL;
+    ObString text;
+    bool null_value = false;
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(expr->eval(eval_ctx_, datum))) {
+    } else if (OB_ISNULL(datum)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(copy_print_field(*expr, *datum, text, null_value))) {
+    } else {
+      is_null[i] = null_value;
+      new (&values[i]) std::string_view(null_value ? "" : text.ptr(), text.length());
+    }
+  }
+  if (OB_SUCC(ret)
+      && file_sql::Status::Ok != (status = copy_writer_->write_row(values, is_null, column_count))) {
+    LOG_WARN("failed to write COPY row", K(status), KCSTRING(copy_writer_->error()));
+    ret = copy_error(status);
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::copy_finish()
+{
+  int ret = OB_SUCCESS;
+  file_sql::Status status = file_sql::Status::Ok;
+  if (copy_finished_) {
+    // already published
+  } else if (OB_ISNULL(copy_writer_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (file_sql::Status::Ok != (status = copy_writer_->commit())) {
+    LOG_WARN("failed to publish COPY target", K(status), KCSTRING(copy_writer_->error()));
+    ret = copy_error(status);
+  } else {
+    copy_finished_ = true;
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::copy_get_next_row()
+{
+  int ret = OB_SUCCESS;
+  ObPhysicalPlanCtx *phy_plan_ctx = NULL;
+  int64_t row_count = 0;
+  bool is_iter_end = false;
+  if (copy_finished_) {
+    // The target is already published: never append to it again (a rescan of the export plan
+    // must not silently duplicate rows).
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  while (OB_SUCC(ret) && !is_iter_end && row_count < top_limit_cnt_) {
+    clear_evaluated_flag();
+    if (OB_FAIL(child_->get_next_row())) {
+      if (OB_LIKELY(OB_ITER_END == ret)) {
+        ret = OB_SUCCESS;
+        is_iter_end = true;
+      }
+    } else if (OB_FAIL(copy_write_row())) {
+    } else {
+      ++row_count;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(copy_finish())) {
+    } else {
+      phy_plan_ctx->set_affected_rows(row_count);
+      ret = OB_ITER_END;
+    }
+  }
+  return ret;
+}
+
 void ObSelectIntoOp::destroy()
 {
   if (OB_NOT_NULL(data_writer_)) {
     data_writer_->~ObExternalFileWriter();
+  }
+  if (OB_NOT_NULL(copy_writer_)) {
+    // ~CsvWriter() aborts an uncommitted export, so a plan torn down before commit leaves no
+    // temp file behind.
+    copy_writer_->~CsvWriter();
+    copy_writer_ = NULL;
+  }
+  if (OB_NOT_NULL(copy_row_alloc_)) {
+    copy_row_alloc_->~ObArenaAllocator();
+    copy_row_alloc_ = NULL;
   }
   external_properties_.~ObExternalFileFormat();
   ObOperator::destroy();

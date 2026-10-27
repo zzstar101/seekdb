@@ -1,0 +1,10 @@
+CREATE TABLE ai_column_plain_sql_regression (id BIGINT PRIMARY KEY, value VARCHAR(64));
+INSERT INTO ai_column_plain_sql_regression VALUES (1, 'normal');
+UPDATE ai_column_plain_sql_regression SET value = 'updated' WHERE id = 1;
+SELECT id, value FROM ai_column_plain_sql_regression;
+id	value
+1	updated
+DELETE FROM ai_column_plain_sql_regression WHERE id = 1;
+ALTER TABLE ai_column_plain_sql_regression ADD COLUMN extra INT;
+ALTER TABLE ai_column_plain_sql_regression DROP COLUMN extra;
+DROP TABLE ai_column_plain_sql_regression;

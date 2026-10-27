@@ -1,0 +1,16 @@
+# Run on a dedicated instance: restore the original global path policy on success.
+--disable_query_log
+let $saved_file_priv = `SELECT IF(@@global.secure_file_priv IS NULL, 'NULL', QUOTE(@@global.secure_file_priv))`;
+--enable_query_log
+SET SESSION enable_file_sql = ON;
+SET GLOBAL secure_file_priv = '';
+--error 1227
+SELECT * FROM read_csv('/tmp/seekdb-file-sql-denied.csv');
+SET GLOBAL secure_file_priv = NULL;
+--error 1227
+SELECT * FROM read_csv('/tmp/seekdb-file-sql-denied.csv');
+--disable_query_log
+eval SET GLOBAL secure_file_priv = $saved_file_priv;
+--enable_query_log
+SET SESSION enable_file_sql = OFF;
+SELECT 1 AS server_survived_denied_file_access;

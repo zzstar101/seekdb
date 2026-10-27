@@ -98,6 +98,14 @@ private:
   virtual int resolve_insert_update_assignment(const ParseNode *node, ObInsertTableInfo& table_info) override;
   int replace_column_to_default(ObRawExpr *&origin);
   int resolve_insert_constraint();
+  // The result of an AI column is produced by the AI column runtime, so an INSERT
+  // may not assign it. The supported way is to omit the column list entry and let
+  // the runtime fill the column in.
+  int check_ai_column_target_write(const ObInsertTableInfo &table_info);
+  int check_ai_column_odku_write(const ObInsertTableInfo &table_info);
+  int check_ai_column_target(const TableItem &table_item,
+                             const common::ObIArray<ObColumnRefRawExpr *> &target_columns,
+                             const bool is_odku_write);
   int check_view_insertable();
   int check_insert_select_field(ObInsertStmt &insert_stmt,
                                 ObSelectStmt &select_stmt,

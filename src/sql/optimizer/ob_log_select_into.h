@@ -44,7 +44,14 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        copy_header_(false),
+        copy_delimiter_(','),
+        copy_quote_('"'),
+        copy_escape_('"'),
+        copy_nullstr_(),
+        copy_force_quote_(false),
+        column_names_()
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -166,6 +173,34 @@ public:
   }
   const common::ObIArray<ObRawExpr*> &get_select_exprs() const { return select_exprs_; }
   common::ObIArray<ObRawExpr*> &get_select_exprs() { return select_exprs_; }
+  // COPY ... TO ... export options
+  inline void set_copy_header(bool copy_header) { copy_header_ = copy_header; }
+  inline void set_copy_delimiter(char copy_delimiter) { copy_delimiter_ = copy_delimiter; }
+  inline void set_copy_quote(char copy_quote) { copy_quote_ = copy_quote; }
+  inline void set_copy_escape(char copy_escape) { copy_escape_ = copy_escape; }
+  inline void set_copy_nullstr(const common::ObString &copy_nullstr)
+  {
+    copy_nullstr_.assign_ptr(copy_nullstr.ptr(), copy_nullstr.length());
+  }
+  inline void set_copy_force_quote(bool copy_force_quote)
+  {
+    copy_force_quote_ = copy_force_quote;
+  }
+  inline int set_column_names(const common::ObIArray<common::ObString> &column_names)
+  {
+    return column_names_.assign(column_names);
+  }
+  inline bool get_copy_header() const { return copy_header_; }
+  inline char get_copy_delimiter() const { return copy_delimiter_; }
+  inline char get_copy_quote() const { return copy_quote_; }
+  inline char get_copy_escape() const { return copy_escape_; }
+  inline common::ObString get_copy_nullstr() const { return copy_nullstr_; }
+  inline bool get_copy_force_quote() const { return copy_force_quote_; }
+  inline const common::ObIArray<common::ObString> &get_column_names() const
+  {
+    return column_names_;
+  }
+  inline bool is_copy_export() const { return T_INTO_COPY == into_type_; }
   virtual int est_cost() override;
   virtual int compute_plan_type() override;
   virtual int get_op_exprs(ObIArray<ObRawExpr*> &all_exprs) override;
@@ -188,6 +223,15 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  // COPY ... TO ... export options, only meaningful when into_type_ == T_INTO_COPY
+  bool copy_header_;
+  char copy_delimiter_;
+  char copy_quote_;
+  char copy_escape_;
+  common::ObString copy_nullstr_;
+  bool copy_force_quote_;
+  // Header names of the exported columns, in select item order.
+  common::ObSEArray<common::ObString, 8, common::ModulePageAllocator, true> column_names_;
 };
 }
 }

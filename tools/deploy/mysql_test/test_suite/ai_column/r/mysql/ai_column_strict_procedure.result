@@ -1,0 +1,24 @@
+DROP DATABASE IF EXISTS ai_strict_procedure;
+CREATE DATABASE ai_strict_procedure;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('strict_procedure_model');
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL('strict_procedure_model', '{"type":"completion","model_name":"mock-complete"}');
+CREATE TABLE ai_strict_procedure.docs (
+id BIGINT PRIMARY KEY,
+content VARCHAR(100),
+generated_text VARCHAR(200) AI COLUMN (AI_COMPLETE('strict_procedure_model', content))
+WITH (sync_mode='async', max_retries=0)
+);
+INSERT INTO ai_strict_procedure.docs(id, content) VALUES (1, 'not ready');
+CREATE PROCEDURE ai_strict_procedure.read_generated() SELECT generated_text FROM ai_strict_procedure.docs;
+CREATE PROCEDURE ai_strict_procedure.read_plain() SELECT id FROM ai_strict_procedure.docs;
+SET SESSION ai_column_strict_read=ON;
+SELECT generated_text FROM ai_strict_procedure.docs;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+CALL ai_strict_procedure.read_generated();
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+CALL ai_strict_procedure.read_plain();
+id
+1
+SET SESSION ai_column_strict_read=OFF;
+DROP DATABASE ai_strict_procedure;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('strict_procedure_model');

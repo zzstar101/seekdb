@@ -10976,6 +10976,21 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "ai_column_strict_read": {
+    "id": 10755,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Reject statements referencing AI columns with non-ready rows",
+    "flags": "SESSION | MYSQL_ONLY | INFLUENCE_PLAN | NEED_SERIALIZE",
+    "min_val": "0",
+    "max_val": "1",
+    "publish_version": "1.4.0.0",
+    "info_cn": "引用存在未就绪行的 AI 列时拒绝执行语句",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ob_sparse_drop_ratio_search": {
     "id": 10753,
     "name": "ob_sparse_drop_ratio_search",

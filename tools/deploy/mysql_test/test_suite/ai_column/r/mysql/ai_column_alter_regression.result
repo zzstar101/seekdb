@@ -1,0 +1,35 @@
+DROP DATABASE IF EXISTS ai_alter_regression;
+CREATE DATABASE ai_alter_regression;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('alter_regression_model');
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL('alter_regression_model', '{"type":"completion","model_name":"mock-complete"}');
+CREATE TABLE ai_alter_regression.docs(id BIGINT PRIMARY KEY, content VARCHAR(100));
+ALTER TABLE ai_alter_regression.docs
+ADD COLUMN tags JSON AI COLUMN (AI_COMPLETE('alter_regression_model', content)),
+ADD COLUMN summary VARCHAR(100) AI COLUMN (AI_COMPLETE('alter_regression_model', content));
+SELECT COUNT(*) = 2 AS both_catalog_rows
+FROM oceanbase.__all_ai_column a
+JOIN oceanbase.__all_table t ON t.table_id = a.table_id
+JOIN oceanbase.__all_database d ON d.database_id = t.database_id
+WHERE d.database_name = 'ai_alter_regression' AND t.table_name = 'docs';
+both_catalog_rows
+1
+SELECT COUNT(*) = 6 AS all_hidden_ids_resolve
+FROM oceanbase.__all_ai_column a
+JOIN oceanbase.__all_table t ON t.table_id = a.table_id
+JOIN oceanbase.__all_database d ON d.database_id = t.database_id
+JOIN oceanbase.__all_column c ON c.table_id = a.table_id
+AND c.column_id IN (a.state_column_id, a.request_column_id, a.result_spec_column_id)
+WHERE d.database_name = 'ai_alter_regression' AND t.table_name = 'docs'
+ AND c.is_hidden = 1;
+all_hidden_ids_resolve
+1
+SELECT COUNT(*) = 4 AS only_business_and_result_columns_visible
+FROM oceanbase.__all_column c
+JOIN oceanbase.__all_table t ON t.table_id = c.table_id
+JOIN oceanbase.__all_database d ON d.database_id = t.database_id
+WHERE d.database_name = 'ai_alter_regression' AND t.table_name = 'docs'
+ AND c.is_hidden = 0;
+only_business_and_result_columns_visible
+1
+DROP DATABASE ai_alter_regression;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('alter_regression_model');

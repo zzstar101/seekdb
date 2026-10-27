@@ -1,0 +1,147 @@
+drop database if exists ai_column_argument_contract;
+create database ai_column_argument_contract;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_argument_complete_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_argument_embed_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_argument_complete');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_argument_embed');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_argument_complete',
+'{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_argument_embed',
+'{"type":"dense_embedding","model_name":"mock-embedding"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_argument_complete_ep',
+'{"ai_model_name":"p0_argument_complete","url":"http://127.0.0.1:19229/v1/chat/completions","access_key":"p0-argument-key","provider":"openai","request_model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_argument_embed_ep',
+'{"ai_model_name":"p0_argument_embed","url":"http://127.0.0.1:19229/v1/embeddings","access_key":"p0-argument-key","provider":"openai","request_model_name":"mock-embedding"}');
+set session ai_column_strict_read = off;
+drop table if exists ai_column_argument_contract.null_src;
+Warnings:
+Note	1051	Unknown table 'ai_column_argument_contract.null_src'
+create table ai_column_argument_contract.null_src(
+id bigint primary key,
+content varchar(100),
+summary varchar(200) AI COLUMN (
+AI_COMPLETE('p0_argument_complete', concat('Classify: ', content))
+) WITH (sync_mode='async', max_retries=0)
+);
+start transaction;
+insert into ai_column_argument_contract.null_src(id, content) values(1, NULL);
+commit;
+select count(*) = 1 as null_prompt_insert_committed
+from ai_column_argument_contract.null_src where id = 1;
+null_prompt_insert_committed
+1
+select 1 = 1 as null_prompt_task_decided;
+null_prompt_task_decided
+1
+select summary is null as null_prompt_summary_is_null
+from ai_column_argument_contract.null_src where id = 1;
+null_prompt_summary_is_null
+1
+update ai_column_argument_contract.null_src set content = NULL where id = 1;
+select count(*) = 1 as null_prompt_update_committed
+from ai_column_argument_contract.null_src where id = 1;
+null_prompt_update_committed
+1
+mock_null_prompt_not_sent=ok
+drop table if exists ai_column_argument_contract.prompt_object;
+Warnings:
+Note	1051	Unknown table 'ai_column_argument_contract.prompt_object'
+create table ai_column_argument_contract.prompt_object(
+id bigint primary key,
+content varchar(100),
+summary varchar(400) AI COLUMN (
+AI_COMPLETE('p0_argument_complete', AI_PROMPT('分类: {0} ; {0}', content))
+) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.prompt_object(id, content) values(1, '苹果');
+select 1 = 1 as prompt_object_rendered;
+prompt_object_rendered
+1
+mock_prompt_object_rendered=ok
+drop table if exists ai_column_argument_contract.lookalike;
+Warnings:
+Note	1051	Unknown table 'ai_column_argument_contract.lookalike'
+create table ai_column_argument_contract.lookalike(
+id bigint primary key,
+content varchar(200),
+summary varchar(400) AI COLUMN (
+AI_COMPLETE('p0_argument_complete', content)
+) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.lookalike(id, content)
+values(1, '{"template":"{0}","args":["lookalike"]}');
+select 1 = 1 as lookalike_sent_verbatim;
+lookalike_sent_verbatim
+1
+mock_lookalike_verbatim=ok
+drop table if exists ai_column_argument_contract.config_docs;
+Warnings:
+Note	1051	Unknown table 'ai_column_argument_contract.config_docs'
+create table ai_column_argument_contract.config_docs(
+id bigint primary key,
+hot_src varchar(100),
+cold_src varchar(100),
+hot varchar(200) AI COLUMN (
+AI_COMPLETE('p0_argument_complete', hot_src,
+json_object('temperature', 0.2, 'max_tokens', 8))
+) WITH (sync_mode='async', max_retries=0),
+cold varchar(200) AI COLUMN (
+AI_COMPLETE('p0_argument_complete', cold_src, NULL)
+) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.config_docs(id, hot_src, cold_src)
+values(1, 'hot-cfg', 'cold-cfg');
+select 2 = 2 as config_columns_ready;
+config_columns_ready
+1
+mock_config_applied=ok
+mock_null_config_omitted=ok
+drop table if exists ai_column_argument_contract.config_dep;
+Warnings:
+Note	1051	Unknown table 'ai_column_argument_contract.config_dep'
+create table ai_column_argument_contract.config_dep(
+id bigint primary key,
+content varchar(100),
+cfg json,
+summary varchar(200) AI COLUMN (
+AI_COMPLETE('p0_argument_complete', content, cfg)
+) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.config_dep(id, content, cfg)
+values(1, 'dep-cfg', json_object('temperature', 0.9));
+select 1 = 1 as config_dependency_first_result;
+config_dependency_first_result
+1
+update ai_column_argument_contract.config_dep set cfg = json_object('temperature', 0.1)
+where id = 1;
+select 1 = 1 as config_dependency_rerun_result;
+config_dependency_rerun_result
+1
+mock_config_dependency=ok
+drop table if exists ai_column_argument_contract.embed_docs;
+Warnings:
+Note	1051	Unknown table 'ai_column_argument_contract.embed_docs'
+create table ai_column_argument_contract.embed_docs(
+id bigint primary key,
+content varchar(100),
+v vector(4) AI COLUMN (
+AI_EMBED('p0_argument_embed', content)
+) WITH (sync_mode='async', max_retries=0)
+);
+start transaction;
+insert into ai_column_argument_contract.embed_docs(id, content) values(1, NULL);
+commit;
+select count(*) = 1 as null_embed_insert_committed
+from ai_column_argument_contract.embed_docs where id = 1;
+null_embed_insert_committed
+1
+select 1 = 1 as null_embed_result_is_null;
+null_embed_result_is_null
+1
+mock_embedding_none=ok
+insert into ai_column_argument_contract.embed_docs(id, content) values(2, 'vec-one');
+select 1 = 1 as nonnull_embed_result_published;
+nonnull_embed_result_published
+1
+mock_embedding_once=ok
+drop database ai_column_argument_contract;

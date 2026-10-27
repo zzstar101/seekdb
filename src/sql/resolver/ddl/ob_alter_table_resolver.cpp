@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_retry_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_part_expr_checker.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
@@ -64,6 +66,37 @@ int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
     ret = OB_ERR_UNEXPECTED;
     SQL_RESV_LOG(WARN, "invalid parse tree", K(ret), K(parse_tree.num_child_));
   } else {
+    // ALTER TABLE ... RETRY AI COLUMN <col> [WHERE ...] changes no schema: it
+    // re-queues the AI column tasks of the rows the predicate selects. The retry is
+    // an alter table action in the grammar so that combining it with another action
+    // is an unsupported combination rather than a syntax error; a statement made of
+    // that action alone resolves to a retry statement and stops here.
+    int64_t retry_action_index = -1;
+    int64_t alter_action_count = 0;
+    if (OB_FAIL(ObAIColumnRetryResolver::find_retry_action(parse_tree.children_[ACTION_LIST],
+                                                          retry_action_index,
+                                                          alter_action_count))) {
+      SQL_RESV_LOG(WARN, "failed to inspect the alter table action list", K(ret));
+    } else if (retry_action_index >= 0 && alter_action_count > 1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+      SQL_RESV_LOG(WARN, "a retry ai column action must be the only action of the statement",
+                   K(ret), K(alter_action_count));
+    } else if (retry_action_index >= 0) {
+      ObAIColumnRetryResolver retry_resolver(params_);
+      if (OB_FAIL(retry_resolver.resolve(parse_tree))) {
+        SQL_RESV_LOG(WARN, "failed to resolve the retry ai column statement", K(ret));
+      } else if (OB_ISNULL(stmt_ = retry_resolver.get_basic_stmt())) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "the retry ai column statement is null", K(ret));
+      }
+      return ret;
+    }
+    if (OB_FAIL(ret)) {
+      // Preserve RETRY validation errors: ordinary ALTER setup below must not
+      // overwrite them and attempt to resolve an unsupported mixed action.
+      return ret;
+    }
     ObAlterTableStmt *alter_table_stmt = NULL;
     //create alter table stmt
     if (NULL == (alter_table_stmt = create_stmt<ObAlterTableStmt>())) {
@@ -3455,13 +3488,86 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
 
         //add column
         if (OB_SUCC(ret)) {
-          if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
+          // Online ADD applies columns sequentially. Persist the hidden columns
+          // first so the result column's catalog row can resolve their actual ids
+          // within this same DDL transaction.
+          if (OB_FAIL(append_ai_column_hidden_columns(alter_column_schema,
+                                                       add_column_names_set))) {
+            SQL_RESV_LOG(WARN, "fail to append ai column hidden columns", K(ret));
+          } else if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
           }
         }
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+// An AI column created by ALTER TABLE ... ADD COLUMN owns the same three hidden
+// columns as one created by CREATE TABLE. They precede the AI result column in
+// the ALTER operation list: the online DDL service assigns ids and persists
+// columns sequentially, and the result column's catalog row needs those ids.
+int ObAlterTableResolver::append_ai_column_hidden_columns(
+    const share::schema::AlterColumnSchema &ai_column,
+    ObColumnNameSet &add_column_names_set)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  ObAIColumnDefinition def;
+  const ObString &comment = ai_column.get_comment_str();
+  if (OB_ISNULL(alter_table_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!ObAIColumnResolver::is_ai_column(ai_column)) {
+    // an ordinary added column
+  } else if (OB_FAIL(ObAIColumnResolver::decode_definition(*allocator_, comment, def))) {
+    SQL_RESV_LOG(WARN, "fail to decode ai column definition", K(ret), K(ai_column));
+  } else {
+    const ObString *hidden_names[3] = {
+        &def.state_column_name_, &def.request_column_name_, &def.result_spec_column_name_};
+    const ObObjType hidden_types[3] = {ObIntType, ObVarcharType, ObLongTextType};
+    const char *hidden_comments[3] = {
+        "AI column state: 1 pending, 2 running, 3 retry_wait, 4 ready, 5 failed",
+        "AI column request id watermark",
+        "AI column result type spec"};
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      AlterColumnSchema hidden_column;
+      hidden_column.alter_type_ = OB_DDL_ADD_COLUMN;
+      ObColumnNameHashWrapper col_key(*hidden_names[i]);
+      if (hidden_names[i]->empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "ai column hidden column name is empty", K(ret), K(def));
+      } else if (OB_FAIL(add_column_names_set.set_refactored(col_key))) {
+        SQL_RESV_LOG(WARN, "ai column hidden column name conflicts", K(ret),
+                     K(*hidden_names[i]));
+      } else {
+        hidden_column.set_is_hidden(true);
+        hidden_column.set_nullable(true);
+        hidden_column.set_data_type(hidden_types[i]);
+        if (ObVarcharType == hidden_types[i]) {
+          hidden_column.set_charset_type(CHARSET_UTF8MB4);
+          hidden_column.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+          ObAccuracy accuracy;
+          accuracy.set_length(128);
+          hidden_column.set_accuracy(accuracy);
+        } else if (ObLongTextType == hidden_types[i]) {
+          hidden_column.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[ObLongTextType]);
+          hidden_column.set_charset_type(CHARSET_UTF8MB4);
+          hidden_column.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+        } else {
+          hidden_column.set_charset_type(CHARSET_BINARY);
+          hidden_column.set_collation_type(CS_TYPE_BINARY);
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(hidden_column.set_column_name(*hidden_names[i]))) {
+        } else if (OB_FAIL(hidden_column.set_comment(hidden_comments[i]))) {
+        } else if (OB_FAIL(alter_table_stmt->add_column(hidden_column))) {
+          SQL_RESV_LOG(WARN, "fail to add ai column hidden column", K(ret),
+                       K(*hidden_names[i]));
+        }
+      }
+    }
   }
   return ret;
 }
@@ -3863,6 +3969,17 @@ int ObAlterTableResolver::resolve_change_column(const ParseNode &node)
                        table_schema_->get_table_name_str().ptr());
       }
     }
+    // Reject a CHANGE COLUMN on an AI result column before the new definition is parsed.
+    // The stored column flags (including AI_COLUMN_FLAG) are copied onto the new
+    // definition, so the AI specific validation inside the column definition resolver
+    // would run and fail first with an internal error (client code 4016) instead of the
+    // OB_NOT_SUPPORTED reported here.
+    if (OB_SUCC(ret) && ObAIColumnResolver::is_ai_column(*origin_col_schema)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "redefining an AI result column with CHANGE COLUMN is");
+      SQL_RESV_LOG(WARN, "change column on an ai column is not supported", K(ret),
+                   KP(origin_col_schema));
+    }
     //resolve new column definition
     if (OB_SUCC(ret)) {
       ObColumnResolveStat stat;
@@ -3880,6 +3997,31 @@ int ObAlterTableResolver::resolve_change_column(const ParseNode &node)
       ObSEArray<ObColumnSchemaV2 *, 8> resolved_cols;
       if (OB_FAIL(get_table_schema_all_column_schema(resolved_cols, alter_table_stmt->get_alter_table_schema()))) {
       } else if (OB_FAIL(resolve_alter_table_column_definition(alter_column_schema, node.children_[1], stat, is_modify_column_visibility, resolved_cols))) {
+      } else if (OB_FAIL(ObAIColumnResolver::inherit_definition(*allocator_,
+                                                                *origin_col_schema,
+                                                                alter_column_schema))) {
+        // ALTER TABLE ... CHANGE COLUMN rebuilds the column schema from scratch, so a
+        // statement that does not repeat the AI COLUMN clause (or the COMMENT) would
+        // otherwise drop the definition while the AI column flag survives.
+        LOG_WARN("fail to inherit ai column definition", K(ret), KP(origin_col_schema),
+                 K(alter_column_schema));
+      } else if (ObAIColumnResolver::is_ai_column(*origin_col_schema)
+                 || ObAIColumnResolver::is_ai_column(alter_column_schema)) {
+        // MODIFY / CHANGE COLUMN cannot redefine an AI result column, nor turn an
+        // ordinary column into one: only CREATE TABLE and ALTER TABLE ... ADD COLUMN
+        // create the three hidden columns (__ai_state_* / __ai_req_* /
+        // __ai_result_spec_*) and the __all_ai_column row the runtime needs, so
+        // accepting the statement here would persist a column that claims to be an AI
+        // column while nothing computes it.
+        ret = OB_NOT_SUPPORTED;
+        if (ObAIColumnResolver::is_ai_column(*origin_col_schema)) {
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "redefining an AI result column with CHANGE COLUMN is");
+        } else {
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "turning a normal column into an AI column with CHANGE COLUMN is");
+        }
+        SQL_RESV_LOG(WARN, "change column on an ai column is not supported", K(ret),
+                     KP(origin_col_schema), K(alter_column_schema));
       } else if (!stat.is_primary_key_ && OB_FAIL(resolve_alter_column_not_null(alter_column_schema, *origin_col_schema))) {
       } else {
         //TODO(xiyu):hanlde change column c2 c3 int unique key; support unique key
@@ -4029,6 +4171,16 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
                            table_schema_->get_table_name_str().length(),
                            table_schema_->get_table_name_str().ptr());
           }
+        } else if (ObAIColumnResolver::is_ai_column(*origin_col_schema)) {
+          // Reject a MODIFY COLUMN on an AI result column before the new definition is
+          // parsed: the stored column flags (including AI_COLUMN_FLAG) are copied onto the
+          // new definition, so the AI specific validation inside the column definition
+          // resolver would run and fail first with an internal error (client code 4016)
+          // instead of the OB_NOT_SUPPORTED reported here.
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "redefining an AI result column with MODIFY COLUMN is");
+          SQL_RESV_LOG(WARN, "modify column on an ai column is not supported", K(ret),
+                       KP(origin_col_schema));
         } else {
           //alter column's generated column flag should be parsed by itself,
           // So need to clear the generated column flag that was previously copied
@@ -4053,6 +4205,33 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
                     resolved_cols,
                     false,
                     allow_has_default))) {
+        } else if (OB_FAIL(ObAIColumnResolver::inherit_definition(*allocator_,
+                                                                  *origin_col_schema,
+                                                                  alter_column_schema))) {
+          // MODIFY COLUMN rebuilds the column schema; keep the AI definition (and the
+          // user comment) of the stored column when the statement does not spell them
+          // out again, otherwise the AI column would keep its flag but lose its
+          // definition.
+          LOG_WARN("fail to inherit ai column definition", K(ret), KP(origin_col_schema),
+                   K(alter_column_schema));
+        } else if (ObAIColumnResolver::is_ai_column(*origin_col_schema)
+                   || ObAIColumnResolver::is_ai_column(alter_column_schema)) {
+          // MODIFY / CHANGE COLUMN cannot redefine an AI result column, nor turn an
+          // ordinary column into one: only CREATE TABLE and ALTER TABLE ... ADD COLUMN
+          // create the three hidden columns (__ai_state_* / __ai_req_* /
+          // __ai_result_spec_*) and the __all_ai_column row the runtime needs, so
+          // accepting the statement here would persist a column that claims to be an
+          // AI column while nothing computes it.
+          ret = OB_NOT_SUPPORTED;
+          if (ObAIColumnResolver::is_ai_column(*origin_col_schema)) {
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "redefining an AI result column with MODIFY COLUMN is");
+          } else {
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "turning a normal column into an AI column with MODIFY COLUMN is");
+          }
+          SQL_RESV_LOG(WARN, "modify column on an ai column is not supported", K(ret),
+                       KP(origin_col_schema), K(alter_column_schema));
         } else if (!stat.is_primary_key_ &&
                    OB_FAIL(resolve_alter_column_not_null(alter_column_schema, *origin_col_schema))) {
         }

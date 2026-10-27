@@ -2441,7 +2441,10 @@ all_ai_model_endpoint_def = dict(
         ('request_model_name', 'varchar:128', 'true'),
         ('parameters', 'varchar:2048', 'true'),
         ('request_transform_fn', 'varchar:64', 'true'),
-        ('response_transform_fn', 'varchar:64', 'true')
+        ('response_transform_fn', 'varchar:64', 'true'),
+        # 0 means "the user did not specify max_concurrency"; a specified value
+        # is in [1, 1024] and is validated by ObAiModelEndpointInfo::check_valid.
+        ('max_concurrency', 'int', 'false', '0')
     ]
 )
 def_table_schema(**all_ai_model_endpoint_def)
@@ -2466,6 +2469,108 @@ all_objauth_mysql_def = dict(
   )
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
+
+
+# AI COLUMN runtime: persistent task queue for asynchronous AI column computation.
+# One row per (row of a user table, AI column) that has to be (re)computed.
+# The row is inserted / deleted inside the very same transaction as the business
+# DML (see src/observer/ai_service/ai_column/ob_ai_column_dml_hook.cpp), so an
+# aborted transaction never leaves a task behind and a committed transaction
+# never loses one. The background worker
+# (src/observer/ai_service/ai_column/ob_ai_column_worker.cpp) claims tasks with a
+# compare-and-swap on (request_id, state, lease), calls the AI endpoint *outside*
+# of the business transaction and publishes the result with a second CAS guarded
+# by the per-row request_id, which is what stops a late result of a stale request
+# from overwriting a newer one.
+all_ai_column_task_def = dict(
+    owner = 'ai_column_runtime',
+    table_name     = '__all_ai_column_task',
+    table_id       = '1141',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('table_id', 'int'),
+        ('column_id', 'int'),
+        ('rowkey_predicate', 'varchar:4096')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        # logical request identity, shared by all AI columns of one row change
+        ('request_id', 'varchar:128', 'false', ''),
+        # 1 PENDING, 2 RUNNING, 3 RETRY_WAIT, 4 READY, 5 FAILED
+        ('state', 'int', 'false', 1),
+        ('retry_count', 'int', 'false', 0),
+        ('max_retries', 'int', 'false', 0),
+        # __all_ai_column.definition_version this task was queued with: a result
+        # computed for an older definition is dropped, never published
+        ('definition_version', 'int', 'false', 1),
+        ('eligible_ts', 'timestamp:6'),
+        # A pending or terminal task has no active lease.
+        ('lease_owner', 'varchar:128', 'true'),
+        ('lease_expire_ts', 'timestamp:6', 'true'),
+        # 1 AI_COMPLETE, 2 AI_EMBED
+        ('call_type', 'int', 'false', 1),
+        ('model_name', 'varchar:128', 'false', ''),
+        # prompt text materialized at enqueue time, inside the enqueuing transaction
+        ('prompt', 'longtext'),
+        # how model output must be converted before publish (json / integer / vector dim)
+        ('result_spec', 'longtext'),
+        # model output staged until the whole row can be published atomically
+        ('result_data', 'longtext', 'true'),
+        ('error_msg', 'varchar:512', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
+
+# AI COLUMN catalog: one row per AI column of a user table, written by the DDL
+# layer (src/share/schema/ob_ai_column_sql_service.{h,cpp}) inside the same schema
+# transaction that writes __all_table / __all_column, and read by the AI column
+# runtime (src/observer/ai_service/ai_column/ob_ai_column_task.h) to rebuild the
+# definition of a column (prompt SQL text, model, retry policy, hidden columns).
+# The authoritative definition text is also kept in the AI result column comment
+# (prefix "__ai_column__"), so the catalog row is a faithful index of it.
+all_ai_column_def = dict(
+    owner = 'ai_column_ddl',
+    table_name     = '__all_ai_column',
+    table_id       = '1142',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('table_id', 'int'),
+        ('column_id', 'int')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false', ''),
+        # 1 AI_COMPLETE, 2 AI_EMBED
+        ('call_type', 'int', 'false', 1),
+        ('ai_function_name', 'varchar:64', 'false', ''),
+        ('model_name', 'varchar:128', 'false', ''),
+        # prompt as evaluable SQL text over the user table, e.g. concat('Classify: ', content)
+        ('prompt_expr', 'longtext'),
+        # prompt plus the result type instruction, e.g. '... Return exactly one valid JSON value'
+        ('normalized_expr', 'longtext'),
+        # how model output is converted before publish: json / varchar / vector:4
+        ('result_spec', 'longtext'),
+        ('sync_mode', 'varchar:16', 'false', 'sync'),
+        ('max_retries', 'int', 'false', 0),
+        # -1 for AI_COMPLETE, vector dimension for AI_EMBED
+        ('dimension', 'int', 'false', -1),
+        # hidden columns owned by the runtime: state watermark, request id, result spec
+        ('state_column_id', 'int', 'false', 0),
+        ('request_column_id', 'int', 'false', 0),
+        ('result_spec_column_id', 'int', 'false', 0),
+        # bumped by ALTER TABLE ... MODIFY COLUMN on an AI column
+        ('definition_version', 'int', 'false', 1),
+        # referenced ordinary columns of the prompt, 'name:column_id' pairs joined by ','
+        ('deps', 'varchar:4096'),
+        ('comment', 'longtext')
+    ]
+)
+def_table_schema(**all_ai_column_def)
 
 
 # Reserved position (placeholder before this line)
@@ -13819,7 +13924,8 @@ def_table_schema(
       REQUEST_MODEL_NAME,
       PARAMETERS,
       REQUEST_TRANSFORM_FN,
-      RESPONSE_TRANSFORM_FN
+      RESPONSE_TRANSFORM_FN,
+      MAX_CONCURRENCY
     FROM oceanbase.__all_ai_model_endpoint WHERE ENDPOINT_ID != -1;
   """.replace("\n", " ")
 )

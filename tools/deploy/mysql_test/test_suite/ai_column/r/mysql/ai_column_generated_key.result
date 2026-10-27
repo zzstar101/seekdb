@@ -1,0 +1,114 @@
+drop database if exists ai_column_generated_key;
+create database ai_column_generated_key;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('generated_key_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('generated_key_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('generated_key_model',
+'{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('generated_key_ep',
+'{"ai_model_name":"generated_key_model","url":"http://127.0.0.1:19134/v1/chat/completions","access_key":"test","provider":"openai","request_model_name":"mock-complete"}');
+create table ai_column_generated_key.docs(
+id bigint auto_increment primary key,
+content varchar(100),
+result varchar(400) AI COLUMN (AI_COMPLETE('generated_key_model', content))
+WITH (sync_mode='async', max_retries=0)
+);
+start transaction;
+insert into ai_column_generated_key.docs(content) values ('generated-single');
+select count(*) = 1 as generated_key_single_task_key
+from oceanbase.__all_ai_column_task task
+join ai_column_generated_key.docs row_view
+on task.rowkey_predicate = concat('`id` = ', row_view.id)
+where row_view.content = 'generated-single'
+  and task.table_id = (select t.table_id from oceanbase.__all_table t
+join oceanbase.__all_database d
+on d.database_id = t.database_id
+where d.database_name = 'ai_column_generated_key'
+                         and t.table_name = 'docs');
+generated_key_single_task_key
+1
+commit;
+select 1 = 1 as generated_key_single_published;
+generated_key_single_published
+1
+start transaction;
+insert into ai_column_generated_key.docs(content)
+values ('generated-batch-a'), ('generated-batch-b'), ('generated-batch-c');
+select count(*) = 3 as generated_key_batch_task_keys
+from oceanbase.__all_ai_column_task task
+join ai_column_generated_key.docs row_view
+on task.rowkey_predicate = concat('`id` = ', row_view.id)
+where row_view.content like 'generated-batch-%'
+  and task.table_id = (select t.table_id from oceanbase.__all_table t
+join oceanbase.__all_database d
+on d.database_id = t.database_id
+where d.database_name = 'ai_column_generated_key'
+                         and t.table_name = 'docs');
+generated_key_batch_task_keys
+1
+commit;
+select 1 = 1 as generated_key_batch_published;
+generated_key_batch_published
+1
+start transaction;
+insert into ai_column_generated_key.docs(content) values ('generated-rollback-value');
+select count(*) = 1 as generated_key_rollback_task_visible
+from oceanbase.__all_ai_column_task task
+join ai_column_generated_key.docs row_view
+on task.rowkey_predicate = concat('`id` = ', row_view.id)
+where row_view.content = 'generated-rollback-value'
+  and task.table_id = (select t.table_id from oceanbase.__all_table t
+join oceanbase.__all_database d
+on d.database_id = t.database_id
+where d.database_name = 'ai_column_generated_key'
+                         and t.table_name = 'docs');
+generated_key_rollback_task_visible
+1
+rollback;
+select count(*) = 0 as generated_key_rollback_row_gone
+from ai_column_generated_key.docs where content = 'generated-rollback-value';
+generated_key_rollback_row_gone
+1
+select count(*) = 0 as generated_key_rollback_no_orphan_task
+from oceanbase.__all_ai_column_task task
+left join ai_column_generated_key.docs row_view
+on task.rowkey_predicate = concat('`id` = ', row_view.id)
+where task.table_id = (select t.table_id from oceanbase.__all_table t
+join oceanbase.__all_database d
+on d.database_id = t.database_id
+where d.database_name = 'ai_column_generated_key'
+                         and t.table_name = 'docs')
+and row_view.id is null;
+generated_key_rollback_no_orphan_task
+1
+mock_no_rollback_value=ok
+start transaction;
+insert into ai_column_generated_key.docs(id, content) values (900001, 'generated-explicit');
+select count(*) = 1 as generated_key_explicit_task_key
+from oceanbase.__all_ai_column_task task
+join ai_column_generated_key.docs row_view
+on task.rowkey_predicate = concat('`id` = ', row_view.id)
+where row_view.id = 900001
+and task.table_id = (select t.table_id from oceanbase.__all_table t
+join oceanbase.__all_database d
+on d.database_id = t.database_id
+where d.database_name = 'ai_column_generated_key'
+                         and t.table_name = 'docs');
+generated_key_explicit_task_key
+1
+commit;
+select 1 = 1 as generated_key_explicit_published;
+generated_key_explicit_published
+1
+select 1 = 1 as generated_key_all_rows_ready;
+generated_key_all_rows_ready
+1
+set session ai_column_strict_read = on;
+select count(*) as generated_key_rows,
+count(result) as generated_key_ready_rows
+from ai_column_generated_key.docs;
+generated_key_rows	generated_key_ready_rows
+5	5
+set session ai_column_strict_read = off;
+drop database ai_column_generated_key;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('generated_key_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('generated_key_model');

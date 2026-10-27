@@ -1,0 +1,8 @@
+# Local file SQL must be explicitly enabled per session (or by a global default).
+SELECT @@session.enable_file_sql AS default_enabled;
+SET SESSION enable_file_sql = ON;
+SELECT @@session.enable_file_sql AS enabled;
+SET SESSION enable_file_sql = OFF;
+SELECT @@session.enable_file_sql AS disabled;
+--error 1231
+SET SESSION enable_file_sql = 2;

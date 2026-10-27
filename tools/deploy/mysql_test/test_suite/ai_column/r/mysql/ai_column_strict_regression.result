@@ -1,0 +1,81 @@
+drop database if exists ai_column_strict_regression;
+create database ai_column_strict_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('strict_regression_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('strict_regression_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('strict_regression_model',
+'{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('strict_regression_ep',
+'{"ai_model_name":"strict_regression_model","url":"http://127.0.0.1:19129/v1/chat/completions","access_key":"test","provider":"openai","request_model_name":"mock-complete"}');
+create table ai_column_strict_regression.docs(
+id bigint primary key, content varchar(100), title varchar(100),
+result varchar(400) AI COLUMN (AI_COMPLETE('strict_regression_model', content))
+WITH (sync_mode='async', max_retries=0),
+label varchar(400) AI COLUMN (AI_COMPLETE('strict_regression_model', title))
+WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_strict_regression.docs(id, content, title)
+values (1, 'first', 'label-one'), (2, 'second', 'label-two');
+select 1 = 1 as all_ready;
+all_ready
+1
+set session ai_column_strict_read = on;
+prepare strict_cached from 'select result is not null as ready from ai_column_strict_regression.docs where id = ?';
+set @strict_id = 2;
+execute strict_cached using @strict_id;
+ready
+1
+execute strict_cached using @strict_id;
+ready
+1
+update ai_column_strict_regression.docs set content = 'new-first' where id = 1;
+select count(*) = 2 as ordinary_columns_allowed from ai_column_strict_regression.docs;
+ordinary_columns_allowed
+1
+select count(*) = 2 as independent_ready_column_allowed
+from ai_column_strict_regression.docs where label is not null;
+independent_ready_column_allowed
+1
+execute strict_cached using @strict_id;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select result from ai_column_strict_regression.docs where 1 = 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select result from ai_column_strict_regression.docs limit 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select id from ai_column_strict_regression.docs where 1 = 0 and result is null;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select d.id from ai_column_strict_regression.docs d
+join ai_column_strict_regression.docs e on d.result = e.label where d.id = 999;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select x.value from (select result as value from ai_column_strict_regression.docs) x where 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select id from ai_column_strict_regression.docs d
+where exists (select 1 from ai_column_strict_regression.docs e where e.label = d.result);
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select id from ai_column_strict_regression.docs where id in
+(select id from ai_column_strict_regression.docs where result is null);
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+select result from ai_column_strict_regression.docs where 0
+union all select label from ai_column_strict_regression.docs where 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+update ai_column_strict_regression.docs set title = result where 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+update ai_column_strict_regression.docs set title = title where result is null and 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+delete from ai_column_strict_regression.docs where result is null and 0;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+update ai_column_strict_regression.docs set title = title where id = 999;
+delete from ai_column_strict_regression.docs where id = 999;
+set @ai_column_internal_write = 1;
+execute strict_cached using @strict_id;
+ERROR HY000: AI column has unfinished tasks for table_id=<table_id>, column_id=<column_id>
+set session ai_column_strict_read = off;
+execute strict_cached using @strict_id;
+ready
+1
+select count(*) = 2 as rejected_dml_left_rows_intact from ai_column_strict_regression.docs;
+rejected_dml_left_rows_intact
+1
+deallocate prepare strict_cached;
+drop database ai_column_strict_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('strict_regression_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('strict_regression_model');

@@ -1,0 +1,10 @@
+SET SESSION enable_file_sql = ON;
+SELECT whole, fractional FROM read_csv('/tmp/seekdb-file-datetime.csv', nullstr = 'THIS_IS_A_LONG_NULL_SENTINEL') ORDER BY whole;
+whole	fractional
+NULL	NULL
+2026-08-01 10:11:12	2026-08-01 10:11:12.1234
+SELECT whole, fractional FROM read_json('/tmp/seekdb-file-datetime.jsonl') ORDER BY whole;
+whole	fractional
+NULL	NULL
+2026-08-01 10:11:12	2026-08-01 10:11:12.123456
+SET SESSION enable_file_sql = OFF;

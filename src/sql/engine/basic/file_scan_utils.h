@@ -15,6 +15,10 @@ enum class Type { Null, BigInt, Double, Boolean, Varchar, Date, DateTime };
 Type infer_type(std::string_view text);
 Type widen(Type left, Type right);
 const char *type_name(Type type);
+// Shared text helpers so every format reader validates and compares names the
+// same way: UTF-8 (NUL-free) payloads and ASCII case-insensitive identifiers.
+bool is_valid_utf8(std::string_view text);
+bool equal_ascii_ci(std::string_view left, std::string_view right);
 
 // Serializable file identity passed from schema resolution to execution.
 // Nanosecond modification and change times also catch same-size rewrites.
@@ -31,6 +35,40 @@ struct FileIdentity {
         && modified_seconds == other.modified_seconds && modified_nanoseconds == other.modified_nanoseconds
         && changed_seconds == other.changed_seconds && changed_nanoseconds == other.changed_nanoseconds;
   }
+};
+
+// Descriptor-relative, no-symlink access to one regular file beneath a
+// secure_file_priv root. Writers of format readers share this instead of
+// re-deriving the containment policy, so every format fails closed identically.
+// The snapshot taken at open() is what a planner serializes and an executor
+// revalidates, which rejects a file replaced between resolution and execution.
+class SecureFile {
+public:
+  SecureFile() = default;
+  ~SecureFile();
+  SecureFile(const SecureFile &) = delete;
+  SecureFile &operator=(const SecureFile &) = delete;
+  Status open(const char *path, const char *secure_root);
+  // Detects replacement, truncation and same-size rewrites of the opened file.
+  Status check_unchanged();
+  FileIdentity identity() const;
+  // Positional read used by formats with a footer or random-access pages.
+  // Returns Ok when all requested bytes were read, End when the file ends
+  // early, and reports how many bytes were actually available in read.
+  Status read_at(void *buffer, size_t length, int64_t offset, size_t &read);
+  int fd() const { return fd_; }
+  int64_t size() const { return snapshot_.st_size; }
+  const char *path() const { return path_; }
+  const char *error() const { return error_; }
+  void close();
+private:
+  Status fail(Status status, const char *message);
+  int fd_ = -1;
+  int root_fd_ = -1;
+  struct stat snapshot_ = {};
+  char path_[4096] = {};
+  char relative_path_[4096] = {};
+  char error_[512] = {};
 };
 
 struct CsvOptions {

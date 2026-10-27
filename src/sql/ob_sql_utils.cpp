@@ -29,6 +29,7 @@
 #include "share/ob_timezone_mgr.h"
 #include "sql/printer/ob_schema_printer.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "sql/engine/dml/ob_table_modify_op.h"
 #include <openssl/md5.h>
 #include "share/geo/ob_srs_provider.h"
 #include "sql/resolver/ddl/ob_create_view_resolver.h"
@@ -3373,7 +3374,17 @@ bool ObSQLUtils::is_iter_uncommitted_row(ObExecContext *cur_ctx)
 
 bool ObSQLUtils::is_nested_sql(ObExecContext *cur_ctx)
 {
-  return is_pl_nested_sql(cur_ctx) || is_fk_nested_sql(cur_ctx) || is_online_stat_gathering_nested_sql(cur_ctx);
+  // AI invalidation and task creation execute inside the business statement.
+  // They must not close its statement/transaction state independently. A root
+  // worker statement remains a root even while the recursion guard is active.
+  // A RETRY command has a parent context but no active parent DML statement:
+  // its maintenance statements must each open/close their own statement state.
+  const ObExecContext *parent = cur_ctx == nullptr ? nullptr : cur_ctx->get_parent_ctx();
+  const bool is_ai_nested = parent != nullptr && parent->get_sql_ctx() != nullptr
+      && ObStmt::is_dml_stmt(parent->get_sql_ctx()->stmt_type_)
+      && AiColumnHookGuard::is_active();
+  return is_pl_nested_sql(cur_ctx) || is_fk_nested_sql(cur_ctx)
+      || is_online_stat_gathering_nested_sql(cur_ctx) || is_ai_nested;
 }
 
 //bind current execute context to my session,

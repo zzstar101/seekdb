@@ -1,0 +1,103 @@
+# Strict checks retain pre-rewrite references and run on every cached execution.
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19129
+--disable_warnings
+drop database if exists ai_column_strict_regression;
+--enable_warnings
+create database ai_column_strict_regression;
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('strict_regression_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('strict_regression_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('strict_regression_model',
+  '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('strict_regression_ep',
+  '{"ai_model_name":"strict_regression_model","url":"http://127.0.0.1:19129/v1/chat/completions","access_key":"test","provider":"openai","request_model_name":"mock-complete"}');
+create table ai_column_strict_regression.docs(
+  id bigint primary key, content varchar(100), title varchar(100),
+  result varchar(400) AI COLUMN (AI_COMPLETE('strict_regression_model', content))
+    WITH (sync_mode='async', max_retries=0),
+  label varchar(400) AI COLUMN (AI_COMPLETE('strict_regression_model', title))
+    WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_strict_regression.docs(id, content, title)
+values (1, 'first', 'label-one'), (2, 'second', 'label-two');
+let $retry = 150;
+let $ready = 0;
+while ($retry)
+{
+  let $ready = `select count(*) = 2 from ai_column_strict_regression.docs
+    where result is not null and label is not null`;
+  if ($ready == 1) { let $retry = 0; }
+  if ($ready == 0) { --sleep 0.1
+    dec $retry; }
+}
+eval select $ready = 1 as all_ready;
+set session ai_column_strict_read = on;
+prepare strict_cached from 'select result is not null as ready from ai_column_strict_regression.docs where id = ?';
+set @strict_id = 2;
+execute strict_cached using @strict_id;
+execute strict_cached using @strict_id;
+# Same session/statement/settings, but another row in the referenced column changes.
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19129
+update ai_column_strict_regression.docs set content = 'new-first' where id = 1;
+select count(*) = 2 as ordinary_columns_allowed from ai_column_strict_regression.docs;
+select count(*) = 2 as independent_ready_column_allowed
+from ai_column_strict_regression.docs where label is not null;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+execute strict_cached using @strict_id;
+# Optimizer can remove all scans, but not the strict precondition.
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_strict_regression.docs where 1 = 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_strict_regression.docs limit 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select id from ai_column_strict_regression.docs where 1 = 0 and result is null;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select d.id from ai_column_strict_regression.docs d
+join ai_column_strict_regression.docs e on d.result = e.label where d.id = 999;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select x.value from (select result as value from ai_column_strict_regression.docs) x where 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select id from ai_column_strict_regression.docs d
+where exists (select 1 from ai_column_strict_regression.docs e where e.label = d.result);
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select id from ai_column_strict_regression.docs where id in
+  (select id from ai_column_strict_regression.docs where result is null);
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_strict_regression.docs where 0
+union all select label from ai_column_strict_regression.docs where 0;
+# SET RHS is a read; storage/index-maintenance columns are not user reads.
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+update ai_column_strict_regression.docs set title = result where 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+update ai_column_strict_regression.docs set title = title where result is null and 0;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+delete from ai_column_strict_regression.docs where result is null and 0;
+update ai_column_strict_regression.docs set title = title where id = 999;
+delete from ai_column_strict_regression.docs where id = 999;
+# No SQL-settable internal exemption (an unrelated user variable has no effect).
+set @ai_column_internal_write = 1;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+execute strict_cached using @strict_id;
+set session ai_column_strict_read = off;
+execute strict_cached using @strict_id;
+select count(*) = 2 as rejected_dml_left_rows_intact from ai_column_strict_regression.docs;
+deallocate prepare strict_cached;
+drop database ai_column_strict_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('strict_regression_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('strict_regression_model');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19129

@@ -18,6 +18,7 @@
 #define OCEANBASE_SHARE_SCHEMA_OB_TABLE_SQL_SERVICE_H_
 
 #include "ob_ddl_sql_service.h"
+#include "ob_ai_column_definition.h"
 
 namespace oceanbase
 {
@@ -344,6 +345,24 @@ private:
                              const uint64_t table_id,
                              const int64_t column_count,
                              bool check_affect_rows = true);
+  // AI column catalog (__all_ai_column): one row per AI result column, written in
+  // the same DDL transaction as the table / column it describes.
+  int add_ai_column_catalog(common::ObISQLClient &sql_client,
+                            const ObTableSchema &table_schema);
+  int batch_add_ai_column_catalog(common::ObISQLClient &sql_client,
+                                  const common::ObIArray<ObTableSchema> &tables);
+  // `user_comment` is the comment the user wrote on the column (the payload of the
+  // result column comment carries it separately, so the catalog row shows what the
+  // user actually asked for).
+  int add_ai_column_catalog_row(common::ObISQLClient &sql_client,
+                                const ObTableSchema &table_schema,
+                                const ObColumnSchemaV2 &column,
+                                const AIColumnDefinition &def,
+                                const common::ObString &user_comment);
+  // column_id == OB_INVALID_ID removes every catalog row of the table.
+  int delete_ai_column_catalog(common::ObISQLClient &sql_client,
+                               const uint64_t table_id,
+                               const uint64_t column_id = common::OB_INVALID_ID);
   int delete_from_all_table_history(common::ObISQLClient &sql_client,
                                     const ObTableSchema &table_schema,
                                     const int64_t new_schema_version);

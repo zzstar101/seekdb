@@ -26,6 +26,7 @@
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/engine/table/ob_table_scan_op.h"
+#include "sql/engine/dml/ob_table_modify_op.h"
 #include "share/ob_ddl_checksum.h"
 
 using namespace oceanbase::sql;
@@ -41,6 +42,45 @@ namespace sql
 {
 namespace
 {
+int check_ai_column_strict_read(ObSQLSessionInfo &session, const ObPhysicalPlan &plan)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  const ObIArray<AiColumnReadReference> &refs = plan.get_ai_column_read_references();
+  IAiColumnDmlHook *hook = share::server_service<IAiColumnDmlHook>();
+  // These are kernel-owned execution properties, not SQL-settable variables.
+  // The hook guard covers nested invalidation/publication on the user session.
+  if (refs.empty()
+      || (session.is_inner() && session.is_real_inner_session())
+      || AiColumnHookGuard::is_active()) {
+  } else if (OB_FAIL(session.get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+    LOG_WARN("get AI column strict read setting failed", K(ret));
+  } else if (strict_read && OB_ISNULL(hook)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("AI column strict read service is unavailable", K(ret));
+  } else if (strict_read) {
+    ObSEArray<uint64_t, 8> checked_tables;
+    ObSEArray<uint64_t, 8> columns;
+    for (int64_t i = 0; OB_SUCC(ret) && i < refs.count(); ++i) {
+      const uint64_t table_id = refs.at(i).table_id_;
+      if (!is_contain(checked_tables, table_id)) {
+        columns.reuse();
+        for (int64_t j = i; OB_SUCC(ret) && j < refs.count(); ++j) {
+          if (refs.at(j).table_id_ == table_id) {
+            ret = columns.push_back(refs.at(j).column_id_);
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(checked_tables.push_back(table_id))) {
+        } else if (OB_FAIL(hook->check_strict_read(table_id, columns))) {
+          LOG_WARN("AI column strict read precondition failed", K(ret), K(table_id), K(columns));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int find_table_scan_table_id(const ObOpSpec *spec, uint64_t &table_id)
 {
   int ret = OB_SUCCESS;
@@ -150,6 +190,8 @@ OB_INLINE int ObResultSet::open_plan()
         if (OB_UNLIKELY(my_session_.is_zombie())) {
           //session has been killed some moment ago
           ret = OB_ERR_SESSION_INTERRUPTED;
+        } else if (OB_FAIL(check_ai_column_strict_read(my_session_, *physical_plan_))) {
+          // Run for every execution, including cached and scan-free plans.
         } else {
           if (OB_SUCC(ret)) {
             do {

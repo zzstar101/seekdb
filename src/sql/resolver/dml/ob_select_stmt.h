@@ -128,8 +128,16 @@ struct ObSelectIntoItem
         max_file_size_(DEFAULT_MAX_FILE_SIZE),
         escaped_cht_(),
         buffer_size_(DEFAULT_BUFFER_SIZE),
-        external_properties_()
+        external_properties_(),
+        copy_header_(DEFAULT_COPY_HEADER),
+        copy_delimiter_(DEFAULT_COPY_DELIMITER),
+        copy_quote_(DEFAULT_COPY_QUOTE),
+        copy_escape_(DEFAULT_COPY_ESCAPE),
+        copy_nullstr_(),
+        copy_force_quote_(DEFAULT_COPY_FORCE_QUOTE)
   {
+    copy_nullstr_.assign_ptr(DEFAULT_COPY_NULL_STR,
+                             static_cast<int32_t>(strlen(DEFAULT_COPY_NULL_STR)));
     field_str_.set_varchar(DEFAULT_FIELD_TERM_STR);
     field_str_.set_collation_type(ObCharset::get_system_collation());
     line_str_.set_varchar(DEFAULT_LINE_TERM_STR);
@@ -155,6 +163,12 @@ struct ObSelectIntoItem
     cs_type_ = other.cs_type_;
     buffer_size_ = other.buffer_size_;
     external_properties_ = other.external_properties_;
+    copy_header_ = other.copy_header_;
+    copy_delimiter_ = other.copy_delimiter_;
+    copy_quote_ = other.copy_quote_;
+    copy_escape_ = other.copy_escape_;
+    copy_nullstr_ = other.copy_nullstr_;
+    copy_force_quote_ = other.copy_force_quote_;
     return user_vars_.assign(other.user_vars_);
   }
   int deep_copy(ObIAllocator &allocator,
@@ -171,7 +185,13 @@ struct ObSelectIntoItem
                K_(escaped_cht),
                K_(cs_type),
                K_(buffer_size),
-               K_(external_properties));
+               K_(external_properties),
+               K_(copy_header),
+               K_(copy_delimiter),
+               K_(copy_quote),
+               K_(copy_escape),
+               K_(copy_nullstr),
+               K_(copy_force_quote));
   ObItemType into_type_;
   common::ObObj outfile_name_;
   common::ObObj field_str_; // field terminated str
@@ -186,6 +206,15 @@ struct ObSelectIntoItem
   common::ObCollationType cs_type_;
   int64_t buffer_size_;
   common::ObString external_properties_;
+  // COPY ... TO ... export options, only meaningful when into_type_ == T_INTO_COPY.
+  // The writer (sql::file_sql::CsvWriter) owns the CSV grammar; these fields only carry
+  // the resolved option values from the COPY clause down to the physical operator.
+  bool copy_header_;        // write a header row built from the select item aliases
+  char copy_delimiter_;     // single byte field delimiter
+  char copy_quote_;         // single byte quoting character
+  char copy_escape_;        // single byte escape character
+  common::ObString copy_nullstr_;  // raw text used for SQL NULL
+  bool copy_force_quote_;   // quote every non-NULL field
 
   static const char* const DEFAULT_FIELD_TERM_STR;
   static const char* const DEFAULT_LINE_TERM_STR;
@@ -195,6 +224,12 @@ struct ObSelectIntoItem
   static const int64_t DEFAULT_MAX_FILE_SIZE;
   static const int64_t DEFAULT_BUFFER_SIZE;
   static const char DEFAULT_FIELD_ESCAPED_CHAR;
+  static const char* const DEFAULT_COPY_NULL_STR;
+  static const bool DEFAULT_COPY_HEADER;
+  static const char DEFAULT_COPY_DELIMITER;
+  static const char DEFAULT_COPY_QUOTE;
+  static const char DEFAULT_COPY_ESCAPE;
+  static const bool DEFAULT_COPY_FORCE_QUOTE;
 };
 
 struct ObGroupbyExpr

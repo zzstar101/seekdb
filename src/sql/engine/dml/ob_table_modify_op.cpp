@@ -18,9 +18,11 @@
 
 #include "ob_table_modify_op.h"
 #include "share/ob_autoincrement_service.h"
+#include "share/rc/ob_server_runtime.h"
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "sql/ob_sql_utils.h"
 
 namespace oceanbase
 {
@@ -623,6 +625,14 @@ ObTableModifyOp::ObTableModifyOp(ObExecContext &ctx,
     execute_single_row_(false),
     dml_modify_rows_(ctx.get_allocator()),
     last_store_row_(),
+    ai_column_allocator_(),
+    ai_column_pk_columns_(),
+    ai_column_changes_(),
+    ai_column_updated_column_ids_(),
+    ai_column_table_id_(OB_INVALID_ID),
+    ai_column_changes_table_id_(OB_INVALID_ID),
+    ai_column_checked_(false),
+    ai_column_enabled_(false),
     saved_session_(NULL)
 {
   obj_print_params_ = CREATE_OBJ_PRINT_PARAM(ctx_.get_my_session());
@@ -1056,6 +1066,10 @@ int ObTableModifyOp::submit_all_dml_task()
                 OB_FAIL(dml_rtctx_.das_ref_.pick_del_task_to_first())) {
     } else if (OB_FAIL(dml_rtctx_.das_ref_.execute_all_task())) {
     } else if (OB_FAIL(dml_rtctx_.das_ref_.close_all_task())) {
+    } else if (OB_FAIL(ai_column_run_hook())) {
+      // the task rows of the AI columns must be written by the same transaction as
+      // the rows themselves, so the hook runs right after the rows are flushed and
+      // a failure rolls the statement back
     } else if (OB_FAIL(ObDMLService::handle_after_row_processing(this, &get_dml_modify_row_list()))) {
     } else {
       dml_modify_rows_.clear();
@@ -1156,5 +1170,272 @@ int ObTableModifyOp::perform_batch_fk_check()
   }
   return ret;
 }
+
+//-------------------------------------------------------------------------------------
+// AI column runtime hooks, see the declarations in ob_table_modify_op.h.
+//
+// The value of an AI column is produced by a model call, so it can not be
+// computed while the statement that changes the row is still running: the model
+// must never be called from a transaction that may still roll back. The engine
+// therefore only does what has to happen inside the transaction itself:
+//
+//   * null the results of the AI columns of every touched row, so that the
+//     statement (and its transaction) never exposes a result of a stale row,
+//   * reset the hidden state / request columns of the row, and
+//   * queue one task per AI column of the row, keyed by the printed primary key.
+//
+// The background worker of the runtime picks the tasks up after the commit, calls
+// the model and publishes the results with a request id cas.
+//
+// The runtime is implemented in the observer while this code belongs to the
+// engine, so it is reached through a server service slot. A table without AI
+// columns, or a server without the runtime, keeps the plain behaviour.
+//-------------------------------------------------------------------------------------
+namespace
+{
+// Depth of the hook on this thread. The runtime writes to the user table itself
+// (it resets the results of a row and it publishes a result) and those inner
+// statements must not queue tasks of their own.
+thread_local int64_t ai_column_hook_depth = 0;
+}  // namespace
+
+AiColumnHookGuard::AiColumnHookGuard()
+{
+  ++ai_column_hook_depth;
+}
+
+AiColumnHookGuard::~AiColumnHookGuard()
+{
+  --ai_column_hook_depth;
+}
+
+bool AiColumnHookGuard::is_active()
+{
+  return ai_column_hook_depth > 0;
+}
+
+int ObTableModifyOp::ai_column_prepare_table(const ObDMLBaseCtDef &dml_ctdef, bool &enabled)
+{
+  int ret = OB_SUCCESS;
+  enabled = false;
+  // table_id_ is the SQL location/alias ID (often UINT64_MAX-1), not a
+  // schema object ID. The primary-index ctdef identifies the physical table.
+  const uint64_t table_id = dml_ctdef.das_base_ctdef_.index_tid_;
+  if (AiColumnHookGuard::is_active()) {
+    // the runtime itself is writing, it knows what it is doing
+  } else if (!dml_ctdef.is_primary_index_) {
+    // the rows are queued once, by the main table ctdef; the index ctdefs of the
+    // same statement carry the same rows
+  } else if (dml_ctdef.is_table_without_pk_) {
+    // a task is addressed by the primary key of its row, a table without primary
+    // key is not supported by the AI column feature
+  } else if (ai_column_checked_ && ai_column_table_id_ == table_id) {
+    enabled = ai_column_enabled_;
+  } else {
+    IAiColumnDmlHook *hook = share::server_service<IAiColumnDmlHook>();
+    if (OB_ISNULL(hook)) {
+      // the runtime is not installed, AI columns can not be maintained at all
+      ai_column_checked_ = true;
+      ai_column_table_id_ = table_id;
+      ai_column_enabled_ = false;
+    } else {
+      bool has_ai_column = false;
+      ai_column_pk_columns_.reuse();
+      if (OB_FAIL(hook->get_table_ai_columns(ai_column_allocator_, table_id, has_ai_column,
+                                             ai_column_pk_columns_))) {
+        LOG_WARN("failed to get the ai columns of the table", K(ret), K(table_id));
+      } else {
+        ai_column_checked_ = true;
+        ai_column_table_id_ = table_id;
+        ai_column_enabled_ = has_ai_column && !ai_column_pk_columns_.empty();
+        enabled = ai_column_enabled_;
+        LOG_TRACE("ai column table checked", K(table_id), K(has_ai_column), K_(ai_column_enabled));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableModifyOp::ai_column_build_rowkey(const ObDMLBaseCtDef &dml_ctdef,
+                                            const ExprFixedArray &row_exprs,
+                                            ObString &rowkey_predicate)
+{
+  int ret = OB_SUCCESS;
+  char *buf = NULL;
+  int64_t len = 0;
+  int64_t pos = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_pk_columns_.count(); ++i) {
+    const AiColumnKeyColumn &key = ai_column_pk_columns_.at(i);
+    ObString escaped_key_name;
+    const ObExpr *expr = NULL;
+    ObDatum *datum = NULL;
+    int64_t idx = -1;
+    for (int64_t j = 0; OB_SUCC(ret) && -1 == idx && j < dml_ctdef.column_ids_.count(); ++j) {
+      if (dml_ctdef.column_ids_.at(j) == key.column_id_) {
+        idx = j;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(-1 == idx)) {
+      // The statement does not carry the value of this primary key column, for
+      // example an insert that omits an auto increment primary key.  Such a row
+      // can not be addressed by the runtime, so the caller skips it instead of
+      // failing the user statement.
+      LOG_DEBUG("the rowkey column is not in the row of the statement", K(key));
+      ret = OB_ENTRY_NOT_EXIST;
+    } else if (OB_ISNULL(expr = row_exprs.at(idx))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the rowkey expression is null", K(ret), K(key));
+    } else if (i > 0 && OB_FAIL(databuff_printf(buf, len, pos, ai_column_allocator_, " and "))) {
+      LOG_WARN("failed to append the rowkey predicate delimiter", K(ret));
+    } else if (OB_FAIL(ObSQLUtils::generate_new_name_with_escape_character(
+                           ai_column_allocator_, key.column_name_, escaped_key_name))) {
+      LOG_WARN("failed to escape the rowkey column name", K(ret), K(key));
+    } else if (OB_FAIL(databuff_printf(buf, len, pos, ai_column_allocator_, "`%.*s` = ",
+                                       escaped_key_name.length(), escaped_key_name.ptr()))) {
+      LOG_WARN("failed to append the rowkey column name", K(ret), K(key));
+    } else if (OB_FAIL(expr->eval(eval_ctx_, datum))) {
+      LOG_WARN("failed to evaluate the rowkey expression", K(ret), K(key));
+    } else if (OB_ISNULL(datum)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("the evaluated rowkey datum is null", K(ret), K(key));
+    } else {
+      ObObj obj;
+      ObObjPrintParams key_print_params = obj_print_params_;
+      // Queue identities use a case-insensitive catalog collation. Encode character
+      // bytes canonically so binary-collated keys such as 'a' and 'A' stay distinct;
+      // the safe representation preserves the source charset/collation for lookup.
+      key_print_params.character_hex_safe_represent_ = true;
+      if (OB_FAIL(datum->to_obj(obj, expr->obj_meta_))) {
+        LOG_WARN("failed to convert the rowkey datum to object", K(ret), K(key));
+      } else if (OB_FAIL(obj.print_sql_literal(buf, len, pos, ai_column_allocator_,
+                                               key_print_params))) {
+        LOG_WARN("failed to print the rowkey literal", K(ret), K(key));
+      }
+    }
+  }
+  if (OB_ENTRY_NOT_EXIST == ret) {
+    // The row is not addressable by a primary key predicate, the caller skips it.
+    ret = OB_SUCCESS;
+    rowkey_predicate.reset();
+  } else if (OB_SUCC(ret) && pos > 0) {
+    // the predicate is kept until the hook of the statement has been executed
+    rowkey_predicate.assign_ptr(buf, static_cast<int32_t>(pos));
+  }
+  return ret;
+}
+
+int ObTableModifyOp::ai_column_collect_row(const ObDMLBaseCtDef &dml_ctdef,
+                                           const AiColumnRowEvent event,
+                                           const ExprFixedArray *old_row,
+                                           const ExprFixedArray *new_row)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  if (OB_FAIL(ai_column_prepare_table(dml_ctdef, enabled))) {
+  } else if (!enabled) {
+    // a table without ai column, nothing to queue
+  } else {
+    AiColumnRowChange row_change;
+    row_change.event_ = event;
+    if (AI_COLUMN_ROW_UPDATED == event && ai_column_updated_column_ids_.empty()) {
+      // the SET clause of the update decides which ai columns have to be
+      // recomputed, an ai column that does not depend on the changed columns
+      // keeps its result
+      const ObUpdCtDef &upd_ctdef = static_cast<const ObUpdCtDef &>(dml_ctdef);
+      if (OB_FAIL(ai_column_updated_column_ids_.assign(upd_ctdef.dupd_ctdef_.updated_column_ids_))) {
+        LOG_WARN("failed to record the updated columns of the statement", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (NULL != old_row
+        && OB_FAIL(ai_column_build_rowkey(dml_ctdef, *old_row, row_change.old_rowkey_))) {
+      LOG_WARN("failed to build the old rowkey predicate", K(ret), K(event));
+    } else if (NULL != new_row
+               && OB_FAIL(ai_column_build_rowkey(dml_ctdef, *new_row, row_change.new_rowkey_))) {
+      LOG_WARN("failed to build the new rowkey predicate", K(ret), K(event));
+    } else if ((NULL != old_row && row_change.old_rowkey_.empty())
+               || (NULL != new_row && row_change.new_rowkey_.empty())) {
+      // The primary key value of the row is not part of the statement, so the
+      // runtime can not address its task row.  Skipping keeps the user DML
+      // working; such a row simply gets no asynchronous AI column result.
+      LOG_DEBUG("skip the ai column task of a row without a primary key value",
+                K(event), K(ai_column_table_id_));
+    } else if (OB_INVALID_ID != ai_column_changes_table_id_
+               && ai_column_changes_table_id_ != ai_column_table_id_) {
+      // The row keys of the collected changes are printed against the columns of the
+      // first table, so they can not be used for the rows of another table.
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("a statement that modifies the rows of two ai column tables is not supported",
+               K(ret), K_(ai_column_changes_table_id), K_(ai_column_table_id));
+    } else if (OB_FAIL(ai_column_changes_.push_back(row_change))) {
+      LOG_WARN("failed to store the ai column row change", K(ret));
+    } else {
+      ai_column_changes_table_id_ = ai_column_table_id_;
+    }
+  }
+  return ret;
+}
+
+int ObTableModifyOp::ai_column_run_hook()
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObString, 8> stmts;
+  if (ai_column_changes_.empty() || !ai_column_enabled_) {
+    // the statement did not touch a row of an ai column table
+  } else if (AiColumnHookGuard::is_active()) {
+    // the runtime itself is writing, queueing a task here would loop forever
+  } else {
+    IAiColumnDmlHook *hook = share::server_service<IAiColumnDmlHook>();
+    if (OB_ISNULL(hook)) {
+      LOG_WARN("the ai column runtime is not installed", K_(ai_column_table_id));
+    } else if (OB_FAIL(hook->build_row_change_sql(ai_column_allocator_, ai_column_table_id_,
+                                                  ai_column_changes_,
+                                                  ai_column_updated_column_ids_, stmts))) {
+      LOG_WARN("failed to build the ai column task sql", K(ret), K_(ai_column_table_id));
+    } else if (stmts.empty()) {
+      // nothing to do, for instance only AI columns that do not depend on the
+      // changed columns
+    } else if (OB_ISNULL(inner_conn_) && OB_FAIL(open_inner_conn())) {
+      LOG_WARN("failed to open the inner connection for the ai column tasks", K(ret));
+    } else if (OB_FAIL(begin_nested_session(false))) {
+      LOG_WARN("failed to begin the nested session for the ai column tasks", K(ret));
+    } else {
+      // the rows of the statement have been written to the transaction but are not
+      // committed yet, the task statements have to see them
+      const bool saved_iter_uncommitted = ctx_.get_das_ctx().iter_uncommitted_row_;
+      int64_t affected_rows = 0;
+      AiColumnHookGuard guard;
+      ctx_.get_das_ctx().iter_uncommitted_row_ = true;
+      for (int64_t i = 0; OB_SUCC(ret) && i < stmts.count(); ++i) {
+        affected_rows = 0;
+        if (OB_FAIL(inner_conn_->execute_write(stmts.at(i), affected_rows))) {
+          LOG_WARN("failed to execute the ai column task sql", K(ret), K(stmts.at(i)));
+        } else {
+          LOG_TRACE("ai column task sql executed", K(stmts.at(i)), K(affected_rows));
+        }
+      }
+      ctx_.get_das_ctx().iter_uncommitted_row_ = saved_iter_uncommitted;
+      int end_ret = end_nested_session();
+      if (OB_SUCCESS != end_ret) {
+        LOG_WARN("failed to end the nested session of the ai column tasks", K(end_ret));
+        if (OB_SUCCESS == ret) {
+          ret = end_ret;
+        }
+      }
+    }
+  }
+  // the collected rows and the printed predicates belong to this statement only
+  ai_column_changes_.reuse();
+  ai_column_updated_column_ids_.reuse();
+  ai_column_pk_columns_.reuse();
+  ai_column_allocator_.reuse();
+  ai_column_checked_ = false;
+  ai_column_table_id_ = OB_INVALID_ID;
+  ai_column_changes_table_id_ = OB_INVALID_ID;
+  ai_column_enabled_ = false;
+  return ret;
+}
+
 }  // namespace sql
 }  // namespace oceanbase

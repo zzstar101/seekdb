@@ -271,18 +271,23 @@ int ObSql::fill_result_set(ObResultSet &result_set,
     }
     case stmt::T_EXPLAIN: {
       ObString tname = ObString::make_string("explain_table");
-      ObString cname = ObString::make_string("Query Plan");
+      const bool file_describe = static_cast<const ObExplainStmt *>(stmt)->is_file_describe();
+      const int64_t field_count = file_describe ? ObExplainStmt::DESCRIBE_FIELD_COUNT : 1;
       field.tname_ = tname;
       field.org_tname_ = tname;
-      field.cname_ = cname;
-      field.org_cname_ = cname;
       field.type_.set_type(ObVarcharType);
       field.charsetnr_ = CS_TYPE_UTF8MB4_GENERAL_CI;
       field.type_.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
       field.type_.set_collation_level(CS_LEVEL_IMPLICIT);
       field.type_.set_varchar(type_name);
-      if (OB_FAIL(result_set.reserve_field_columns(1))) {
-      } else if (OB_FAIL(result_set.add_field_column(field))) {
+      if (OB_FAIL(result_set.reserve_field_columns(field_count))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < field_count; ++i) {
+        const ObString name = ObString::make_string(file_describe
+            ? ObExplainStmt::describe_field_name(i) : "Query Plan");
+        field.cname_ = name;
+        field.org_cname_ = name;
+        ret = result_set.add_field_column(field);
       }
       break;
     }
@@ -2306,6 +2311,76 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
   return ret;
 }
 
+namespace
+{
+// Capture semantic reads before rewrite removes predicates/subqueries or builds
+// an empty plan. In particular, DML's storage column arrays are NOT reads.
+int collect_ai_column_read_references(ObDMLStmt &root, ObPhysicalPlan &plan)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObDMLStmt *, 8> stmts;
+  ObSEArray<ObRawExpr *, 32> exprs;
+  ObSEArray<AiColumnReadReference, 16> refs;
+  if (!root.is_select_stmt() && !root.is_update_stmt() && !root.is_delete_stmt()) {
+    // EXPLAIN and write-only INSERT are not strict reads.
+  } else if (OB_FAIL(stmts.push_back(&root))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < stmts.count(); ++i) {
+    ObSEArray<ObSelectStmt *, 8> children;
+    ObStmtExprGetter getter;
+    getter.set_relation_scope();
+    getter.remove_scope(SCOPE_DML_COLUMN);
+    getter.remove_scope(SCOPE_DMLINFOS);
+    getter.remove_scope(SCOPE_DML_CONSTRAINT);
+    // SCOPE_DML_VALUE remains: UPDATE SET ordinary_col = ai_col is a read.
+    if (OB_FAIL(stmts.at(i)->get_relation_exprs(exprs, getter))) {
+    } else if (OB_FAIL(stmts.at(i)->get_child_stmts(children))) {
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < children.count(); ++j) {
+      if (OB_ISNULL(children.at(j))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(add_var_to_array_no_dup(stmts,
+                                               static_cast<ObDMLStmt *>(children.at(j))))) {
+      }
+    }
+  }
+  // Walking the expression DAG also follows correlated execution parameters.
+  // Their outer reference is not exposed by get_param_count().
+  for (int64_t i = 0; OB_SUCC(ret) && i < exprs.count(); ++i) {
+    ObRawExpr *expr = exprs.at(i);
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (expr->is_column_ref_expr()) {
+      const ObColumnRefRawExpr &column = *static_cast<ObColumnRefRawExpr *>(expr);
+      const ColumnItem *item = nullptr;
+      for (int64_t j = 0; nullptr == item && j < stmts.count(); ++j) {
+        item = stmts.at(j)->get_column_item_by_id(column.get_table_id(), column.get_column_id());
+      }
+      // Derived outputs are handled by traversing their defining child stmt.
+      // A physical ColumnItem carries base IDs even when its table is aliased.
+      if (nullptr != item && OB_INVALID_ID != item->base_tid_ && OB_INVALID_ID != item->base_cid_) {
+        ret = add_var_to_array_no_dup(refs, AiColumnReadReference(item->base_tid_, item->base_cid_));
+      }
+    } else if (expr->is_exec_param_expr()) {
+      ObRawExpr *outer = static_cast<ObExecParamRawExpr *>(expr)->get_ref_expr();
+      if (nullptr != outer) {
+        ret = add_var_to_array_no_dup(exprs, outer);
+      }
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < expr->get_param_count(); ++j) {
+        if (nullptr != expr->get_param_expr(j)) {
+          ret = add_var_to_array_no_dup(exprs, expr->get_param_expr(j));
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ret = plan.set_ai_column_read_references(refs);
+  }
+  return ret;
+}
+}
+
 int ObSql::generate_plan(ParseResult &parse_result,
                         ObPlanCacheCtx *pc_ctx,
                         ObSqlCtx &sql_ctx,
@@ -2405,6 +2480,8 @@ int ObSql::generate_plan(ParseResult &parse_result,
     }
 
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(collect_ai_column_read_references(*stmt, *phy_plan))) {
+      LOG_WARN("collect pre-rewrite AI column read references failed", K(ret));
     } else if (OB_FAIL(transform_stmt(&stmt->get_query_ctx()->sql_schema_guard_,
                                       opt_stat_mgr_,
                                       &self_addr_,

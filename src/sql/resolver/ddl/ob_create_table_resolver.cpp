@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -359,6 +360,15 @@ int ObCreateTableResolver::resolve(const ParseNode &parse_tree)
         if (OB_SUCC(ret)) {
           ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;
           if (OB_FAIL(check_skip_index(table_schema))) {
+          }
+        }
+
+        // an AI column owns three hidden columns (state / request id / result spec);
+        // they are created together with the table schema and marked is_hidden
+        if (OB_SUCC(ret)) {
+          ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;
+          if (OB_FAIL(ObAIColumnResolver::append_hidden_columns(table_schema, *allocator_))) {
+            SQL_RESV_LOG(WARN, "fail to append ai column hidden columns", K(ret));
           }
         }
 

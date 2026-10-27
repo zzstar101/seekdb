@@ -49,6 +49,9 @@ public:
     request_transform_fn_.reset();
     response_transform_fn_.reset();
     endpoint_id_ = OB_INVALID_ID;
+    // 0 means "not specified by the user"; a specified value is in
+    // [MIN_MAX_CONCURRENCY, MAX_MAX_CONCURRENCY].
+    max_concurrency_ = DEFAULT_MAX_CONCURRENCY;
   }
 
   int parse_from_json_base(common::ObArenaAllocator &allocator,const ObString &name, const common::ObIJsonBase &params_jbase);
@@ -69,6 +72,7 @@ public:
   const ObString &get_response_transform_fn() const { return response_transform_fn_; }
   uint64_t get_endpoint_id() const { return endpoint_id_; }
   void set_endpoint_id(uint64_t endpoint_id) { endpoint_id_ = endpoint_id; }
+  int64_t get_max_concurrency() const { return max_concurrency_; }
 
   TO_STRING_KV(K_(name),
                K_(scope),
@@ -80,10 +84,18 @@ public:
                K_(request_model_name),
                K_(parameters),
                K_(request_transform_fn),
-               K_(response_transform_fn));
+               K_(response_transform_fn),
+               K_(max_concurrency));
 private:
   static const ObString DEFAULT_SCOPE;
+  // A max_concurrency value given by the user must fall in
+  // [MIN_MAX_CONCURRENCY, MAX_MAX_CONCURRENCY]; DEFAULT_MAX_CONCURRENCY (0)
+  // only ever means "the user did not specify it".
+  static const int64_t MIN_MAX_CONCURRENCY;
+  static const int64_t MAX_MAX_CONCURRENCY;
+  static const int64_t DEFAULT_MAX_CONCURRENCY;
   static bool is_valid_provider(const ObString &provider);
+  static bool is_valid_max_concurrency(int64_t max_concurrency);
   int encrypt_access_key_(common::ObIAllocator &allocator, const ObString &access_key, ObString &encrypted_access_key);
   int decrypt_access_key_(common::ObIAllocator &allocator, const ObString &encrypted_access_key, ObString &unencrypted_access_key) const;
 private:
@@ -98,6 +110,7 @@ private:
   ObString parameters_;
   ObString request_transform_fn_;
   ObString response_transform_fn_;
+  int64_t max_concurrency_;
 };
 
 } // namespace share

@@ -84,7 +84,7 @@ int ObFunctionTableOp::inner_close()
 void ObFunctionTableOp::destroy()
 {
   if (file_reader_ != nullptr) {
-    file_reader_->~CsvReader();
+    file_reader_->~FileScanReader();
     ctx_.get_allocator().free(file_reader_);
     file_reader_ = nullptr;
   }
@@ -115,11 +115,15 @@ int ObFunctionTableOp::open_file_scan()
   } else if (OB_FAIL(definition.decode(datum->get_string()))) {
   } else {
     if (file_reader_ == nullptr) {
-      void *storage = ctx_.get_allocator().alloc(sizeof(file_sql::CsvReader));
+      void *storage = ctx_.get_allocator().alloc(sizeof(file_sql::FileScanReader));
       if (storage == nullptr) ret = OB_ALLOCATE_MEMORY_FAILED;
-      else file_reader_ = new (storage) file_sql::CsvReader();
+      else file_reader_ = new (storage) file_sql::FileScanReader();
     }
-    OZ (definition.open_csv(ctx_.get_allocator(), *file_reader_, root_copy.ptr()));
+    if (OB_SUCC(ret)) {
+      OZ (file_reader_->open(definition, ctx_.get_allocator(), root_copy.ptr()));
+      OX (file_reader_->set_projection(MY_SPEC.file_column_ids_.get_data(),
+                                       MY_SPEC.file_column_ids_.count()));
+    }
   }
   return ret;
 }
@@ -145,7 +149,7 @@ int ObFunctionTableOp::inner_get_next_row_file()
         } else {
           auto text = file_reader_->value(column);
           const ObString str(text.size(), text.data());
-          switch (file_reader_->column(column).type) {
+          switch (file_reader_->column_type(column)) {
             case file_sql::Type::BigInt: {
               if (!text.empty() && text.front() == '+') text.remove_prefix(1);
               int64_t value = 0;

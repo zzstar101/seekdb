@@ -1,6 +1,7 @@
 /* Copyright (c) 2026 OceanBase. Licensed under the Apache License, Version 2.0. */
 #include "file_scan_utils.h"
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -12,7 +13,7 @@
 
 namespace oceanbase { namespace sql { namespace file_sql {
 namespace {
-bool equal_ci(std::string_view a, std::string_view b)
+bool text_equal_ci(std::string_view a, std::string_view b)
 {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {
@@ -77,7 +78,7 @@ bool same_file(const struct stat &a, const struct stat &b)
 }
 // Resolve no symlinks while opening any component, including the secure root.
 // The directory descriptors pin the traversal against rename/symlink races.
-int open_beneath(int base, const char *relative, bool directory)
+int open_beneath_nofollow(int base, const char *relative, bool directory)
 {
   char path[4096];
   if (!relative || !*relative || std::strlen(relative) >= sizeof(path)) return -1;
@@ -104,7 +105,7 @@ int open_beneath(int base, const char *relative, bool directory)
 
 Type infer_type(std::string_view text)
 {
-  if (equal_ci(text, "true") || equal_ci(text, "false")) return Type::Boolean;
+  if (text_equal_ci(text, "true") || text_equal_ci(text, "false")) return Type::Boolean;
   if (valid_date(text)) {
     if (text.size() == 10) return Type::Date;
     if (text.size() >= 19 && (text[10] == ' ' || text[10] == 'T') && text[13] == ':' && text[16] == ':'
@@ -153,6 +154,135 @@ const char *type_name(Type type)
     default: return "VARCHAR";
   }
 }
+bool equal_ascii_ci(std::string_view left, std::string_view right)
+{
+  return text_equal_ci(left, right);
+}
+bool is_valid_utf8(std::string_view text)
+{
+#ifdef _WIN32
+  // No file can be opened on this platform, so no payload reaches this check.
+  return false;
+#else
+  return valid_utf8(text);
+#endif
+}
+
+#ifndef _WIN32
+SecureFile::~SecureFile() { close(); }
+void SecureFile::close()
+{
+  if (fd_ >= 0) ::close(fd_);
+  if (root_fd_ >= 0) ::close(root_fd_);
+  fd_ = root_fd_ = -1;
+  snapshot_ = {};
+  path_[0] = relative_path_[0] = error_[0] = 0;
+}
+Status SecureFile::fail(Status status, const char *message)
+{
+  std::snprintf(error_, sizeof(error_), "%.240s: %s", path_[0] != 0 ? path_ : "input", message);
+  return status;
+}
+Status SecureFile::open(const char *path, const char *secure_root)
+{
+  close();
+  if (!path || !secure_root || !*secure_root || text_equal_ci(secure_root, "null")) {
+    return fail(Status::Denied, "secure_file_priv denies access");
+  }
+  char root[4096], canonical[4096];
+  if (std::strlen(path) >= sizeof(path_) || std::strlen(secure_root) >= sizeof(root)) {
+    return fail(Status::ResourceLimit, "path too long");
+  }
+  if (!realpath(secure_root, root) || !realpath(path, canonical)) {
+    return fail(Status::Denied, "cannot resolve secure path");
+  }
+  const size_t len = std::strlen(root);
+  if (std::strncmp(root, canonical, len) != 0 || (len > 1 && canonical[len] != '/')) {
+    return fail(Status::Denied, "path is outside secure_file_priv");
+  }
+  const char *relative = canonical + len + (len > 1 ? 1 : 0);
+  if (!*relative) return fail(Status::Denied, "input must be a regular file");
+  std::strcpy(path_, canonical);
+  std::strcpy(relative_path_, relative);
+  const int system_root = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (system_root < 0) return fail(Status::Io, "cannot open filesystem root");
+  root_fd_ = len == 1 ? fcntl(system_root, F_DUPFD_CLOEXEC, 0) : open_beneath_nofollow(system_root, root + 1, true);
+  ::close(system_root);
+  if (root_fd_ < 0) return fail(Status::Denied, "secure directory changed during open");
+  fd_ = open_beneath_nofollow(root_fd_, relative_path_, false);
+  if (fd_ < 0) return fail(Status::Denied, "input path changed during open");
+  if (fstat(fd_, &snapshot_) != 0 || !S_ISREG(snapshot_.st_mode)) {
+    close();
+    return fail(Status::Denied, "input must be a regular file");
+  }
+  return Status::Ok;
+}
+FileIdentity SecureFile::identity() const
+{
+#ifdef __APPLE__
+  const auto modified = snapshot_.st_mtimespec, changed = snapshot_.st_ctimespec;
+#else
+  const auto modified = snapshot_.st_mtim, changed = snapshot_.st_ctim;
+#endif
+  return {static_cast<uint64_t>(snapshot_.st_dev), static_cast<uint64_t>(snapshot_.st_ino), snapshot_.st_size,
+      modified.tv_sec, modified.tv_nsec, changed.tv_sec, changed.tv_nsec};
+}
+Status SecureFile::check_unchanged()
+{
+  if (fd_ < 0) return fail(Status::InvalidOption, "reader is not open");
+  struct stat fd_stat, path_stat;
+  if (fstat(fd_, &fd_stat) != 0 || fstatat(root_fd_, relative_path_, &path_stat, AT_SYMLINK_NOFOLLOW) != 0
+      || !same_file(snapshot_, fd_stat) || !same_file(snapshot_, path_stat)) {
+    return fail(Status::Changed, "input file changed");
+  }
+  return Status::Ok;
+}
+Status SecureFile::read_at(void *buffer, size_t length, int64_t offset, size_t &read)
+{
+  read = 0;
+  if (fd_ < 0) return fail(Status::InvalidOption, "reader is not open");
+  if (offset < 0 || (buffer == nullptr && length > 0) || static_cast<uint64_t>(offset) + length > 0x7fffffffffffffffULL) {
+    return fail(Status::InvalidOption, "invalid read range");
+  }
+  char *out = static_cast<char *>(buffer);
+  while (read < length) {
+    const ssize_t n = ::pread(fd_, out + read, length - read, static_cast<off_t>(offset + static_cast<int64_t>(read)));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return fail(Status::Io, "input read failed");
+    }
+    if (n == 0) break;
+    read += static_cast<size_t>(n);
+  }
+  return read < length ? Status::End : Status::Ok;
+}
+#else
+// Fail closed on platforms without descriptor-relative no-follow traversal.
+SecureFile::~SecureFile() { close(); }
+void SecureFile::close()
+{
+  fd_ = root_fd_ = -1;
+  snapshot_ = {};
+  path_[0] = relative_path_[0] = error_[0] = 0;
+}
+Status SecureFile::fail(Status status, const char *message)
+{
+  std::snprintf(error_, sizeof(error_), "%.240s: %s", "input", message);
+  return status;
+}
+Status SecureFile::open(const char *, const char *)
+{
+  return fail(Status::Unsupported, "secure local file scanning is unavailable on this platform");
+}
+FileIdentity SecureFile::identity() const { return {}; }
+Status SecureFile::check_unchanged() { return fail(Status::Unsupported, "secure local file scanning is unavailable on this platform"); }
+Status SecureFile::read_at(void *, size_t, int64_t, size_t &read)
+{
+  read = 0;
+  return fail(Status::Unsupported, "secure local file scanning is unavailable on this platform");
+}
+#endif
+
 #ifndef _WIN32
 CsvReader::~CsvReader() { close(); }
 void CsvReader::close()
@@ -175,7 +305,7 @@ Status CsvReader::open(const char *path, const char *secure_root, const CsvOptio
 {
   close();
   if (!options.enabled) return fail(Status::Disabled, "enable_file_sql is disabled");
-  if (!path || !secure_root || !*secure_root || equal_ci(secure_root, "null")) return fail(Status::Denied, "secure_file_priv denies access");
+  if (!path || !secure_root || !*secure_root || text_equal_ci(secure_root, "null")) return fail(Status::Denied, "secure_file_priv denies access");
   if (options.sample_size != -1) return fail(Status::Unsupported, "only sample_size=-1 is supported");
   const auto bad_char = [](char c) { return c <= 0 || c == '\r' || c == '\n' || static_cast<unsigned char>(c) >= 128; };
   if (bad_char(options.delimiter) || bad_char(options.quote) || bad_char(options.escape)
@@ -193,10 +323,10 @@ Status CsvReader::open(const char *path, const char *secure_root, const CsvOptio
   std::strcpy(relative_path_, relative);
   const int system_root = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (system_root < 0) return fail(Status::Io, "cannot open filesystem root");
-  root_fd_ = len == 1 ? fcntl(system_root, F_DUPFD_CLOEXEC, 0) : open_beneath(system_root, root + 1, true);
+  root_fd_ = len == 1 ? fcntl(system_root, F_DUPFD_CLOEXEC, 0) : open_beneath_nofollow(system_root, root + 1, true);
   ::close(system_root);
   if (root_fd_ < 0) return fail(Status::Denied, "secure directory changed during open");
-  const int fd = open_beneath(root_fd_, relative_path_, false);
+  const int fd = open_beneath_nofollow(root_fd_, relative_path_, false);
   if (fd < 0) return fail(Status::Denied, "input path changed during open");
   if (fstat(fd, &snapshot_) != 0 || !S_ISREG(snapshot_.st_mode)) {
     ::close(fd); return fail(Status::Denied, "input must be a regular file");
@@ -354,7 +484,7 @@ Status CsvReader::infer()
     std::strcpy(columns_[i].name, base);
     size_t suffix = 2;
     for (size_t j = 0; j < i;) {
-      if (equal_ci(columns_[i].name, columns_[j].name)) {
+      if (text_equal_ci(columns_[i].name, columns_[j].name)) {
         const int n = std::snprintf(columns_[i].name, sizeof(columns_[i].name), "%s__%zu", base, suffix++);
         if (n < 0 || static_cast<size_t>(n) >= sizeof(columns_[i].name)) return fail(Status::ResourceLimit, "deduplicated column name too long");
         j = 0;
@@ -368,8 +498,10 @@ Status CsvReader::infer()
     ++rows;
     for (size_t i = 0; i < column_count_; ++i) {
       columns_[i].nullable |= cells_[i].is_null;
-      columns_[i].max_bytes = std::max(columns_[i].max_bytes, cells_[i].length);
-      if (!cells_[i].is_null) columns_[i].type = widen(columns_[i].type, infer_type(value(i)));
+      if (!cells_[i].is_null) {
+        columns_[i].max_bytes = std::max(columns_[i].max_bytes, cells_[i].length);
+        columns_[i].type = widen(columns_[i].type, infer_type(value(i)));
+      }
     }
     s = read_record();
   }

@@ -1,0 +1,40 @@
+DROP DATABASE IF EXISTS ai_guard_views;
+CREATE DATABASE ai_guard_views;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('guard_view_model');
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL('guard_view_model', '{"type":"completion","model_name":"mock-complete"}');
+CREATE TABLE ai_guard_views.docs (
+id BIGINT PRIMARY KEY,
+content VARCHAR(100),
+tags VARCHAR(100) AI COLUMN (AI_COMPLETE('guard_view_model', content))
+WITH (sync_mode='async', max_retries=0)
+);
+CREATE VIEW ai_guard_views.renamed AS SELECT id AS record_id, content AS body, tags AS generated_text FROM ai_guard_views.docs;
+CREATE VIEW ai_guard_views.nested AS SELECT record_id, body, generated_text FROM ai_guard_views.renamed;
+UPDATE ai_guard_views.renamed SET generated_text='forbidden' WHERE record_id=-1;
+ERROR 0A000: assigning an AI column in UPDATE is not supported
+UPDATE ai_guard_views.nested SET generated_text=NULL WHERE record_id=-1;
+ERROR 0A000: assigning an AI column in UPDATE is not supported
+INSERT INTO ai_guard_views.renamed(record_id, body, generated_text) VALUES (1, 'source', 'forbidden');
+ERROR 0A000: assigning an AI column in INSERT is not supported
+INSERT INTO ai_guard_views.nested VALUES (2, 'source', DEFAULT);
+ERROR 0A000: assigning an AI column in INSERT is not supported
+INSERT INTO ai_guard_views.renamed(record_id, body, generated_text) SELECT 3, 'source', 'forbidden';
+ERROR 0A000: assigning an AI column in INSERT is not supported
+CREATE TABLE ai_guard_views.ordinary (id BIGINT PRIMARY KEY, value VARCHAR(100));
+UPDATE ai_guard_views.renamed v JOIN ai_guard_views.ordinary o ON v.record_id=o.id SET v.generated_text='forbidden', o.value='ordinary';
+ERROR 0A000: assigning an AI column in UPDATE is not supported
+UPDATE ai_guard_views.renamed SET body='ordinary' WHERE record_id=-1;
+SELECT COUNT(*) AS rejected_rows FROM ai_guard_views.docs;
+rejected_rows
+0
+START TRANSACTION;
+INSERT INTO ai_guard_views.renamed(record_id, body) VALUES (4, 'ordinary');
+SELECT id, content, tags FROM ai_guard_views.docs;
+id	content	tags
+4	ordinary	NULL
+ROLLBACK;
+SELECT COUNT(*) AS rolled_back_rows FROM ai_guard_views.docs;
+rolled_back_rows
+0
+DROP DATABASE ai_guard_views;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('guard_view_model');

@@ -1,0 +1,41 @@
+# Quoted primary-key identifiers must survive native task predicate construction.
+# All writes roll back; the worker must never invoke the model for these rows.
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19127
+--disable_warnings
+drop database if exists ai_quoted_key_regression;
+--enable_warnings
+create database ai_quoted_key_regression;
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('quoted_key_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('quoted_key_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('quoted_key_model',
+  '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('quoted_key_ep',
+  '{"ai_model_name":"quoted_key_model","url":"http://127.0.0.1:19127/v1/chat/completions","access_key":"test-key","provider":"openai","request_model_name":"mock-complete"}');
+create table ai_quoted_key_regression.docs(
+  `a``b` bigint primary key,
+  content varchar(200),
+  tags json AI COLUMN (AI_COMPLETE('quoted_key_model', content))
+    WITH (sync_mode='async', max_retries=0)
+);
+start transaction;
+insert into ai_quoted_key_regression.docs(`a``b`, content) values(1, 'first');
+select `a``b`, tags is null as pending from ai_quoted_key_regression.docs;
+update ai_quoted_key_regression.docs set `a``b`=2, content='second' where `a``b`=1;
+select `a``b`, tags is null as pending from ai_quoted_key_regression.docs;
+delete from ai_quoted_key_regression.docs where `a``b`=2;
+select count(*) as rows_after_delete from ai_quoted_key_regression.docs;
+rollback;
+select count(*) as rows_after_rollback from ai_quoted_key_regression.docs;
+select count(*) as tasks_after_rollback
+from oceanbase.__all_ai_column_task task
+join oceanbase.__all_table t on t.table_id=task.table_id
+join oceanbase.__all_database d on d.database_id=t.database_id
+where d.database_name='ai_quoted_key_regression' and t.table_name='docs';
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py assert 19127 no-requests
+drop database ai_quoted_key_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('quoted_key_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('quoted_key_model');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19127

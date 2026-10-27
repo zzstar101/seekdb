@@ -35,6 +35,8 @@
 #include "observer/ob_req_time_service.h"
 #include "observer/omt/ob_ai_service.h"
 #include "observer/ai_service/ob_ai_service_executor.h"
+#include "observer/ai_service/ai_column/ob_ai_column_service.h"
+#include "observer/ai_service/ai_column/ob_ai_column_retry_runner.h"
 #include "observer/dbms_scheduler/ob_dbms_sched_service.h"
 #include "storage/lob/ob_lob_manager.h"
 #include "storage/compaction/ob_freeze_info_mgr.h"
@@ -972,6 +974,11 @@ void ObServer::destroy()
     ObTabletAutoincrementService::get_instance().destroy();
     FLOG_INFO("table auto increment service destroyed");
 
+    FLOG_INFO("begin to destroy ai column service");
+    observer::ai_column::AiColumnService::get_instance().destroy();
+    share::unbind_server_service<sql::IAiColumnRetryHook>();
+    FLOG_INFO("ai column service destroyed");
+
     FLOG_INFO("begin to destroy server timer");
     server_gtimer_.destroy();
     FLOG_INFO("server timer destroyed");
@@ -1331,6 +1338,14 @@ int ObServer::start()
       FLOG_INFO("success to start net frame");
     }
 
+    // The AI column worker runs the queued model calls after the business
+    // transaction has committed; it must not start before the server is up.
+    if (FAILEDx(observer::ai_column::AiColumnService::get_instance().start())) {
+      LOG_ERROR("fail to start ai column service", KR(ret));
+    } else {
+      FLOG_INFO("success to start ai column service");
+    }
+
     if (OB_SUCC(ret) && OB_FAIL(standby_module_->start_listener())) {
       LOG_ERROR("fail to start standby gRPC service", KR(ret));
     }
@@ -1600,6 +1615,10 @@ int ObServer::stop()
     FLOG_INFO("begin to stop timer monitor");
     ObTimerMonitor::get_instance().stop();
     FLOG_INFO("timer monitor stopped");
+
+    FLOG_INFO("begin to stop ai column service");
+    observer::ai_column::AiColumnService::get_instance().stop();
+    FLOG_INFO("ai column service stopped");
 
     FLOG_INFO("begin to stop timer");
     server_gtimer_.stop();
@@ -2186,6 +2205,17 @@ int ObServer::init_server_runtime()
   int ret = OB_SUCCESS;
 
   if (OB_FAIL(server_runtime_controller_.init(log_block_mgr_))) {
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(observer::ai_column::AiColumnService::get_instance().init(sql_proxy_))) {
+    LOG_WARN("fail to init ai column service", K(ret));
+  } else {
+    // The rows of an AI COLUMN RETRY are invalidated and queued by the runtime,
+    // inside the transaction of the ALTER.  The engine has no link dependency on
+    // the observer, so the retry reaches the runtime through the server runtime.
+    share::bind_server_service<sql::IAiColumnRetryHook>(
+        &observer::ai_column::AiColumnRetryRunner::get_instance());
   }
 
   if (OB_SUCC(ret)) {

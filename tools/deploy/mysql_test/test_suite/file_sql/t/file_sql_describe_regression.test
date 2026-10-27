@@ -1,0 +1,10 @@
+--write_file /tmp/seekdb-file-describe-regression.csv
+id,name,score,active,day,created,empty
+1,世界,1.5,true,2026-08-01,2026-08-01 10:11:12,
+2,two,2,false,,,NULL
+EOF
+SET SESSION enable_file_sql = ON;
+DESCRIBE SELECT * FROM read_csv('/tmp/seekdb-file-describe-regression.csv');
+DESC SELECT name AS label, id AS identifier FROM read_csv('/tmp/seekdb-file-describe-regression.csv') WHERE id < 0;
+--remove_file /tmp/seekdb-file-describe-regression.csv
+SET SESSION enable_file_sql = OFF;

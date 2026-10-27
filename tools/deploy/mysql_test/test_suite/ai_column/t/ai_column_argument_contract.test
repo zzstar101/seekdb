@@ -1,0 +1,284 @@
+# AI column argument contract: NULL dependencies, prompt objects vs plain
+# strings, the AI_COMPLETE config, and SQL NULL propagation of AI_EMBED.
+#
+# The queue row keeps the prompt and the config of the AI function inside a
+# versioned JSON input envelope that the user statement itself evaluates with
+# JSON_OBJECT, so the worker sees exactly the types the statement produced:
+#   * a NULL dependency must not abort the business DML with ER_BAD_NULL_ERROR,
+#     the COMPLETE task fails terminally and sends no request;
+#   * AI_PROMPT(...) is a JSON prompt object, validated and rendered (unicode
+#     template, repeated placeholder);
+#   * a VARCHAR that merely looks like a prompt object is a plain string and is
+#     sent verbatim;
+#   * the config of AI_COMPLETE is snapshotted at enqueue, its column references
+#     are dependencies, and a NULL config equals an omitted one;
+#   * AI_EMBED of a NULL input publishes SQL NULL instead of an empty vector.
+#
+# Oracle: ai_column_argument_mock.py on port 19229 records the real requests.
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py start 19229
+--disable_warnings
+drop database if exists ai_column_argument_contract;
+--enable_warnings
+create database ai_column_argument_contract;
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_argument_complete_ep');
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_argument_embed_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_argument_complete');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_argument_embed');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_argument_complete',
+  '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_argument_embed',
+  '{"type":"dense_embedding","model_name":"mock-embedding"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_argument_complete_ep',
+  '{"ai_model_name":"p0_argument_complete","url":"http://127.0.0.1:19229/v1/chat/completions","access_key":"p0-argument-key","provider":"openai","request_model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_argument_embed_ep',
+  '{"ai_model_name":"p0_argument_embed","url":"http://127.0.0.1:19229/v1/embeddings","access_key":"p0-argument-key","provider":"openai","request_model_name":"mock-embedding"}');
+set session ai_column_strict_read = off;
+
+# ---- 1. a NULL dependency must not abort the business DML -------------------
+drop table if exists ai_column_argument_contract.null_src;
+create table ai_column_argument_contract.null_src(
+  id bigint primary key,
+  content varchar(100),
+  summary varchar(200) AI COLUMN (
+    AI_COMPLETE('p0_argument_complete', concat('Classify: ', content))
+  ) WITH (sync_mode='async', max_retries=0)
+);
+start transaction;
+insert into ai_column_argument_contract.null_src(id, content) values(1, NULL);
+commit;
+select count(*) = 1 as null_prompt_insert_committed
+from ai_column_argument_contract.null_src where id = 1;
+let $retry = 150;
+let $decided = 0;
+while ($retry)
+{
+  let $decided = `select count(*) = 0
+      from oceanbase.__all_ai_column_task task
+      join oceanbase.__all_table t on t.table_id = task.table_id
+      join oceanbase.__all_database d on d.database_id = t.database_id
+      where d.database_name = 'ai_column_argument_contract'
+        and t.table_name = 'null_src'`;
+  if ($decided == 1)
+  {
+    let $retry = 0;
+  }
+  if ($decided == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $decided = 1 as null_prompt_task_decided;
+select summary is null as null_prompt_summary_is_null
+from ai_column_argument_contract.null_src where id = 1;
+update ai_column_argument_contract.null_src set content = NULL where id = 1;
+select count(*) = 1 as null_prompt_update_committed
+from ai_column_argument_contract.null_src where id = 1;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 null-prompt-not-sent
+
+# ---- 2. AI_PROMPT is a prompt object: unicode template, repeated placeholder
+drop table if exists ai_column_argument_contract.prompt_object;
+create table ai_column_argument_contract.prompt_object(
+  id bigint primary key,
+  content varchar(100),
+  summary varchar(400) AI COLUMN (
+    AI_COMPLETE('p0_argument_complete', AI_PROMPT('分类: {0} ; {0}', content))
+  ) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.prompt_object(id, content) values(1, '苹果');
+let $retry = 150;
+let $rendered = 0;
+while ($retry)
+{
+  let $rendered = `select ifnull(summary = 'mock:分类: 苹果 ; 苹果', 0)
+      from ai_column_argument_contract.prompt_object where id = 1`;
+  if ($rendered == 1)
+  {
+    let $retry = 0;
+  }
+  if ($rendered == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $rendered = 1 as prompt_object_rendered;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 prompt-object-rendered
+
+# ---- 3. a prompt-looking VARCHAR is a plain string, never expanded ----------
+drop table if exists ai_column_argument_contract.lookalike;
+create table ai_column_argument_contract.lookalike(
+  id bigint primary key,
+  content varchar(200),
+  summary varchar(400) AI COLUMN (
+    AI_COMPLETE('p0_argument_complete', content)
+  ) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.lookalike(id, content)
+  values(1, '{"template":"{0}","args":["lookalike"]}');
+let $retry = 150;
+let $verbatim = 0;
+while ($retry)
+{
+  let $verbatim = `select ifnull(summary = concat('mock:', content), 0)
+      from ai_column_argument_contract.lookalike where id = 1`;
+  if ($verbatim == 1)
+  {
+    let $retry = 0;
+  }
+  if ($verbatim == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $verbatim = 1 as lookalike_sent_verbatim;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 lookalike-verbatim
+
+# ---- 4. the config is snapshotted and reaches the model; NULL == omitted ----
+drop table if exists ai_column_argument_contract.config_docs;
+create table ai_column_argument_contract.config_docs(
+  id bigint primary key,
+  hot_src varchar(100),
+  cold_src varchar(100),
+  hot varchar(200) AI COLUMN (
+    AI_COMPLETE('p0_argument_complete', hot_src,
+                json_object('temperature', 0.2, 'max_tokens', 8))
+  ) WITH (sync_mode='async', max_retries=0),
+  cold varchar(200) AI COLUMN (
+    AI_COMPLETE('p0_argument_complete', cold_src, NULL)
+  ) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.config_docs(id, hot_src, cold_src)
+  values(1, 'hot-cfg', 'cold-cfg');
+let $retry = 150;
+let $configured = 0;
+while ($retry)
+{
+  let $configured = `select ifnull((hot = 'mock:hot-cfg@0.2') + (cold = 'mock:cold-cfg'), 0)
+      from ai_column_argument_contract.config_docs where id = 1`;
+  if ($configured == 2)
+  {
+    let $retry = 0;
+  }
+  if ($configured != 2)
+  {
+    let $configured = 0;
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $configured = 2 as config_columns_ready;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 config-applied
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 null-config-omitted
+
+# ---- 5. a config column is a dependency and is snapshotted at enqueue -------
+drop table if exists ai_column_argument_contract.config_dep;
+create table ai_column_argument_contract.config_dep(
+  id bigint primary key,
+  content varchar(100),
+  cfg json,
+  summary varchar(200) AI COLUMN (
+    AI_COMPLETE('p0_argument_complete', content, cfg)
+  ) WITH (sync_mode='async', max_retries=0)
+);
+insert into ai_column_argument_contract.config_dep(id, content, cfg)
+  values(1, 'dep-cfg', json_object('temperature', 0.9));
+let $retry = 150;
+let $first = 0;
+while ($retry)
+{
+  let $first = `select ifnull(summary = 'mock:dep-cfg@0.9', 0)
+      from ai_column_argument_contract.config_dep where id = 1`;
+  if ($first == 1)
+  {
+    let $retry = 0;
+  }
+  if ($first == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $first = 1 as config_dependency_first_result;
+# updating the config column alone re-enqueues the AI column, and the new task
+# snapshots the committed config value (0.1), not the old one
+update ai_column_argument_contract.config_dep set cfg = json_object('temperature', 0.1)
+  where id = 1;
+let $retry = 150;
+let $rerun = 0;
+while ($retry)
+{
+  let $rerun = `select ifnull(summary = 'mock:dep-cfg@0.1', 0)
+      from ai_column_argument_contract.config_dep where id = 1`;
+  if ($rerun == 1)
+  {
+    let $retry = 0;
+  }
+  if ($rerun == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $rerun = 1 as config_dependency_rerun_result;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 config-dependency
+
+# ---- 6. AI_EMBED of a NULL input propagates SQL NULL, not an empty vector ---
+drop table if exists ai_column_argument_contract.embed_docs;
+create table ai_column_argument_contract.embed_docs(
+  id bigint primary key,
+  content varchar(100),
+  v vector(4) AI COLUMN (
+    AI_EMBED('p0_argument_embed', content)
+  ) WITH (sync_mode='async', max_retries=0)
+);
+start transaction;
+insert into ai_column_argument_contract.embed_docs(id, content) values(1, NULL);
+commit;
+select count(*) = 1 as null_embed_insert_committed
+from ai_column_argument_contract.embed_docs where id = 1;
+let $retry = 150;
+let $null_result = 0;
+while ($retry)
+{
+  let $null_result = `select ifnull(v is null, 0)
+      from ai_column_argument_contract.embed_docs where id = 1`;
+  if ($null_result == 1)
+  {
+    let $retry = 0;
+  }
+  if ($null_result == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $null_result = 1 as null_embed_result_is_null;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 embedding-none
+insert into ai_column_argument_contract.embed_docs(id, content) values(2, 'vec-one');
+let $retry = 150;
+let $embedded = 0;
+while ($retry)
+{
+  let $embedded = `select ifnull(v is not null, 0)
+      from ai_column_argument_contract.embed_docs where id = 2`;
+  if ($embedded == 1)
+  {
+    let $retry = 0;
+  }
+  if ($embedded == 0)
+  {
+    --sleep 0.1
+    dec $retry;
+  }
+}
+eval select $embedded = 1 as nonnull_embed_result_published;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py assert 19229 embedding-once
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_argument_mock.py stop 19229
+drop database ai_column_argument_contract;

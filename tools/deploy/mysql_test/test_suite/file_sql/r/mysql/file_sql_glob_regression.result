@@ -1,0 +1,35 @@
+SELECT * FROM glob('/tmp/seekdb-glob-regression-?.csv');
+ERROR 0A000: File SQL without enable_file_sql not supported
+SET SESSION enable_file_sql = ON;
+SELECT file FROM glob('/tmp/seekdb-glob-regression-?.csv') ORDER BY file;
+file
+/tmp/seekdb-glob-regression-a.csv
+/tmp/seekdb-glob-regression-b.csv
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-[ab].csv');
+matches
+2
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-missing-*.csv');
+matches
+0
+SELECT g.file FROM glob('/tmp/seekdb-glob-regression-?.csv') AS g
+WHERE g.file LIKE '%-b.csv' ORDER BY g.file LIMIT 1;
+file
+/tmp/seekdb-glob-regression-b.csv
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-?.csv') AS a
+JOIN glob('/tmp/seekdb-glob-regression-?.csv') AS b ON a.file = b.file;
+matches
+2
+SELECT * FROM glob('/tmp/seekdb-glob-regression-*.csv', header = true);
+ERROR HY000: Invalid argument
+SET SESSION enable_file_sql = OFF;
+SELECT 1 AS ordinary_sql;
+ordinary_sql
+1
+SET SESSION enable_file_sql = ON;
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-?.csv');
+matches
+0
+SET SESSION enable_file_sql = OFF;
+SELECT 'glob regression complete' AS outcome;
+outcome
+glob regression complete

@@ -3932,16 +3932,29 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   const ParseNode *args = function.children_[1];
   const ObString function_name(name.str_len_, name.str_value_);
   file_sql::FileScanDefinition definition;
-  file_sql::CsvOptions options;
-  options.enabled = true;
+  file_sql::CsvOptions csv_options;
+  file_sql::JsonOptions json_options;
+  file_sql::ParquetOptions parquet_options;
+  csv_options.enabled = true;
+  json_options.enabled = true;
+  parquet_options.enabled = true;
+  const bool is_csv = 0 == function_name.case_compare("read_csv");
+  // read_ndjson is DuckDB's spelling of the same newline-delimited JSON scan.
+  const bool is_json = 0 == function_name.case_compare("read_json")
+                       || 0 == function_name.case_compare("read_ndjson");
+  const bool is_parquet = 0 == function_name.case_compare("read_parquet");
+  const bool is_glob = 0 == function_name.case_compare("glob");
   ObString secure_root, root_copy, encoded;
   ObConstRawExpr *definition_expr = nullptr;
   ObDMLStmt *stmt = get_stmt();
-  if (function_name.case_compare("read_csv") != 0) {
+  if (!is_csv && !is_json && !is_parquet && !is_glob) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file format");
   } else if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(args) || args->num_child_ < 1
              || OB_ISNULL(args->children_[0]) || args->children_[0]->type_ != T_VARCHAR) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  if (OB_SUCC(ret) && is_glob && args->num_child_ != 1) {
     ret = OB_INVALID_ARGUMENT;
   }
   ObSEArray<ObString, 8> seen;
@@ -3958,33 +3971,65 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
       }
       OZ (seen.push_back(key_name));
       if (OB_FAIL(ret)) {
-      } else if (key_name.case_compare("header") == 0 || key_name.case_compare("empty_is_null") == 0) {
-        if ((value.type_ != T_BOOL && value.type_ != T_INT) || (value.value_ != 0 && value.value_ != 1)) {
+      } else if (0 == key_name.case_compare("header") || 0 == key_name.case_compare("empty_is_null")) {
+        if (!is_csv) {
           ret = OB_INVALID_ARGUMENT;
-        } else if (key_name.case_compare("header") == 0) {
-          options.header = value.value_ != 0;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "this option is only valid for read_csv");
+        } else if ((value.type_ != T_BOOL && value.type_ != T_INT) || (value.value_ != 0 && value.value_ != 1)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (0 == key_name.case_compare("header")) {
+          csv_options.header = value.value_ != 0;
         } else {
-          options.empty_is_null = value.value_ != 0;
+          csv_options.empty_is_null = value.value_ != 0;
         }
-      } else if (key_name.case_compare("sample_size") == 0) {
+      } else if (0 == key_name.case_compare("sample_size")) {
         if (value.type_ != T_INT || value.value_ != -1) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "sample_size other than -1");
         }
-      } else if (key_name.case_compare("delimiter") == 0 || key_name.case_compare("delim") == 0
-                 || key_name.case_compare("quote") == 0 || key_name.case_compare("escape") == 0) {
-        if (value.type_ != T_VARCHAR || value.str_len_ != 1) {
-          ret = OB_INVALID_ARGUMENT;
-        } else if (key_name.case_compare("quote") == 0) {
-          options.quote = value.str_value_[0];
-        } else if (key_name.case_compare("escape") == 0) {
-          options.escape = value.str_value_[0];
+      } else if (0 == key_name.case_compare("format")) {
+        // The only JSON layout implemented is one object per line; an explicit
+        // layout that names another format is reported as unsupported.
+        const ObString layout(value.str_len_, value.str_value_);
+        bool supported = false;
+        if (is_csv) {
+          supported = 0 == layout.case_compare("csv");
+        } else if (is_json) {
+          supported = 0 == layout.case_compare("newline_delimited") || 0 == layout.case_compare("ndjson")
+                      || 0 == layout.case_compare("jsonl");
         } else {
-          options.delimiter = value.str_value_[0];
+          // read_parquet names its layout by the function, the way read_csv does.
+          supported = 0 == layout.case_compare("parquet");
         }
-      } else if (key_name.case_compare("nullstr") == 0 || key_name.case_compare("null") == 0) {
-        if (value.type_ != T_VARCHAR) ret = OB_INVALID_ARGUMENT;
-        else options.null_text = std::string_view(value.str_value_, value.str_len_);
+        if (value.type_ != T_VARCHAR) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (!supported) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file format");
+        }
+      } else if (0 == key_name.case_compare("delimiter") || 0 == key_name.case_compare("delim")
+                 || 0 == key_name.case_compare("quote") || 0 == key_name.case_compare("escape")) {
+        if (!is_csv) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "this option is only valid for read_csv");
+        } else if (value.type_ != T_VARCHAR || value.str_len_ != 1) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (0 == key_name.case_compare("quote")) {
+          csv_options.quote = value.str_value_[0];
+        } else if (0 == key_name.case_compare("escape")) {
+          csv_options.escape = value.str_value_[0];
+        } else {
+          csv_options.delimiter = value.str_value_[0];
+        }
+      } else if (0 == key_name.case_compare("nullstr") || 0 == key_name.case_compare("null")) {
+        if (!is_csv) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "this option is only valid for read_csv");
+        } else if (value.type_ != T_VARCHAR) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          csv_options.null_text = std::string_view(value.str_value_, value.str_len_);
+        }
       } else {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "unknown file scan option");
@@ -3995,7 +4040,16 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   OZ (ob_write_string(*allocator_, secure_root, root_copy, true));
   if (OB_SUCC(ret)) {
     const ParseNode &path = *args->children_[0];
-    OZ (definition.infer_csv(*allocator_, ObString(path.str_len_, path.str_value_), root_copy.ptr(), options));
+    const ObString file_path(path.str_len_, path.str_value_);
+    if (is_csv) {
+      OZ (definition.infer_csv(*allocator_, file_path, root_copy.ptr(), csv_options));
+    } else if (is_json) {
+      OZ (definition.infer_json(*allocator_, file_path, root_copy.ptr(), json_options));
+    } else if (is_parquet) {
+      OZ (definition.infer_parquet(*allocator_, file_path, root_copy.ptr(), parquet_options));
+    } else {
+      OZ (definition.infer_glob(*allocator_, file_path, root_copy.ptr()));
+    }
   }
   OZ (definition.encode(*allocator_, encoded));
   OZ (params_.expr_factory_->create_raw_expr(T_VARCHAR, definition_expr));
@@ -4053,7 +4107,14 @@ int ObDMLResolver::resolve_file_table_columns(const TableItem &table_item, ObIAr
       meta.set_collation_level(meta.is_string_type() ? CS_LEVEL_IMPLICIT : CS_LEVEL_NUMERIC);
       ObAccuracy accuracy = ObAccuracy(PRECISION_UNKNOWN_YET, SCALE_UNKNOWN_YET);
       if (meta.is_string_type()) accuracy.set_length(MAX(1, col.max_bytes_));
-      if (meta.is_datetime()) accuracy.set_scale(6);
+      if (meta.is_datetime()) {
+        // Full CSV/JSON inference accepts only 19-byte whole-second timestamps
+        // or 20 + fractional_digits bytes. NULL spellings are not value widths.
+        // Binary Parquet timestamps retain the reader's microsecond precision.
+        const int64_t scale = definition.format_ == static_cast<int64_t>(file_sql::FileFormat::Parquet)
+            ? 6 : MAX(0, MIN(6, col.max_bytes_ - 20));
+        accuracy.set_scale(static_cast<int16_t>(scale));
+      }
       OZ (resolve_function_table_column_item(table_item, meta, accuracy, col.name_, OB_APP_MIN_COLUMN_ID + i, item));
     }
     CK (OB_NOT_NULL(item));

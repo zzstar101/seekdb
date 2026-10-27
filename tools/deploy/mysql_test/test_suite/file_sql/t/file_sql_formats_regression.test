@@ -1,0 +1,38 @@
+# Native JSONL/Parquet scans, union metadata, cross-format joins and errors.
+SET SESSION enable_file_sql = ON;
+--write_file /tmp/seekdb-file-formats.jsonl
+{"id":1,"name":"世界","score":1.5,"active":true}
+{"id":2,"score":null,"active":false,"day":"2026-08-02"}
+{"id":3,"name":"third","score":3,"note":"ok"}
+EOF
+--write_file /tmp/seekdb-file-formats.csv
+id,label
+1,first
+2,second
+4,fourth
+EOF
+--write_file /tmp/seekdb-file-formats-nested.jsonl
+{"id":1,"nested":{"x":2}}
+EOF
+--exec python3 -c "import base64,pathlib; pathlib.Path('/tmp/seekdb-file-formats.parquet').write_bytes(base64.b64decode(pathlib.Path('tools/deploy/mysql_test/test_suite/file_sql/data/simple.parquet.b64').read_bytes()))"
+SELECT id, name, score, active, day, note FROM read_json('/tmp/seekdb-file-formats.jsonl') ORDER BY id;
+SELECT COUNT(*) AS n, SUM(score) AS total FROM read_ndjson('/tmp/seekdb-file-formats.jsonl');
+SELECT c.id, c.label, j.name, j.note FROM read_csv('/tmp/seekdb-file-formats.csv') AS c
+ LEFT JOIN read_json('/tmp/seekdb-file-formats.jsonl') AS j ON c.id = j.id ORDER BY c.id;
+SELECT COUNT(*) AS n, MIN(c1) AS lo, MAX(c1) AS hi, SUM(c1) AS total
+ FROM read_parquet('/tmp/seekdb-file-formats.parquet');
+SELECT p.c1, j.name FROM read_parquet('/tmp/seekdb-file-formats.parquet') AS p
+ JOIN read_json('/tmp/seekdb-file-formats.jsonl') AS j ON p.c1 = j.id ORDER BY p.c1;
+SELECT c1 FROM read_parquet('/tmp/seekdb-file-formats.parquet') WHERE c1 > 2 ORDER BY c1 DESC LIMIT 2;
+--disable_result_log
+--error 1210
+SELECT * FROM read_json('/tmp/seekdb-file-formats-nested.jsonl');
+--error 1210
+SELECT * FROM read_json('/tmp/seekdb-file-formats.jsonl', header = true);
+--enable_result_log
+--remove_file /tmp/seekdb-file-formats.jsonl
+--remove_file /tmp/seekdb-file-formats.csv
+--remove_file /tmp/seekdb-file-formats-nested.jsonl
+--remove_file /tmp/seekdb-file-formats.parquet
+SET SESSION enable_file_sql = OFF;
+SELECT 'format regression complete' AS outcome;

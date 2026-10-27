@@ -18,6 +18,7 @@
 #include "ob_table_sql_service.h"
 #include "lib/literals/ob_literals.h"
 #include "share/ob_global_stat_proxy.h"
+#include "share/schema/ob_ai_column_definition.h"
 #include "share/schema/ob_constraint.h"
 #include "share/schema/ob_partition_sql_helper.h"
 #include "share/ob_timezone_mgr.h"
@@ -696,6 +697,18 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
                        true))) {
     }
   }
+  // Ordinary table DDL must not access the optional AI catalog. In particular,
+  // dropping a table must remain valid on a store without AI catalog tables.
+  bool has_ai_column = false;
+  for (int64_t i = 0; !has_ai_column && i < table_schema.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+    has_ai_column = NULL != column && is_ai_column_column(*column);
+  }
+  if (OB_SUCC(ret) && need_drop_column && has_ai_column) {
+    if (OB_FAIL(delete_ai_column_catalog(sql_client, table_id))) {
+      LOG_WARN("fail to delete ai column catalog rows", K(ret), K(table_id));
+    }
+  }
 
   // delete from __all_table_stat, __all_monitor_modified, __all_column_usage, __all_optstat_user_prefs
   if (OB_SUCC(ret)) {
@@ -888,6 +901,20 @@ int ObTableSqlService::insert_single_column(
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
   } else if (OB_FAIL(add_single_column(sql_client, new_column_schema))) {
+  } else if (!new_column_schema.is_hidden() && is_ai_column_column(new_column_schema)) {
+    // ALTER TABLE ... ADD COLUMN of an AI column: record its catalog row too. The
+    // hidden columns are added by the same ALTER statement, so they are already
+    // part of new_table_schema here.
+    ObArenaAllocator allocator;
+    AIColumnDefinition def;
+    ObString user_comment;
+    if (OB_FAIL(decode_ai_column_definition(allocator, new_column_schema.get_comment_str(),
+                                            def, user_comment))) {
+      LOG_WARN("fail to decode ai column definition", K(ret), K(new_column_schema));
+    } else if (OB_FAIL(add_ai_column_catalog_row(sql_client, new_table_schema,
+                                                 new_column_schema, def, user_comment))) {
+      LOG_WARN("fail to add ai column catalog row", K(ret), K(new_column_schema));
+    }
   }
   if (OB_SUCC(ret)) {
     if (new_column_schema.is_autoincrement()) {
@@ -2005,6 +2032,13 @@ int ObTableSqlService::delete_single_column(
     }
   }
 
+  if (OB_SUCC(ret) && !orig_column_schema.is_hidden() &&
+      is_ai_column_column(orig_column_schema)) {
+    if (OB_FAIL(delete_ai_column_catalog(sql_client, table_id, column_id))) {
+      LOG_WARN("fail to delete ai column catalog row", K(ret), K(table_id), K(column_id));
+    }
+  }
+
   if (OB_SUCC(ret)) {
     if (OB_FAIL(delete_column_stat(sql_client, table_id, column_id))) {
     }
@@ -2151,6 +2185,8 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
     } else if (FALSE_IT(time_guard.click("insert_all_table"))) {
     } else if (OB_FAIL(batch_add_columns_for_create_table(sql_client, tables))) {
     } else if (FALSE_IT(time_guard.click("insert_all_column"))) {
+    } else if (OB_FAIL(batch_add_ai_column_catalog(sql_client, tables))) {
+    } else if (FALSE_IT(time_guard.click("insert_ai_column_catalog"))) {
     } else if (OB_FAIL(batch_add_constraints_for_create_table(sql_client, tables))) {
     } else if (FALSE_IT(time_guard.click("insert_all_cst"))) {
     } else if (OB_FAIL(batch_add_table_part_info(sql_client, tables))) {
@@ -2741,6 +2777,138 @@ int ObTableSqlService::delete_from_all_histogram_stat(ObISQLClient &sql_client,
     }
   }
 
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// AI column catalog (__all_ai_column).
+//
+// The metadata of an AI column is persisted twice: encoded in the comment of its
+// result column (__all_column.comment, which the column path already writes) and
+// as a row of __all_ai_column, which is what SQL and the AI column runtime read.
+// Both writes happen inside the same DDL transaction, so a failed DDL never
+// leaves a catalog row behind.
+// ---------------------------------------------------------------------------
+
+int ObTableSqlService::add_ai_column_catalog_row(ObISQLClient &sql_client,
+                                                 const ObTableSchema &table_schema,
+                                                 const ObColumnSchemaV2 &column,
+                                                 const AIColumnDefinition &def,
+                                                 const ObString &user_comment)
+{
+  int ret = OB_SUCCESS;
+  const ObColumnSchemaV2 *state_column = table_schema.get_column_schema(def.state_column_name_);
+  const ObColumnSchemaV2 *request_column =
+      table_schema.get_column_schema(def.request_column_name_);
+  const ObColumnSchemaV2 *result_spec_column =
+      table_schema.get_column_schema(def.result_spec_column_name_);
+  ObSqlString deps;
+  if (OB_ISNULL(state_column) || OB_ISNULL(request_column) || OB_ISNULL(result_spec_column)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column hidden columns are missing", K(ret), K(column), K(def));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < def.dep_column_names_.count(); ++i) {
+    if (i > 0 && OB_FAIL(deps.append(","))) {
+    } else if (OB_FAIL(deps.append(def.dep_column_names_.at(i)))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObDMLSqlSplicer dml;
+    int64_t affected_rows = 0;
+    if (OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(
+                                                 table_schema.get_table_id())))
+        || OB_FAIL(dml.add_pk_column("column_id", column.get_column_id()))
+        || OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(column.get_column_name())))
+        || OB_FAIL(dml.add_column("call_type", def.call_type_))
+        || OB_FAIL(dml.add_column("ai_function_name", ObHexEscapeSqlStr(def.ai_function_name_)))
+        || OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(def.model_name_)))
+        || OB_FAIL(dml.add_column("prompt_expr", ObHexEscapeSqlStr(def.prompt_expr_)))
+        || OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(def.normalized_expr_)))
+        || OB_FAIL(dml.add_column("result_spec", ObHexEscapeSqlStr(def.result_spec_)))
+        || OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(def.sync_mode_)))
+        || OB_FAIL(dml.add_column("max_retries", def.max_retries_))
+        || OB_FAIL(dml.add_column("dimension", def.dimension_))
+        || OB_FAIL(dml.add_column("state_column_id", state_column->get_column_id()))
+        || OB_FAIL(dml.add_column("request_column_id", request_column->get_column_id()))
+        || OB_FAIL(dml.add_column("result_spec_column_id", result_spec_column->get_column_id()))
+        || OB_FAIL(dml.add_column("definition_version", def.definition_version_))
+        || OB_FAIL(dml.add_column("deps", ObHexEscapeSqlStr(
+             deps.empty() ? ObString::make_string("") : deps.string())))
+        || OB_FAIL(dml.add_column("comment", ObHexEscapeSqlStr(
+             user_comment.empty() ? ObString::make_string("") : user_comment)))
+        || OB_FAIL(dml.add_gmt_create())
+        || OB_FAIL(dml.add_gmt_modified())) {
+      LOG_WARN("fail to build ai column catalog dml", K(ret), K(column));
+    } else if (OB_FAIL(exec_insert(sql_client,
+                                   table_schema.get_table_id(),
+                                   OB_ALL_AI_COLUMN_TNAME,
+                                   dml,
+                                   affected_rows))) {
+      LOG_WARN("fail to insert ai column catalog row", K(ret), K(column));
+    } else if (affected_rows > 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected affected rows", K(ret), K(affected_rows), K(column));
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::add_ai_column_catalog(ObISQLClient &sql_client,
+                                             const ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  const int64_t column_count = table_schema.get_column_count();
+  ObArenaAllocator allocator;
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(column) || column->is_hidden() || !is_ai_column_column(*column)) {
+      // an ordinary column or a hidden column: nothing to record
+    } else {
+      AIColumnDefinition def;
+      ObString user_comment;
+      if (OB_FAIL(decode_ai_column_definition(allocator, column->get_comment_str(),
+                                              def, user_comment))) {
+        LOG_WARN("fail to decode ai column definition", K(ret), KPC(column));
+      } else if (OB_FAIL(add_ai_column_catalog_row(sql_client, table_schema, *column,
+                                                   def, user_comment))) {
+        LOG_WARN("fail to add ai column catalog row", K(ret), KPC(column));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::batch_add_ai_column_catalog(ObISQLClient &sql_client,
+                                                   const ObIArray<ObTableSchema> &tables)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+    const ObTableSchema &table = tables.at(i);
+    if (is_inner_table(table.get_table_id())) {
+      // inner tables do not carry AI columns
+    } else if (OB_FAIL(add_ai_column_catalog(sql_client, table))) {
+      LOG_WARN("fail to add ai column catalog", K(ret), K(table));
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::delete_ai_column_catalog(ObISQLClient &sql_client,
+                                                const uint64_t table_id,
+                                                const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  ObDMLSqlSplicer dml;
+  int64_t affected_rows = 0;
+  if (OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(table_id)))) {
+    LOG_WARN("fail to add table id", K(ret), K(table_id));
+  } else if (OB_INVALID_ID != column_id &&
+             OB_FAIL(dml.add_pk_column("column_id", column_id))) {
+    LOG_WARN("fail to add column id", K(ret), K(column_id));
+  } else if (OB_FAIL(exec_delete(sql_client, table_id, OB_ALL_AI_COLUMN_TNAME, dml,
+                                 affected_rows))) {
+    LOG_WARN("fail to delete ai column catalog rows", K(ret), K(table_id), K(column_id));
+  }
   return ret;
 }
 

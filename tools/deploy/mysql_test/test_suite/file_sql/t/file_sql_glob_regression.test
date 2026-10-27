@@ -1,0 +1,32 @@
+# Native glob() projection, filtering, joins, empty results and security gate.
+--error 1235
+SELECT * FROM glob('/tmp/seekdb-glob-regression-?.csv');
+SET SESSION enable_file_sql = ON;
+--replace_result /private/tmp /tmp
+--write_file /tmp/seekdb-glob-regression-a.csv
+id
+1
+EOF
+--write_file /tmp/seekdb-glob-regression-b.csv
+id
+2
+EOF
+SELECT file FROM glob('/tmp/seekdb-glob-regression-?.csv') ORDER BY file;
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-[ab].csv');
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-missing-*.csv');
+--replace_result /private/tmp /tmp
+SELECT g.file FROM glob('/tmp/seekdb-glob-regression-?.csv') AS g
+ WHERE g.file LIKE '%-b.csv' ORDER BY g.file LIMIT 1;
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-?.csv') AS a
+ JOIN glob('/tmp/seekdb-glob-regression-?.csv') AS b ON a.file = b.file;
+--error 1210
+SELECT * FROM glob('/tmp/seekdb-glob-regression-*.csv', header = true);
+--remove_file /tmp/seekdb-glob-regression-a.csv
+--remove_file /tmp/seekdb-glob-regression-b.csv
+SET SESSION enable_file_sql = OFF;
+SELECT 1 AS ordinary_sql;
+# Repeated identical SQL must not reuse the previous directory result.
+SET SESSION enable_file_sql = ON;
+SELECT COUNT(*) AS matches FROM glob('/tmp/seekdb-glob-regression-?.csv');
+SET SESSION enable_file_sql = OFF;
+SELECT 'glob regression complete' AS outcome;

@@ -5,6 +5,10 @@ OBSERVER_UNITY_GROUPS = [
         name = "ob_server_ai_service_0",
         language = "c++",
         srcs = [
+            "src/observer/ai_service/ai_column/ob_ai_column_retry_runner.cpp",
+            "src/observer/ai_service/ai_column/ob_ai_column_service.cpp",
+            "src/observer/ai_service/ai_column/ob_ai_column_task.cpp",
+            "src/observer/ai_service/ai_column/ob_ai_column_worker.cpp",
             "src/observer/ai_service/ob_ai_service_proxy.cpp",
             "src/observer/ai_service/ob_ai_service_executor.cpp",
             "src/observer/ob_system_package_load_service.cpp",

@@ -1,0 +1,16 @@
+# DATETIME precision comes from the full non-NULL text schema, not a fixed six.
+SET SESSION enable_file_sql = ON;
+--write_file /tmp/seekdb-file-datetime.csv
+whole,fractional
+2026-08-01 10:11:12,2026-08-01 10:11:12.1234
+THIS_IS_A_LONG_NULL_SENTINEL,THIS_IS_A_LONG_NULL_SENTINEL
+EOF
+SELECT whole, fractional FROM read_csv('/tmp/seekdb-file-datetime.csv', nullstr = 'THIS_IS_A_LONG_NULL_SENTINEL') ORDER BY whole;
+--write_file /tmp/seekdb-file-datetime.jsonl
+{"whole":"2026-08-01 10:11:12","fractional":"2026-08-01 10:11:12.123456"}
+{"whole":null,"fractional":null}
+EOF
+SELECT whole, fractional FROM read_json('/tmp/seekdb-file-datetime.jsonl') ORDER BY whole;
+--remove_file /tmp/seekdb-file-datetime.csv
+--remove_file /tmp/seekdb-file-datetime.jsonl
+SET SESSION enable_file_sql = OFF;

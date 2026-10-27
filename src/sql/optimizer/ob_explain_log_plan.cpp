@@ -37,6 +37,8 @@ int ObExplainLogPlan::generate_normal_raw_plan()
   int ret = OB_SUCCESS;
   if (OB_ISNULL(get_stmt()) || OB_UNLIKELY(!get_stmt()->is_explain_stmt())) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (static_cast<const ObExplainStmt *>(get_stmt())->is_file_describe()) {
+    ret = generate_file_describe_plan();
   } else {
     ObLogPlan *child_plan = NULL;
     const ObDMLStmt *child_stmt = NULL;
@@ -104,6 +106,47 @@ int ObExplainLogPlan::generate_normal_raw_plan()
       get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             false);
+    }
+  }
+  return ret;
+}
+
+int ObExplainLogPlan::generate_file_describe_plan()
+{
+  int ret = OB_SUCCESS;
+  ObLogicalOperator *top = nullptr;
+  const auto &columns = static_cast<const ObExplainStmt *>(get_stmt())->get_describe_columns();
+  if (OB_FAIL(allocate_values_as_top(top))) {
+  } else if (top == nullptr || top->get_type() != LOG_VALUES) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    auto *values = static_cast<ObLogValues *>(top);
+    set_plan_root(top);
+    top->mark_is_plan_root();
+    for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+      ObObj cells[ObExplainStmt::DESCRIBE_FIELD_COUNT];
+      for (auto &cell : cells) cell.set_null();
+      cells[0].set_varchar(columns.at(i).name_);
+      cells[1].set_varchar(columns.at(i).type_);
+      cells[2].set_varchar(columns.at(i).nullable_ ? "YES" : "NO");
+      for (int64_t j = 0; j < 3; ++j) {
+        cells[j].set_collation_type(ObCharset::get_system_collation());
+      }
+      ObNewRow row;
+      row.cells_ = cells;
+      row.count_ = ObExplainStmt::DESCRIBE_FIELD_COUNT;
+      ret = values->add_row(row);
+    }
+    get_optimizer_context().get_all_exprs().reuse();
+    for (int64_t i = 0; OB_SUCC(ret) && i < ObExplainStmt::DESCRIBE_FIELD_COUNT; ++i) {
+      ret = allocate_output_expr_for_values_op(*values);
+    }
+    if (OB_SUCC(ret)) {
+      values->set_op_id(0);
+      set_max_op_id(1);
+      optimizer_context_.set_packed(false);
+      get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
+                                            ObPhyPlanType::OB_PHY_PLAN_LOCAL, false);
     }
   }
   return ret;

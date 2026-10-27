@@ -1,0 +1,145 @@
+drop database if exists ai_column_security_regression;
+create database ai_column_security_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('security_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('security_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('security_model',
+'{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('security_ep',
+'{"ai_model_name":"security_model","url":"http://127.0.0.1:19136/v1/chat/completions","access_key":"security-key","provider":"openai","request_model_name":"mock-complete"}');
+create table ai_column_security_regression.target(
+id bigint primary key,
+category varchar(20),
+content varchar(200),
+result varchar(400) AI COLUMN (
+AI_COMPLETE('security_model', content)
+) WITH (sync_mode='async', max_retries=0)
+);
+create table ai_column_security_regression.secret(
+id bigint primary key,
+s varchar(50)
+);
+insert into ai_column_security_regression.secret(id, s) values (1, 'top-secret');
+insert into ai_column_security_regression.target(id, category, content)
+values (1, 'news', 'row-one'),
+(2, 'sports', 'row-two'),
+(3, 'news', 'row-three');
+select 1 = 1 as initial_results_ready;
+initial_results_ready
+1
+select count(*) = 1 as one_catalog_row,
+max(a.definition_version) = 1 as first_definition_version
+from oceanbase.__all_ai_column a
+join oceanbase.__all_table t on t.table_id = a.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+one_catalog_row	first_definition_version
+1	1
+select count(*) = 3 as three_hidden_columns
+from oceanbase.__all_column c
+join oceanbase.__all_table t on t.table_id = c.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target'
+  and c.is_hidden = 1;
+three_hidden_columns
+1
+drop user if exists 'ai_col_sec_user'@'%';
+create user 'ai_col_sec_user'@'%' identified by 'Sec_pw_2026';
+grant select, alter on ai_column_security_regression.target to 'ai_col_sec_user'@'%';
+select current_user() as retry_caller;
+retry_caller
+ai_col_sec_user@%
+select * from secret;
+ERROR 42000: SELECT command denied to user 'ai_col_sec_user'@'%' for table 'secret'
+alter table target retry ai column result
+where exists (select 1 from secret);
+ERROR 42000: SELECT command denied to user 'ai_col_sec_user'@'%' for table 'secret'
+alter table target retry ai column result
+where id in (select id from secret);
+ERROR 42000: SELECT command denied to user 'ai_col_sec_user'@'%' for table 'secret'
+select count(*) = 3 as results_untouched_by_refused_retries
+from target where result is not null;
+results_untouched_by_refused_retries
+1
+alter table target retry ai column result where id = 1;
+alter table target retry ai column result where id in (2, 3);
+alter table target retry ai column result where category = 'news';
+select 1 = 1 as allowed_retries_recomputed;
+allowed_retries_recomputed
+1
+alter table target retry ai column result where status = 'READY' and id = 3;
+select 1 = 1 as status_predicate_retry_recomputed;
+status_predicate_retry_recomputed
+1
+select count(*) = 3 as caller_reads_all_results from target;
+caller_reads_all_results
+1
+select count(*) = 0 as no_pending_tasks
+from oceanbase.__all_ai_column_task task
+join oceanbase.__all_table t on t.table_id = task.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+no_pending_tasks
+1
+alter table ai_column_security_regression.target modify column content varchar(120);
+alter table ai_column_security_regression.target add column note int;
+alter table ai_column_security_regression.target add column result2 varchar(400)
+AI COLUMN (AI_COMPLETE('security_model', content)) WITH (sync_mode='async', max_retries=0);
+select count(*) = 2 as added_ai_column_has_catalog_row
+from oceanbase.__all_ai_column a
+join oceanbase.__all_table t on t.table_id = a.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+added_ai_column_has_catalog_row
+1
+select count(*) = 6 as added_ai_column_has_hidden_columns
+from oceanbase.__all_column c
+join oceanbase.__all_table t on t.table_id = c.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target'
+  and c.is_hidden = 1;
+added_ai_column_has_hidden_columns
+1
+select count(*) = 3 as added_ai_column_left_existing_rows_null
+from ai_column_security_regression.target where result2 is null;
+added_ai_column_left_existing_rows_null
+1
+alter table ai_column_security_regression.target modify column result varchar(400);
+ERROR 0A000: redefining an AI result column with MODIFY COLUMN is not supported
+alter table ai_column_security_regression.target modify column result varchar(400)
+AI COLUMN (AI_COMPLETE('security_model', content)) WITH (sync_mode='async', max_retries=0);
+ERROR 0A000: redefining an AI result column with MODIFY COLUMN is not supported
+alter table ai_column_security_regression.target change column result result_renamed varchar(400);
+ERROR 0A000: redefining an AI result column with CHANGE COLUMN is not supported
+alter table ai_column_security_regression.target modify column content varchar(200)
+AI COLUMN (AI_COMPLETE('security_model', content)) WITH (sync_mode='async', max_retries=0);
+ERROR 0A000: turning a normal column into an AI column with MODIFY COLUMN is not supported
+alter table ai_column_security_regression.target modify column result2 varchar(400);
+ERROR 0A000: redefining an AI result column with MODIFY COLUMN is not supported
+select count(*) = 2 as rejected_modify_keeps_catalog_rows,
+max(a.definition_version) = 1 as rejected_modify_keeps_definition_version
+from oceanbase.__all_ai_column a
+join oceanbase.__all_table t on t.table_id = a.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+rejected_modify_keeps_catalog_rows	rejected_modify_keeps_definition_version
+1	1
+select count(*) = 6 as rejected_modify_keeps_hidden_columns
+from oceanbase.__all_column c
+join oceanbase.__all_table t on t.table_id = c.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target'
+  and c.is_hidden = 1;
+rejected_modify_keeps_hidden_columns
+1
+select count(*) = 3 as rejected_modify_keeps_results
+from ai_column_security_regression.target where result is not null;
+rejected_modify_keeps_results
+1
+select count(*) = 3 as rejected_modify_keeps_result2_null
+from ai_column_security_regression.target where result2 is null;
+rejected_modify_keeps_result2_null
+1
+drop user if exists 'ai_col_sec_user'@'%';
+drop database ai_column_security_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('security_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('security_model');

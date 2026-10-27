@@ -28,6 +28,7 @@
 #include "sql/engine/expr/ob_expr_regexp_context.h"
 #include "sql/engine/expr/ob_json_param_type.h"
 #include "sql/parser/ob_parser_utils.h"
+#include "share/system_variable/ob_system_variable_alias.h"
 
 #include "sql/executor/ob_memory_tracker.h"
 namespace oceanbase
@@ -3126,6 +3127,11 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
                                            into_item->pl_vars_,
                                            select_stmt))) {
         }
+      } else if (T_INTO_COPY == node->type_) { // COPY ... TO ...
+        if (is_in_set_query()) {
+          ret = OB_INAPPROPRIATE_INTO;
+        } else if (OB_FAIL(resolve_copy_into_clause(node, *into_item))) {
+        }
       } else {
         //do nothing
       }
@@ -3137,6 +3143,174 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
   return ret;
 }
 
+
+// COPY ... TO ... option value helpers.
+//
+// Option *names* are deliberately not enumerated by the grammar: an unknown or misspelled
+// option has to reach the resolver so that it can be reported as an argument error instead of
+// a syntax error, and so that `FORMAT XML` can report "not supported" rather than "bad syntax".
+static int get_copy_option_bool(const ParseNode *node, bool &value)
+{
+  int ret = OB_SUCCESS;
+  value = true; // bare flag form: HEADER
+  if (OB_ISNULL(node)) {
+    // flag without value
+  } else if (T_INT == node->type_ || T_UINT64 == node->type_) {
+    value = (0 != node->value_);
+  } else if (T_IDENT == node->type_ && OB_NOT_NULL(node->str_value_)) {
+    const ObString word(node->str_len_, node->str_value_);
+    if (0 == word.case_compare("true") || 0 == word.case_compare("on")
+        || 0 == word.case_compare("yes") || 0 == word.case_compare("1")) {
+      value = true;
+    } else if (0 == word.case_compare("false") || 0 == word.case_compare("off")
+               || 0 == word.case_compare("no") || 0 == word.case_compare("0")) {
+      value = false;
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+    }
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  return ret;
+}
+
+static int get_copy_option_char(const ParseNode *node, char &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node) || OB_ISNULL(node->str_value_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if ((T_CHAR == node->type_ || T_VARCHAR == node->type_) && 1 == node->str_len_) {
+    value = node->str_value_[0];
+  } else {
+    // The writer works on bytes, so multi-byte delimiters/quotes are rejected here instead of
+    // being silently truncated.
+    ret = OB_INVALID_ARGUMENT;
+  }
+  return ret;
+}
+
+static int get_copy_option_text(ObIAllocator &allocator, const ParseNode *node, ObString &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node) || OB_ISNULL(node->str_value_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (T_CHAR != node->type_ && T_VARCHAR != node->type_ && T_IDENT != node->type_) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ob_write_string(allocator,
+                                     ObString(node->str_len_, node->str_value_),
+                                     value))) {
+  }
+  return ret;
+}
+
+int ObSelectResolver::resolve_copy_option(const ParseNode *node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node) || T_COPY_OPTION != node->type_ || 2 != node->num_child_
+      || OB_ISNULL(node->children_[0]) || OB_ISNULL(node->children_[0]->str_value_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const ParseNode *name_node = node->children_[0];
+    const ParseNode *value_node = node->children_[1];
+    const ObString name(name_node->str_len_, name_node->str_value_);
+    if (0 == name.case_compare("FORMAT")) {
+      ObString format;
+      if (OB_FAIL(get_copy_option_text(*allocator_, value_node, format))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY FORMAT");
+      } else if (0 != format.case_compare("CSV")) {
+        // Only CSV is backed by the native writer; anything else must fail closed.
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY format other than CSV");
+      }
+    } else if (0 == name.case_compare("HEADER")) {
+      if (OB_FAIL(get_copy_option_bool(value_node, into_item.copy_header_))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY HEADER");
+      }
+    } else if (0 == name.case_compare("DELIMITER") || 0 == name.case_compare("DELIM")) {
+      if (OB_FAIL(get_copy_option_char(value_node, into_item.copy_delimiter_))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY DELIMITER");
+      }
+    } else if (0 == name.case_compare("QUOTE")) {
+      if (OB_FAIL(get_copy_option_char(value_node, into_item.copy_quote_))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY QUOTE");
+      }
+    } else if (0 == name.case_compare("ESCAPE")) {
+      if (OB_FAIL(get_copy_option_char(value_node, into_item.copy_escape_))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY ESCAPE");
+      }
+    } else if (0 == name.case_compare("NULLSTR")) {
+      if (OB_FAIL(get_copy_option_text(*allocator_, value_node, into_item.copy_nullstr_))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY NULLSTR");
+      }
+    } else if (0 == name.case_compare("FORCE_QUOTE")) {
+      if (OB_FAIL(get_copy_option_bool(value_node, into_item.copy_force_quote_))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY FORCE_QUOTE");
+      }
+    } else if (0 == name.case_compare("OVERWRITE")) {
+      bool overwrite = false;
+      if (OB_FAIL(get_copy_option_bool(value_node, overwrite))) {
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY OVERWRITE");
+      } else if (overwrite) {
+        // The writer publishes with linkat(2) without replacement: a COPY never destroys an
+        // existing file. Overwrite would need an unlink-then-create window, so it is refused.
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY OVERWRITE");
+      }
+    } else {
+      LOG_WARN("unknown COPY option", K(ret), K(name));
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY option");
+    }
+  }
+  return ret;
+}
+
+int ObSelectResolver::resolve_copy_into_clause(const ParseNode *node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  if (OB_ISNULL(node) || OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+    LOG_WARN("failed to read File SQL feature gate", K(ret));
+  } else if (!enabled) {
+    // COPY writes into the server's file system, so it sits behind the very same gate as the
+    // file readers: with the gate off it must not even resolve, let alone create a file.
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY without enable_file_sql");
+  } else if (2 != node->num_child_ || OB_ISNULL(node->children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(resolve_into_const_node(node->children_[0], into_item.outfile_name_))) {
+  } else if (!into_item.outfile_name_.is_string_type()
+             || into_item.outfile_name_.get_string().empty()) {
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "COPY target path");
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    into_item.into_type_ = T_INTO_COPY;
+    // The CSV writer emits UTF-8 text, so values are converted to the default charset while
+    // printing (the same target charset the file readers expect).
+    into_item.cs_type_ = ObCharset::get_default_collation(ObCharset::get_default_charset());
+    // COPY publishes exactly one file, so the export plan must stay single-threaded: with
+    // is_single_ == true the planner will not push a random-partition exchange below this op and
+    // only one worker ever instantiates the CSV writer for the target path.
+    into_item.is_single_ = true;
+    const ParseNode *option = node->children_[1];
+    while (OB_SUCC(ret) && OB_NOT_NULL(option)) {
+      if (T_LINK_NODE == option->type_) {
+        if (2 != option->num_child_) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(resolve_copy_option(option->children_[0], into_item))) {
+        } else {
+          option = option->children_[1];
+        }
+      } else if (OB_FAIL(resolve_copy_option(option, into_item))) {
+      } else {
+        option = NULL; // single option without a comma chain
+      }
+    }
+  }
+  return ret;
+}
 
 int ObSelectResolver::resolve_column_ref_in_all_namespace(
   const ObQualifiedName &q_name,

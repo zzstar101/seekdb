@@ -1,0 +1,172 @@
+# AI column security regression.
+#
+# 1. RETRY AI COLUMN carries the WHERE clause of the caller, so its enumeration
+#    query must be evaluated under the caller's privileges: a caller that may
+#    only ALTER and SELECT the target table must not be able to read another
+#    table through a subquery of the predicate (1142), while the predicates that
+#    stay inside the target table keep working.
+# 2. MODIFY / CHANGE COLUMN cannot (re)define an AI result column (1235): only
+#    CREATE TABLE and ADD COLUMN create the hidden columns and the catalog row
+#    the runtime needs, so the rejected statements must leave the settled
+#    results and the catalog untouched.
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19136
+--disable_warnings
+drop database if exists ai_column_security_regression;
+--enable_warnings
+create database ai_column_security_regression;
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('security_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('security_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('security_model',
+  '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('security_ep',
+  '{"ai_model_name":"security_model","url":"http://127.0.0.1:19136/v1/chat/completions","access_key":"security-key","provider":"openai","request_model_name":"mock-complete"}');
+create table ai_column_security_regression.target(
+  id bigint primary key,
+  category varchar(20),
+  content varchar(200),
+  result varchar(400) AI COLUMN (
+    AI_COMPLETE('security_model', content)
+  ) WITH (sync_mode='async', max_retries=0)
+);
+create table ai_column_security_regression.secret(
+  id bigint primary key,
+  s varchar(50)
+);
+insert into ai_column_security_regression.secret(id, s) values (1, 'top-secret');
+insert into ai_column_security_regression.target(id, category, content)
+values (1, 'news', 'row-one'),
+(2, 'sports', 'row-two'),
+(3, 'news', 'row-three');
+let $retry = 150;
+let $ready = 0;
+while ($retry)
+{
+  let $ready = `select count(*) = 3 from ai_column_security_regression.target where result is not null`;
+  if ($ready == 1) { let $retry = 0; }
+  if ($ready == 0) { --sleep 0.1
+    dec $retry; }
+}
+eval select $ready = 1 as initial_results_ready;
+select count(*) = 1 as one_catalog_row,
+       max(a.definition_version) = 1 as first_definition_version
+from oceanbase.__all_ai_column a
+join oceanbase.__all_table t on t.table_id = a.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+select count(*) = 3 as three_hidden_columns
+from oceanbase.__all_column c
+join oceanbase.__all_table t on t.table_id = c.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target'
+  and c.is_hidden = 1;
+--disable_warnings
+drop user if exists 'ai_col_sec_user'@'%';
+--enable_warnings
+create user 'ai_col_sec_user'@'%' identified by 'Sec_pw_2026';
+grant select, alter on ai_column_security_regression.target to 'ai_col_sec_user'@'%';
+# The restricted caller holds ALTER and SELECT on the target table only.
+connect (sec_user, 127.0.0.1, ai_col_sec_user, Sec_pw_2026, ai_column_security_regression);
+select current_user() as retry_caller;
+--error 1142
+select * from secret;
+# The predicate of a retry must not reach a table the caller cannot read.
+--error 1142
+alter table target retry ai column result
+  where exists (select 1 from secret);
+--error 1142
+alter table target retry ai column result
+  where id in (select id from secret);
+select count(*) = 3 as results_untouched_by_refused_retries
+from target where result is not null;
+# ... while the predicates that stay inside the target table are the point of
+# the statement, so those retries still work.
+alter table target retry ai column result where id = 1;
+alter table target retry ai column result where id in (2, 3);
+alter table target retry ai column result where category = 'news';
+let $retry = 150;
+let $ready = 0;
+while ($retry)
+{
+  let $ready = `select count(*) = 3 from target where result is not null`;
+  if ($ready == 1) { let $retry = 0; }
+  if ($ready == 0) { --sleep 0.1
+    dec $retry; }
+}
+eval select $ready = 1 as allowed_retries_recomputed;
+# The status pseudo column is rewritten inside the target table as well.
+alter table target retry ai column result where status = 'READY' and id = 3;
+let $retry = 150;
+let $ready = 0;
+while ($retry)
+{
+  let $ready = `select count(*) = 3 from target where result is not null`;
+  if ($ready == 1) { let $retry = 0; }
+  if ($ready == 0) { --sleep 0.1
+    dec $retry; }
+}
+eval select $ready = 1 as status_predicate_retry_recomputed;
+select count(*) = 3 as caller_reads_all_results from target;
+connection default;
+select count(*) = 0 as no_pending_tasks
+from oceanbase.__all_ai_column_task task
+join oceanbase.__all_table t on t.table_id = task.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+# Positive controls: ordinary columns are still alterable, and ADD COLUMN still
+# creates an AI result column together with its hidden columns and catalog row.
+alter table ai_column_security_regression.target modify column content varchar(120);
+alter table ai_column_security_regression.target add column note int;
+alter table ai_column_security_regression.target add column result2 varchar(400)
+  AI COLUMN (AI_COMPLETE('security_model', content)) WITH (sync_mode='async', max_retries=0);
+select count(*) = 2 as added_ai_column_has_catalog_row
+from oceanbase.__all_ai_column a
+join oceanbase.__all_table t on t.table_id = a.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+select count(*) = 6 as added_ai_column_has_hidden_columns
+from oceanbase.__all_column c
+join oceanbase.__all_table t on t.table_id = c.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target'
+  and c.is_hidden = 1;
+select count(*) = 3 as added_ai_column_left_existing_rows_null
+from ai_column_security_regression.target where result2 is null;
+# Only CREATE TABLE and ADD COLUMN may define an AI result column.
+--error 1235
+alter table ai_column_security_regression.target modify column result varchar(400);
+--error 1235
+alter table ai_column_security_regression.target modify column result varchar(400)
+  AI COLUMN (AI_COMPLETE('security_model', content)) WITH (sync_mode='async', max_retries=0);
+--error 1235
+alter table ai_column_security_regression.target change column result result_renamed varchar(400);
+--error 1235
+alter table ai_column_security_regression.target modify column content varchar(200)
+  AI COLUMN (AI_COMPLETE('security_model', content)) WITH (sync_mode='async', max_retries=0);
+--error 1235
+alter table ai_column_security_regression.target modify column result2 varchar(400);
+select count(*) = 2 as rejected_modify_keeps_catalog_rows,
+       max(a.definition_version) = 1 as rejected_modify_keeps_definition_version
+from oceanbase.__all_ai_column a
+join oceanbase.__all_table t on t.table_id = a.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target';
+select count(*) = 6 as rejected_modify_keeps_hidden_columns
+from oceanbase.__all_column c
+join oceanbase.__all_table t on t.table_id = c.table_id
+join oceanbase.__all_database d on d.database_id = t.database_id
+where d.database_name = 'ai_column_security_regression' and t.table_name = 'target'
+  and c.is_hidden = 1;
+select count(*) = 3 as rejected_modify_keeps_results
+from ai_column_security_regression.target where result is not null;
+select count(*) = 3 as rejected_modify_keeps_result2_null
+from ai_column_security_regression.target where result2 is null;
+--disable_warnings
+drop user if exists 'ai_col_sec_user'@'%';
+--enable_warnings
+drop database ai_column_security_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('security_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('security_model');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19136

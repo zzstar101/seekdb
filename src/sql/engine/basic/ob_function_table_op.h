@@ -66,7 +66,7 @@ private:
   int inner_get_next_row_sys_func();
   int open_file_scan();
   int inner_get_next_row_file();
-  file_sql::CsvReader *file_reader_ = nullptr;
+  file_sql::FileScanReader *file_reader_ = nullptr;
   int get_current_result(common::ObObj &result);
   int64_t node_idx_;
   bool already_calc_;

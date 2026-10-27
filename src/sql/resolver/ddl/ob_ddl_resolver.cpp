@@ -27,6 +27,7 @@
 #include "sql/rewrite/ob_transform_pre_process.h"
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
 #include "sql/resolver/ddl/ob_fts_parser_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
 #include "sql/session/ob_local_session_var.h"
 #include "query/ddl/ob_dynamic_partition_policy.h"
 #include "share/rc/ob_server_runtime.h"
@@ -2181,7 +2182,15 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
                                                             &comment_length,
                                                             MAX_COLUMN_COMMENT_CHAR_LENGTH))){
             } else {
-              column.set_comment(ObString(comment_length, comment_ptr));
+              // COMMENT only ever rewrites the user comment. For an AI column the
+              // definition lives in the same column comment, so it is re-encoded
+              // with the new user comment instead of being overwritten: writing a
+              // comment can neither create nor destroy an AI column.
+              if (OB_FAIL(ObAIColumnResolver::set_user_comment(*allocator_,
+                                                               ObString(comment_length, comment_ptr),
+                                                               column))) {
+                SQL_RESV_LOG(WARN, "fail to set column comment", K(ret), K(column));
+              }
             }
           }
         }
@@ -2284,6 +2293,37 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       case T_VISIBLE:
       case T_INVISIBLE:
       {
+        break;
+      }
+      case T_AI_COLUMN: {
+        // <col> <type> AI COLUMN (AI_COMPLETE / AI_EMBED ...) [WITH (...)]
+        // Whatever comment the column carries at this point (a COMMENT clause seen
+        // earlier in this statement, or a definition installed by an earlier AI
+        // COLUMN clause) is kept as the user comment of the payload, so the order of
+        // the two attributes does not matter and neither one loses the other.
+        ObAIColumnDefinition ai_def;
+        ObString user_comment;
+        if (OB_FAIL(ObAIColumnResolver::get_user_comment(*allocator_, column, user_comment))) {
+          SQL_RESV_LOG(WARN, "fail to get column user comment", K(ret), K(column));
+        } else if (OB_FAIL(ObAIColumnResolver::resolve_ai_column_attribute(attr_node,
+                                                                           column,
+                                                                           *allocator_,
+                                                                           user_comment,
+                                                                           ai_def))) {
+          SQL_RESV_LOG(WARN, "fail to resolve ai column attribute", K(ret), K(column));
+        } else {
+          const ObTableSchema *ai_table_schema = NULL;
+          if (NULL != create_table_stmt) {
+            ai_table_schema = &create_table_stmt->get_create_table_arg().schema_;
+          } else if (NULL != alter_table_stmt) {
+            ai_table_schema = &alter_table_stmt->get_alter_table_arg().alter_table_schema_;
+          }
+          if (NULL != ai_table_schema
+              && OB_FAIL(ObAIColumnResolver::check_ai_column_dependencies(*ai_table_schema,
+                                                                         ai_def))) {
+            SQL_RESV_LOG(WARN, "ai column dependency check failed", K(ret), K(column));
+          }
+        }
         break;
       }
       default:  // won't be here
@@ -2425,7 +2465,13 @@ int ObDDLResolver::resolve_generated_column_attribute(ObColumnSchemaV2 &column,
                                                           &comment_length,
                                                           MAX_COLUMN_COMMENT_CHAR_LENGTH))){
           } else {
-            column.set_comment(ObString(comment_length, comment_ptr));
+            // as in the non generated branch: a COMMENT only rewrites the user
+            // comment and never an AI column definition
+            if (OB_FAIL(ObAIColumnResolver::set_user_comment(*allocator_,
+                                                             ObString(comment_length, comment_ptr),
+                                                             column))) {
+              SQL_RESV_LOG(WARN, "fail to set column comment", K(ret), K(column));
+            }
           }
         }
       }

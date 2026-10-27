@@ -29,6 +29,9 @@ namespace oceanbase
 namespace share
 {
 const ObString ObAiModelEndpointInfo::DEFAULT_SCOPE = "ALL";
+const int64_t ObAiModelEndpointInfo::MIN_MAX_CONCURRENCY = 1;
+const int64_t ObAiModelEndpointInfo::MAX_MAX_CONCURRENCY = 1024;
+const int64_t ObAiModelEndpointInfo::DEFAULT_MAX_CONCURRENCY = 0;
 
 const char *VALID_PROVIDERS[] = {
   "ALIYUN-OPENAI",
@@ -63,6 +66,35 @@ const char *VALID_PROVIDERS[] = {
     LOG_WARN("unknown json key param", K(ret), K(elem.first)); \
   }
 
+// Integer endpoint parameter: only a JSON integer node is accepted. JSON
+// strings ("8"), float/decimal literals (3.5), booleans and explicit nulls are
+// invalid values rather than invalid json keys, and the integer itself must
+// fall in [min_value, max_value]. The user error always reports the canonical
+// parameter name (json_key), not the spelling used by the caller.
+#define EXTRACT_JSON_ELEM_INT_WITH_RANGE(json_key, member, min_value, max_value) \
+      if (elem.first.case_compare(json_key) == 0) { \
+        bool is_value_valid = false; \
+        int64_t int_value = 0; \
+        if (ObJsonNodeType::J_INT == elem.second->json_type()) { \
+          int_value = elem.second->get_int(); \
+          is_value_valid = (int_value >= (min_value) && int_value <= (max_value)); \
+        } else if (ObJsonNodeType::J_UINT == elem.second->json_type()) { \
+          const uint64_t uint_value = elem.second->get_uint(); \
+          is_value_valid = (uint_value >= static_cast<uint64_t>(min_value) \
+                            && uint_value <= static_cast<uint64_t>(max_value)); \
+          int_value = static_cast<int64_t>(uint_value); \
+        } else { \
+          is_value_valid = false; \
+        } \
+        if (!is_value_valid) { \
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID; \
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen(json_key), json_key); \
+          LOG_WARN("invalid json value for endpoint param", K(ret), K(elem.first), K(elem.second->json_type())); \
+        } else { \
+          member = int_value; \
+        } \
+      } else
+
 int ObAiModelEndpointInfo::parse_from_json_base(common::ObArenaAllocator &allocator, const ObString &name, const ObIJsonBase &params_jbase)
 {
   int ret = OB_SUCCESS;
@@ -81,6 +113,7 @@ int ObAiModelEndpointInfo::deep_copy(
   int ret = OB_SUCCESS;
   reset();
   endpoint_id_ = other.endpoint_id_;
+  max_concurrency_ = other.max_concurrency_;
   if (OB_FAIL(ob_write_string(allocator, other.name_, name_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.scope_, scope_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.ai_model_name_, ai_model_name_))) {
@@ -132,8 +165,21 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (!response_transform_fn_.empty()) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("response_transform_fn"), "response_transform_fn");
+  } else if (!is_valid_max_concurrency(max_concurrency_)) {
+    // DEFAULT_MAX_CONCURRENCY (0) means "not specified by the user" and is
+    // accepted; any other out-of-range value is rejected here so that a
+    // corrupted stored value cannot be read back as if it were valid.
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("max_concurrency"), "max_concurrency");
+    LOG_WARN("invalid max_concurrency", K(ret), K(*this));
   }
   return ret;
+}
+
+bool ObAiModelEndpointInfo::is_valid_max_concurrency(int64_t max_concurrency)
+{
+  return DEFAULT_MAX_CONCURRENCY == max_concurrency
+         || (max_concurrency >= MIN_MAX_CONCURRENCY && max_concurrency <= MAX_MAX_CONCURRENCY);
 }
 
 bool ObAiModelEndpointInfo::is_valid_provider(const ObString &provider)
@@ -166,6 +212,7 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("parameters", parameters_)
       EXTRACT_JSON_ELEM_STR("request_transform_fn", request_transform_fn_)
       EXTRACT_JSON_ELEM_STR("response_transform_fn", response_transform_fn_)
+      EXTRACT_JSON_ELEM_INT_WITH_RANGE("max_concurrency", max_concurrency_, MIN_MAX_CONCURRENCY, MAX_MAX_CONCURRENCY)
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();

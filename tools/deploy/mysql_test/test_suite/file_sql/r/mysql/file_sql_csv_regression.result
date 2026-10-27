@@ -1,9 +1,9 @@
 SET SESSION enable_file_sql = ON;
 SELECT id, name, score, active, day, created, IF(note = '', '<EMPTY>', REPLACE(note, CHAR(10), '<NL>')) AS note FROM read_csv('CSV_FILE') f ORDER BY id;
 id	name	score	active	day	created	note
-1	alpha	1.5	1	2026-01-02	2026-01-02 03:04:05.000000	first<NL>line
-2	世界	2.5	0	2026-02-28	2026-02-28 00:00:00.000000	NULL
-3	gamma	NULL	1	2026-03-01	2026-03-01 12:30:00.000000	<EMPTY>
+1	alpha	1.5	1	2026-01-02	2026-01-02 03:04:05	first<NL>line
+2	世界	2.5	0	2026-02-28	2026-02-28 00:00:00	NULL
+3	gamma	NULL	1	2026-03-01	2026-03-01 12:30:00	<EMPTY>
 SELECT COUNT(*) AS n, SUM(id) AS total FROM read_csv('/tmp/seekdb-file-sql-csv-regression.csv');
 n	total
 3	6

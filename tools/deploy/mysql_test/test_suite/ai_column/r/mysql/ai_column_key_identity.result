@@ -1,0 +1,28 @@
+drop database if exists ai_column_key_identity;
+create database ai_column_key_identity;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('key_identity_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('key_identity_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('key_identity_model', '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('key_identity_ep', '{"ai_model_name":"key_identity_model","url":"http://127.0.0.1:19128/v1/chat/completions","access_key":"test","provider":"openai"}');
+create table ai_column_key_identity.docs (
+id varchar(20) character set utf8mb4 collate utf8mb4_bin primary key,
+content varchar(100),
+tags json AI COLUMN (AI_COMPLETE('key_identity_model', content)) WITH (sync_mode='async')
+);
+start transaction;
+insert into ai_column_key_identity.docs(id,content) values ('a','lower'),('A','upper');
+select count(*) as distinct_business_keys from ai_column_key_identity.docs;
+distinct_business_keys
+2
+select count(*) as distinct_queue_keys from oceanbase.__all_ai_column_task
+where table_id = (select t.table_id from oceanbase.__all_table t join oceanbase.__all_database d
+on d.database_id=t.database_id where d.database_name='ai_column_key_identity' and t.table_name='docs');
+distinct_queue_keys
+2
+rollback;
+select count(*) as rolled_back_business_keys from ai_column_key_identity.docs;
+rolled_back_business_keys
+0
+drop database ai_column_key_identity;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('key_identity_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('key_identity_model');

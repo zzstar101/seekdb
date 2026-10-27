@@ -1,0 +1,11 @@
+SET SESSION enable_file_sql = ON;
+SET GLOBAL secure_file_priv = '';
+SELECT * FROM read_csv('/tmp/seekdb-file-sql-denied.csv');
+ERROR 42501: Access denied; you need (at least one of) the secure_file_priv privilege(s) for this operation
+SET GLOBAL secure_file_priv = NULL;
+SELECT * FROM read_csv('/tmp/seekdb-file-sql-denied.csv');
+ERROR 42501: Access denied; you need (at least one of) the secure_file_priv privilege(s) for this operation
+SET SESSION enable_file_sql = OFF;
+SELECT 1 AS server_survived_denied_file_access;
+server_survived_denied_file_access
+1
