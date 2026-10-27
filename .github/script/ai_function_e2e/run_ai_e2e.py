@@ -1528,6 +1528,15 @@ def main():
         except subprocess.TimeoutExpired:
             mock.kill()
         print("\n--- mock.log tail ---\n" + tail(mock_log, 60))
+        log_dir = os.path.join(args.base_dir, "log")
+        if os.path.isdir(log_dir):
+            for name in sorted(os.listdir(log_dir))[:4]:
+                path = os.path.join(log_dir, name)
+                if os.path.isfile(path):
+                    print("--- log/{} tail ---".format(name))
+                    with open(path, encoding="utf-8", errors="replace") as stream:
+                        for line in stream.readlines()[-40:]:
+                            print(line.rstrip())
         print("--- seekdb.log tail ---\n" + tail(seekdb_log, 60))
 
     if failures:

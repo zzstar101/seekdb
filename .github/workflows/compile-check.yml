@@ -152,6 +152,7 @@ jobs:
           name: ai-e2e-logs
           path: |
             ${{ runner.temp }}/ai-e2e
+            ${{ runner.temp }}/seekdb-ai-e2e/log
             /tmp/seekdb_ai_column_mock_*
           if-no-files-found: ignore
           retention-days: 7
