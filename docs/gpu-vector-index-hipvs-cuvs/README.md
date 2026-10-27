@@ -40,8 +40,8 @@ cuVS CAGRA ranks by L2 only, so a cosine index is served in three steps:
 2. **Normalize the probe.** Query vectors are unit-normalized before the GPU call.
 3. **Rescore exactly.** The returned rows are rescored with
    `1 - dot(q̂, x̂)` clamped to `[0, 2]`, so the distances seekdb returns are exact
-   cosine distances and match the VSAG path bit-for-bit at the ordering level
-   instead of inheriting any cuVS distance convention.
+   cosine distances, so the values the SQL layer sees are the same metric the
+   VSAG path reports instead of a rescaled L2 distance.
 
 Inner product stays unsupported: it is not a monotone function of L2 distance
 for unnormalized vectors, so it cannot be reduced to the same trick.
@@ -177,6 +177,9 @@ Output: `bench.jsonl` (machine readable) and `bench.md` (the summary table).
 ## Current limitations
 
 - Phase 1 supports dense float32 L2 and cosine indexes only.
+- `dbms_vector.batch_knn` is a standalone raw-vector path with no metric
+  parameter, so it stays L2-only; cosine applies to declarative `lib=cuvs`
+  indexes.
 - GPU indexes are process-local and rebuilt lazily; persistence and cache reuse
   are follow-up work.
 - The explicit batch API rebuilds its CAGRA index per call.
