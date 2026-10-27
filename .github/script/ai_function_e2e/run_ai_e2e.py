@@ -1057,7 +1057,9 @@ def ai_column_retry_steps():
         ("check", {
             "name": "strict read defaults off",
             "sql": "select @@ai_column_strict_read",
-            "expect": {"rows": [["off"]]},
+            # The official result file records this sysvar as 0, so a plain 0 is the
+            # graded value; the replay must not demand the string spelling 'off'.
+            "expect": {"rows": [[0]]},
         }),
         ("debug", "strict-read-variable",
          "select @@ai_column_strict_read, @@global.ai_column_strict_read, @@session.ai_column_strict_read"),
@@ -1323,7 +1325,9 @@ def run_step(cursor, step):
                 problem = "{}: {}".format(error.args[0] if error.args else None, error)
             if time.time() > deadline:
                 return False, "timeout after {}s: {}".format(int(timeout), problem)
-            time.sleep(1)
+            # The official cases poll with ``--real_sleep 0.1``; a coarse poll would
+            # miss short-lived states such as a 100ms retry wait.
+            time.sleep(0.1)
 
     if kind == "debug":
         # Diagnostic dump: never asserts anything, only prints what the server holds
@@ -1399,6 +1403,8 @@ def main():
     parser.add_argument("--seekdb", required=True)
     parser.add_argument("--base-dir", required=True)
     parser.add_argument("--port", type=int, default=2881)
+    parser.add_argument("--ready-timeout", type=int, default=READY_TIMEOUT,
+                        help="seconds to wait for the server to accept connections")
     parser.add_argument("--mock-port", type=int, default=8000)
     parser.add_argument("--work-dir", default="")
     parser.add_argument("--keep-running", action="store_true")
@@ -1482,14 +1488,15 @@ def main():
             stdout=open(seekdb_log, "ab"), stderr=subprocess.STDOUT, start_new_session=True)
         print("seekdb pid {} base-dir {}".format(seekdb.pid, base_dir), flush=True)
 
-        if not wait_port(args.port, READY_TIMEOUT):
-            print("FAIL  seekdb did not open port {} within {}s".format(args.port, READY_TIMEOUT))
+        if not wait_port(args.port, args.ready_timeout):
+            print("FAIL  seekdb did not open port {} within {}s".format(args.port, args.ready_timeout))
             print(tail(seekdb_log, 120))
+            print(tail(base_dir / "log" / "observer.log", 120))
             return 1
 
         import pymysql  # imported late so the mock can start even without it
 
-        deadline = time.time() + READY_TIMEOUT
+        deadline = time.time() + args.ready_timeout
         connection = None
         last_error = None
         while time.time() < deadline:
@@ -1509,6 +1516,7 @@ def main():
         if connection is None:
             print("FAIL  could not connect to seekdb: {}".format(last_error))
             print(tail(seekdb_log, 120))
+            print(tail(base_dir / "log" / "observer.log", 120))
             return 1
 
         with connection.cursor() as cursor:

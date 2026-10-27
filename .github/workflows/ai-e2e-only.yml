@@ -77,6 +77,28 @@ jobs:
           set -euo pipefail
           python3 -m pip install --disable-pip-version-check pymysql cryptography
 
+      - name: Diagnose the reused binary
+        shell: bash
+        run: |
+          set -uo pipefail
+          for lib_dir in \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib" \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib64"; do
+            [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+          ls -l build_release/src/observer/
+          ldd "$SEEKDB_BINARY_PATH" 2>&1 | head -40 || true
+          rm -rf /tmp/smoke
+          mkdir -p /tmp/smoke
+          set +e
+          timeout 240 "$SEEKDB_BINARY_PATH" --base-dir=/tmp/smoke --port=2882 --nodaemon \
+            > /tmp/smoke/out.log 2>&1
+          echo "smoke exit: $?"
+          set -e
+          tail -40 /tmp/smoke/out.log || true
+          ls -l /tmp/smoke/log 2>/dev/null || echo "no log dir"
+          tail -60 /tmp/smoke/log/observer.log 2>/dev/null || true
+
       - name: Replay the official cases
         shell: bash
         run: |
@@ -90,6 +112,7 @@ jobs:
             --seekdb "$SEEKDB_BINARY_PATH" \
             --base-dir "$RUNNER_TEMP/seekdb-ai-e2e" \
             --port 2881 \
+            --ready-timeout 300 \
             --mock-port 8000 \
             --work-dir "$RUNNER_TEMP/ai-e2e" \
             --repo-root "$GITHUB_WORKSPACE" \
@@ -103,5 +126,6 @@ jobs:
           path: |
             ${{ runner.temp }}/ai-e2e
             /tmp/seekdb_ai_column_mock_*
+            /tmp/smoke
           if-no-files-found: ignore
           retention-days: 7
