@@ -28,10 +28,10 @@
 # prompt, with no retry.
 
 connection default;
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py start 19126
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py start 19126
 # The hold is capped, so a broken release path makes the oracle below fail
 # loudly instead of hanging the test.
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py set_hold_timeout 19126 60000
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py set_hold_timeout 19126 60000
 --disable_warnings
 drop database if exists ai_column_partial_refresh;
 --enable_warnings
@@ -50,11 +50,11 @@ set session ai_column_strict_read = off;
 
 # --- scenario 1: the in-flight column is the one that gets updated -----------
 
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py mark 19126 group1_armed
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py arm 19126 A:a0
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py mark 19126 group1_armed
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py arm 19126 A:a0
 insert into ai_column_partial_refresh.docs(id, a_src, b_src) values (1, 'a0', 'b0');
 select a_out is null and b_out is null as group1_starts_hidden from ai_column_partial_refresh.docs where id = 1;
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py await 19126 A:a0 started 1 30000
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py await 19126 A:a0 started 1 30000
 
 # The group is one request with two tasks, and the held column is the one the
 # worker is executing right now: its task row is already claimed (state 2).
@@ -115,8 +115,8 @@ select a_out is null and b_out is null as group1_still_hidden_after_update from 
 # Release the stale model request of a_out.  Its row lock was already replaced
 # by the new request, so its result must be dropped, while the result of b_out
 # was staged for the original request and still has to be published.
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py mark 19126 group1_after_update
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py release 19126 A:a0
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py mark 19126 group1_after_update
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py release 19126 A:a0
 let $retry = 400;
 let $converged = 0;
 while ($retry)
@@ -139,15 +139,15 @@ eval select $converged = 1 as group1_converged;
 select ifnull(a_out, '<unset>') as group1_a_out, ifnull(b_out, '<unset>') as group1_b_out from ai_column_partial_refresh.docs where id = 1;
 select ifnull(a_out = 'mock:A:a0', 0) as group1_stale_result_never_published, ifnull(b_out = 'mock:B:b0', 0) as group1_untouched_result_published from ai_column_partial_refresh.docs where id = 1;
 select count(*) = 0 as group1_tasks_removed from oceanbase.__all_ai_column_task task join oceanbase.__all_table t on t.table_id = task.table_id join oceanbase.__all_database d on d.database_id = t.database_id where d.database_name = 'ai_column_partial_refresh' and t.table_name = 'docs';
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py assert 19126 partial-refresh-scenario1
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py assert 19126 partial-refresh-scenario1
 
 # --- scenario 2: mirrored, the in-flight column is the untouched one --------
 
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py mark 19126 group2_armed
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py arm 19126 B:b2
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py mark 19126 group2_armed
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py arm 19126 B:b2
 insert into ai_column_partial_refresh.docs(id, a_src, b_src) values (2, 'a2', 'b2');
 select a_out is null and b_out is null as group2_starts_hidden from ai_column_partial_refresh.docs where id = 2;
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py await 19126 B:b2 started 1 30000
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py await 19126 B:b2 started 1 30000
 let $retry = 400;
 let $inflight2 = 0;
 while ($retry)
@@ -200,8 +200,8 @@ while ($retry)
 }
 eval select $requeued2 = 1 as only_the_updated_column_is_requeued_in_group2;
 select a_out is null and b_out is null as group2_still_hidden_after_update from ai_column_partial_refresh.docs where id = 2;
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py mark 19126 group2_after_update
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py release 19126 B:b2
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py mark 19126 group2_after_update
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py release 19126 B:b2
 let $retry = 400;
 let $converged2 = 0;
 while ($retry)
@@ -222,11 +222,11 @@ eval select $converged2 = 1 as group2_converged;
 select ifnull(a_out, '<unset>') as group2_a_out, ifnull(b_out, '<unset>') as group2_b_out from ai_column_partial_refresh.docs where id = 2;
 select ifnull(b_out = 'mock:B:b2', 0) as group2_stale_result_never_published, ifnull(a_out = 'mock:A:a2', 0) as group2_untouched_result_published from ai_column_partial_refresh.docs where id = 2;
 select count(*) = 0 as group2_tasks_removed from oceanbase.__all_ai_column_task task join oceanbase.__all_table t on t.table_id = task.table_id join oceanbase.__all_database d on d.database_id = t.database_id where d.database_name = 'ai_column_partial_refresh' and t.table_name = 'docs';
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py assert 19126 partial-refresh-scenario2
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py assert 19126 partial-refresh-requests
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py assert 19126 partial-refresh-scenario2
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py assert 19126 partial-refresh-requests
 
 drop table ai_column_partial_refresh.docs;
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('partial_refresh_ep');
 call DBMS_AI_SERVICE.DROP_AI_MODEL('partial_refresh_model');
 drop database ai_column_partial_refresh;
---exec python3 mysql_test/test_suite/ai_column/include/ai_column_barrier_mock.py stop 19126
+--exec python3 mysql_test/test_suite/ai_column_ext/include/ai_column_barrier_mock.py stop 19126
