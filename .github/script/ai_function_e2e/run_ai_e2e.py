@@ -778,14 +778,14 @@ def ai_column_worker_steps():
         ("sql", "insert into {}.retry_docs(id, content) values(2, 'retry-once')".format(db)),
         ("wait", {
             "name": "retry state committed",
-            "interval": 0.05,
+            "interval": 0.1,
             "sql": ("select count(*) > 0 from oceanbase.__all_ai_column_task task "
                     "join oceanbase.__all_table t on t.table_id = task.table_id "
                     "join oceanbase.__all_database d on d.database_id = t.database_id "
                     "where d.database_name = '{}' and t.table_name = 'retry_docs' "
                     "and task.state = 3 and task.retry_count = 1").format(db),
             "expect": {"rows": [[1]]},
-            "timeout": 15,
+            "timeout": 10,
         }),
         ("wait", {
             "name": "retry eventually completes",
@@ -1053,8 +1053,8 @@ def ai_column_retry_steps():
         }),
         ("check", {
             "name": "strict read defaults off",
-            "sql": "select @@ai_column_strict_read = 0",
-            "expect": {"rows": [[1]]},
+            "sql": "select @@ai_column_strict_read",
+            "expect": {"rows": [["0"]], "raw": True},
         }),
 
         # ---- a business predicate retries exactly the selected rows ----
@@ -1231,13 +1231,20 @@ def normalise(value):
         return text
 
 
-def compare_rows(actual, expected, lenient_null=False):
+def compare_rows(actual, expected, lenient_null=False, raw=False):
     if len(actual) != len(expected):
         return "row count {} != expected {}".format(len(actual), expected)
     for index, (got, want) in enumerate(zip(actual, expected)):
         if len(got) != len(want):
             return "row {} has {} columns, expected {}".format(index, len(got), len(want))
         for column, (got_value, want_value) in enumerate(zip(got, want)):
+            if raw:
+                got_text = "NULL" if got_value is None else str(got_value)
+                want_text = "NULL" if want_value is None else str(want_value)
+                if got_text != want_text:
+                    return "row {} column {} = {!r}, expected {!r}".format(
+                        index, column, got_text, want_text)
+                continue
             got_normalised = normalise(got_value)
             if want_value is None:
                 if got_normalised is not None and not (lenient_null and got_normalised == "NULL"):
@@ -1311,7 +1318,8 @@ def run_step(cursor, step):
                         return True, None
                 else:
                     problem = compare_rows(rows, payload["expect"]["rows"],
-                                           payload["expect"].get("lenient_null", False))
+                                           payload["expect"].get("lenient_null", False),
+                                           payload["expect"].get("raw", False))
                     if problem is None:
                         return True, None
             except Exception as error:  # noqa: BLE001 - keep polling on transient errors
@@ -1368,7 +1376,8 @@ def run_step(cursor, step):
                 json.dumps(expect["json"], ensure_ascii=False, sort_keys=True))
         return True, None
 
-    problem = compare_rows(rows, expect["rows"], expect.get("lenient_null", False))
+    problem = compare_rows(rows, expect["rows"], expect.get("lenient_null", False),
+                           expect.get("raw", False))
     return (problem is None), problem
 
 
