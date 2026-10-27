@@ -55,7 +55,7 @@ int ObSystemPackageLoadTask::start(common::ObTimer &timer)
   } else {
     if (timer.task_exist(*this)) {
       // ignore duplicate schedule
-    } else if (OB_FAIL(timer.schedule(*this, SCHEDULE_INTERVAL_US, did_repeat))) {
+    } else if (OB_FAIL(timer.schedule(*this, SCHEDULE_INTERVAL_US, did_repeat, true/*immediate*/))) {
     } else {
       LOG_INFO("finish schedule timer task", K(SCHEDULE_INTERVAL_US));
     }
@@ -86,12 +86,16 @@ int ObSystemPackageLoadTask::load_system_package_()
   ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
   int64_t job_id = OB_INVALID_ID;
   int64_t job_count = 0;
+  bool need_load = false;
   if (OB_ISNULL(sql_proxy)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(GET_ADMIN_JOB_COUNT(LOAD_MYSQL_SYS_PACKAGE, job_count))) {
   } else if (0 == job_count) {
-    // job not exists, try insert inprogress job
+    // A fresh catalog must load in this invocation. Waiting for another timer
+    // tick consumes the first CALL's query timeout without doing any work.
     if (OB_FAIL(ADMIN_JOB_CREATE_WITH_RET(job_id, JOB_TYPE_LOAD_MYSQL_SYS_PACKAGE))) {
+    } else {
+      need_load = true;
     }
   } else if (OB_FAIL(ADMIN_JOB_FIND(LOAD_MYSQL_SYS_PACKAGE, job_id))) {
     if (ret == OB_ENTRY_NOT_EXIST) {
@@ -100,12 +104,17 @@ int ObSystemPackageLoadTask::load_system_package_()
       LOG_INFO("find a success job or job_id not exist", KR(ret), K(job_id));
     } else {
     }
-  } else if (OB_FAIL(pl::ObPLPackageManager::load_all_common_sys_package(
-                         *sql_proxy,
-                         false/*from_file*/))) {
-  } else if (OB_FAIL(ADMIN_JOB_COMPLETE(job_id, 0/*result_code*/))) {
   } else {
-    GCTX.sys_package_ready_ = true;
+    need_load = true;
+  }
+  if (OB_SUCC(ret) && need_load) {
+    if (OB_FAIL(pl::ObPLPackageManager::load_all_common_sys_package(
+                           *sql_proxy,
+                           false/*from_file*/))) {
+    } else if (OB_FAIL(ADMIN_JOB_COMPLETE(job_id, 0/*result_code*/))) {
+    } else {
+      GCTX.sys_package_ready_ = true;
+    }
   }
   return ret;
 }
@@ -135,23 +144,15 @@ int ObSystemPackageLoadTask::wait_system_package_ready(const common::ObTimeoutCt
 {
   int ret = OB_SUCCESS;
   const int64_t retry_interval_us = 500l * 1000l;
-  int64_t job_id = OB_INVALID_ID;
-  bool finish = false;
-  int64_t inprogress_job_count = 0;
-  while (OB_SUCC(ret) && !finish) {
-    int tmp_ret = OB_SUCCESS;
+  // No in-progress job is not proof of readiness: before the loader's first
+  // invocation there is no job at all. Only the loader publishes readiness,
+  // after successful loading/completion or finding a completed job on restart.
+  // Read-only servers do not run the loader and must not wait for catalog writes.
+  while (OB_SUCC(ret) && share::server_is_write_enabled() && !GCTX.sys_package_ready_) {
     if (ctx.is_timeouted()) {
       ret = OB_TIMEOUT;
     } else {
-      inprogress_job_count = 0;
-      if (OB_ENTRY_NOT_EXIST != (tmp_ret = ADMIN_JOB_FIND(LOAD_MYSQL_SYS_PACKAGE, job_id))) {
-        inprogress_job_count++;
-      }
-      if (inprogress_job_count == 0) {
-        finish = true;
-      } else {
-        ob_usleep(retry_interval_us);
-      }
+      ob_usleep(retry_interval_us);
     }
   }
   return ret;
