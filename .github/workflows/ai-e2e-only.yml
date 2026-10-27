@@ -88,6 +88,9 @@ jobs:
           done
           ls -l build_release/src/observer/
           ldd "$SEEKDB_BINARY_PATH" 2>&1 | head -40 || true
+          free -g || true
+          df -h /tmp || true
+          ulimit -a || true
           rm -rf /tmp/smoke
           mkdir -p /tmp/smoke
           set +e
@@ -98,6 +101,17 @@ jobs:
           tail -40 /tmp/smoke/out.log || true
           ls -l /tmp/smoke/log 2>/dev/null || echo "no log dir"
           tail -60 /tmp/smoke/log/observer.log 2>/dev/null || true
+          set +e
+          command -v strace || sudo apt-get install -y -q strace >/dev/null 2>&1
+          rm -rf /tmp/smoke2
+          mkdir -p /tmp/smoke2
+          timeout 120 strace -f -e trace=openat,write,exit_group -o /tmp/smoke2/st.log \
+            "$SEEKDB_BINARY_PATH" --base-dir=/tmp/smoke2 --port=2883 --nodaemon \
+            > /tmp/smoke2/out.log 2>&1
+          echo "strace exit: $?"
+          grep -E 'ENOENT|EACCES|EPERM|exit_group' /tmp/smoke2/st.log 2>/dev/null | tail -30 || true
+          sudo dmesg 2>/dev/null | tail -20 || true
+          set -e
 
       - name: Replay the official cases
         shell: bash
@@ -127,5 +141,6 @@ jobs:
             ${{ runner.temp }}/ai-e2e
             /tmp/seekdb_ai_column_mock_*
             /tmp/smoke
+            /tmp/smoke2
           if-no-files-found: ignore
           retention-days: 7
