@@ -2,6 +2,16 @@ set @rank = ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]');
 select json_extract(@rank, '$[*].index') as ranked_indices;
 ranked_indices
 [0, 2, 3, 1]
+set @null_key_rank = ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]', null);
+select json_length(@null_key_rank) as count,
+json_extract(@null_key_rank, '$[*].index') as ranked_indices,
+cast(@null_key_rank as char) = cast(@rank as char) as same_as_omitted_key;
+count	ranked_indices	same_as_omitted_key
+4	[0, 2, 3, 1]	1
+select cast(ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]', cast(null as char)) as char)
+= cast(@rank as char) as typed_null_key_matches_omitted;
+typed_null_key_matches_omitted
+1
 select ai_rerank('rerank_reg', 'query', '[{"id":"first", "text":"aaaa"},{"id":72,"text":"b"},{"id":"last","text":"cccc"}]', 'text') as ranked_objects;
 ranked_objects
 [{"id": "first", "text": "aaaa", "_model_score": 4.0}, {"id": "last", "text": "cccc", "_model_score": 4.0}, {"id": 72, "text": "b", "_model_score": 1.0}]

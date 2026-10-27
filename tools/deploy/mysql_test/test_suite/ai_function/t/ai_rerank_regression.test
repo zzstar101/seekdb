@@ -16,6 +16,13 @@ if (!$indices)
 {
   --die rerank must sort scores descending and ties by original index
 }
+# Explicit SQL NULL is the same string-array overload as an omitted doc_key.
+set @null_key_rank = ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]', null);
+select json_length(@null_key_rank) as count,
+       json_extract(@null_key_rank, '$[*].index') as ranked_indices,
+       cast(@null_key_rank as char) = cast(@rank as char) as same_as_omitted_key;
+select cast(ai_rerank('rerank_reg', 'query', '["aaaa", "b", "cccc", "ddd"]', cast(null as char)) as char)
+       = cast(@rank as char) as typed_null_key_matches_omitted;
 select ai_rerank('rerank_reg', 'query', '[{"id":"first", "text":"aaaa"},{"id":72,"text":"b"},{"id":"last","text":"cccc"}]', 'text') as ranked_objects;
 --disable_query_log
 set @strings = json_array();
