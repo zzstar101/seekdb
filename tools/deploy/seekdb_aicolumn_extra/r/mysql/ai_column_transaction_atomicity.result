@@ -3,7 +3,7 @@ create database ai_column_atomicity;
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('atomicity_ep');
 call DBMS_AI_SERVICE.DROP_AI_MODEL('atomicity_model');
 call DBMS_AI_SERVICE.CREATE_AI_MODEL('atomicity_model', '{"type":"completion","model_name":"mock-complete"}');
-call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('atomicity_ep', '{"ai_model_name":"atomicity_model","url":"http://127.0.0.1:19121/v1/chat/completions","access_key":"test","provider":"openai"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('atomicity_ep', '{"ai_model_name":"atomicity_model","url":"http://127.0.0.1:19140/v1/chat/completions","access_key":"test","provider":"openai"}');
 create table ai_column_atomicity.docs (
 id bigint primary key,
 content varchar(100),
