@@ -1,0 +1,195 @@
+name: FTS large bench (fork)
+
+# Measure tools/benchmark/fts_large_bench.sh on a fork runner, so an
+# optimisation can be judged against a *pristine* build measured on the same
+# machine class instead of against the numbers in FTS_OPTIMIZATION_REPORT.md
+# (that report was taken on a local machine 5-8x faster than the VLDB CI whose
+# averages form fts_large_bench_baseline.json).
+#
+# Two dispatch runs -- one on the pristine ref, one on the candidate -- give the
+# A/B pairs. Every run repeats the whole benchmark with a fresh server and
+# reports mean/min/max per metric, because a single wall-clock sample on a
+# shared runner is noisy (the report measured 19%-62% spread on query metrics).
+#
+# fts_large_bench_score.py is still run, but only for reference: it scores
+# against the upstream CI baseline, so its absolute score is meaningless here.
+# Compare the measured values of two runs of this workflow instead.
+
+on:
+  push:
+    branches:
+      - 'ci/fts-bench'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build and bench (empty = the dispatched ref)'
+        required: false
+        type: string
+      repeats:
+        description: 'How many times to run the whole benchmark (each with a fresh server)'
+        required: false
+        default: '3'
+        type: choice
+        options: ['1', '2', '3', '4', '5']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fts-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: Release build + fts_large_bench
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    env:
+      BENCH_REPEATS: ${{ github.event_name == 'workflow_dispatch' && inputs.repeats || '3' }}
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Install build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y \
+            git wget rpm rpm2cpio cpio make build-essential binutils \
+            m4 libtool-bin libncurses5 python3 python3-pip
+          # The benchmark drives the server through the mysql CLI.
+          sudo apt-get install -y default-mysql-client \
+            || sudo apt-get install -y mysql-client
+
+      - name: Record runner shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Runner"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| ref | \`${{ inputs.ref || github.ref }}\` |"
+            echo "| head sha | \`$(git rev-parse HEAD)\` |"
+            echo "| nproc | $(nproc) |"
+            echo "| memory | $(awk '/MemTotal/ {printf \"%.1f GiB\", $2/1024/1024}' /proc/meminfo) |"
+            echo "| mysql client | $(mysql --version 2>/dev/null || echo missing) |"
+            echo "| repeats | ${BENCH_REPEATS} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache third-party deps
+        uses: actions/cache@v4
+        with:
+          key: deps-el9-x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+          path: deps/3rd
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Initialize release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build.sh release --init
+          echo "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build_release
+          make -j"$(nproc)"
+
+      - name: Assert binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l build_release/src/observer/seekdb build_release/src/observer/observer
+
+      - name: Run fts_large_bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lib_dir in \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib" \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib64"; do
+            [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+
+          SERVER="$GITHUB_WORKSPACE/build_release/src/observer/seekdb"
+          OUT="$RUNNER_TEMP/fts-bench"
+          mkdir -p "$OUT"
+
+          export MYSQL="mysql -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4"
+          export MYSQL_VERBOSE="mysql -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4"
+
+          for i in $(seq 1 "${BENCH_REPEATS}"); do
+            base="$OUT/db-$i"
+            rm -rf "$base"
+            mkdir -p "$base"
+
+            # A fresh server per repeat: the build metrics must not reuse a warm
+            # buffer pool, and the query metrics are taken after the warmup the
+            # benchmark script performs itself.
+            "$SERVER" --base-dir="$base" --port=2881 --nodaemon \
+              > "$OUT/server-$i.log" 2>&1 &
+            server_pid=$!
+            echo "$server_pid" > "$OUT/server-$i.pid"
+
+            python3 .github/script/fts_bench/wait_for_port.py --port 2881 --timeout 900
+
+            echo "::group::bench repeat $i"
+            LABEL="run-$i" OUTPUT="$OUT/run-$i.txt" \
+              bash tools/benchmark/fts_large_bench.sh | tee "$OUT/run-$i.stdout.txt"
+            echo "::endgroup::"
+
+            echo "::group::score repeat $i (upstream-CI baseline, reference only)"
+            python3 tools/benchmark/fts_large_bench_score.py "$OUT/run-$i.txt" \
+              --allow-config-mismatch --json > "$OUT/score-$i.json" || true
+            cat "$OUT/score-$i.json"
+            echo "::endgroup::"
+
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+            cp -r "$base/log" "$OUT/log-$i" 2>/dev/null || true
+          done
+
+      - name: Summarise metrics across repeats
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/script/fts_bench/summarise_metrics.py \
+            "$RUNNER_TEMP/fts-bench" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-bench-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/fts-bench
+          if-no-files-found: warn
+          retention-days: 14
