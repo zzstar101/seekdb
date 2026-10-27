@@ -55,6 +55,7 @@ ob_define(OB_BUILD_SYS_VEC_IDX ON)
 # [hipVS/cuVS] optional GPU vector-index backend (AMD gfx1100 via hipVS/cuVS); OFF by default.
 ob_define(OB_BUILD_CUVS OFF)
 ob_define(CUVS_BRIDGE_LIB "")
+ob_define(OB_BUILD_CUVS_FROM_SOURCE ON)
 ob_define(OB_BUILD_CUVS_TRACE OFF)  # developer-only obvsag call-chain tracer
 
 if(WIN32)

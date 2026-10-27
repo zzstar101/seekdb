@@ -1,9 +1,11 @@
 # hipVS/cuVS GPU vector backend
 
-Status: **Phase 1 implemented and review-gated** on AMD `gfx1100` with ROCm
-7.2.4. This directory documents the current integration and its reproducible
-validation assets. Historical feasibility experiments remain available in Git
-history rather than in the product-facing tree.
+The frozen contest baseline documents Phase 1 validation on AMD `gfx1100` with
+ROCm 7.2.4. The candidate changes add source-built bridge integration, reusable
+query workspace and reusable large-stack workers. These changes have host-side
+contract tests; **candidate ROCm compilation, GPU correctness and performance
+are still unverified**. See [the candidate report](CONTEST_OPTIMIZATION.md) for
+the exact scope and reproducible test procedure.
 
 ## Scope
 
@@ -34,11 +36,10 @@ The product integration lives in:
 
 seekdb links a small C ABI bridge instead of importing hipVS/cuVS C++ types into
 the server. The maintained bridge source and build entry point are under
-[`tools/hipvs_bridge`](../../tools/hipvs_bridge/):
-
-```bash
-tools/hipvs_bridge/build.sh /work/bridge/libseekdb_cuvs_bridge.so
-```
+[`tools/hipvs_bridge`](../../tools/hipvs_bridge/). GPU builds now compile that
+source into a PIC static archive and link it into seekdb. The hipVS C library
+and HIP runtime remain shared dependencies. An older bridge `.so` in
+`LD_LIBRARY_PATH` therefore cannot silently replace the candidate wrapper.
 
 The bridge exports:
 
@@ -49,15 +50,38 @@ seekdb_cuvs_free
 seekdb_cuvs_cagra_knn
 ```
 
-Build seekdb with the resulting library:
+Build seekdb from the candidate sources (requires the hipVS development headers,
+`libcuvs_c.so`, ROCm `hipcc` and `libamdhip64.so`):
 
 ```bash
+export HIPVS_ROOT=/opt/hipvs
+export ROCM_ROOT=/opt/rocm
 ./build.sh release \
   -DOB_BUILD_CUVS=ON \
+  -DOB_BUILD_CUVS_FROM_SOURCE=ON \
   -DOB_BUILD_CUVS_TRACE=OFF \
-  -DCUVS_BRIDGE_LIB=/work/bridge/libseekdb_cuvs_bridge.so \
-  --make -j64
+  --make -j"$(nproc)"
 ```
+
+The paths may also be set using `-DCUVS_HIPVS_ROOT=...`,
+`-DCUVS_ROCM_ROOT=...` and `-DCUVS_HIPCC=...`. Source mode is the default when
+`OB_BUILD_CUVS=ON`; an existing `CUVS_BRIDGE_LIB` argument is ignored in that mode.
+The archive is generated at
+`build_release/hipvs_bridge/libseekdb_cuvs_bridge_source.a`.
+
+For compatibility with the frozen baseline's external-wrapper workflow:
+
+```bash
+tools/hipvs_bridge/build.sh /work/bridge/libseekdb_cuvs_bridge.so
+./build.sh release \
+  -DOB_BUILD_CUVS=ON \
+  -DOB_BUILD_CUVS_FROM_SOURCE=OFF \
+  -DCUVS_BRIDGE_LIB=/work/bridge/libseekdb_cuvs_bridge.so \
+  -DOB_BUILD_CUVS_TRACE=OFF \
+  --make -j"$(nproc)"
+```
+
+Do not use a pre-existing wrapper to evaluate candidate source changes.
 
 For a CPU-only build, leave the defaults or pass:
 
@@ -100,15 +124,21 @@ The self-contained GPU smoke runner generates deterministic vectors and ground
 truth; it does not use private `/work/datasets` or `/work/bench` assets:
 
 ```bash
-LD_LIBRARY_PATH=/work/bridge:/opt/hipvs/lib:/opt/rocm/lib \
+HIPVS_ROOT=/opt/hipvs ROCM_ROOT=/opt/rocm \
   docs/gpu-vector-index-hipvs-cuvs/validation/run_gpu_smoke.sh \
     --observer /path/to/trace-build/seekdb \
-    --bridge /work/bridge/libseekdb_cuvs_bridge.so \
     --base-dir /tmp/seekdb-cuvs-smoke \
     --port 2981 \
     --render /dev/dri/renderD135 \
     --evidence /tmp/seekdb-cuvs-evidence
 ```
+
+Build this validation binary with `-DOB_BUILD_CUVS_TRACE=ON`. For the frozen
+baseline or explicit external-wrapper mode, also pass
+`--bridge /path/to/libseekdb_cuvs_bridge.so`. Use a separate trace-disabled
+release build for timing; the smoke runner is a correctness check, not the
+contest performance harness. Choose disposable smoke directories because the
+runner recreates its own `main`, `no-gpu` and generated data subdirectories.
 
 The runner validates:
 
@@ -125,6 +155,9 @@ Results for a specific candidate belong in that pull request's description or a
 validation comment rather than in the source tree.
 The no-GPU DDL contract remains covered by
 [`vector_index_cuvs_ddl.test`](../../tools/deploy/mysql_test/test_suite/vector_index/t/vector_index_cuvs_ddl.test).
+
+Host-side contract tests, which do not require ROCm or a GPU, are documented in
+[`tools/hipvs_bridge/tests/README.md`](../../tools/hipvs_bridge/tests/README.md).
 
 ## Current limitations
 

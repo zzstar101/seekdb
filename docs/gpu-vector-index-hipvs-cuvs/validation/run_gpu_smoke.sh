@@ -5,8 +5,11 @@ set -Eeuo pipefail
 usage()
 {
   cat <<'EOF'
-Usage: run_gpu_smoke.sh --observer PATH --bridge PATH --base-dir PATH --port PORT
+Usage: run_gpu_smoke.sh --observer PATH [--bridge PATH] --base-dir PATH --port PORT
                         --render PATH --evidence PATH
+
+Omit --bridge for a source-built static wrapper. HIPVS_ROOT and ROCM_ROOT
+select the backend runtime directories (defaults: /opt/hipvs and /opt/rocm).
 EOF
 }
 
@@ -30,7 +33,10 @@ while (($# > 0)); do
 done
 
 [[ -x "$OBSERVER" ]] || { echo "observer is not executable: $OBSERVER" >&2; exit 2; }
-[[ -f "$BRIDGE" ]] || { echo "bridge does not exist: $BRIDGE" >&2; exit 2; }
+if [[ -n "$BRIDGE" && ! -f "$BRIDGE" ]]; then
+  echo "bridge does not exist: $BRIDGE" >&2
+  exit 2
+fi
 [[ -c /dev/kfd ]] || { echo "/dev/kfd is unavailable" >&2; exit 2; }
 [[ -c "$RENDER" ]] || { echo "render node is unavailable: $RENDER" >&2; exit 2; }
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "invalid port: $PORT" >&2; exit 2; }
@@ -39,6 +45,16 @@ done
 command -v mysql >/dev/null
 command -v python3 >/dev/null
 command -v timeout >/dev/null
+
+HIPVS_ROOT=${HIPVS_ROOT:-/opt/hipvs}
+ROCM_ROOT=${ROCM_ROOT:-/opt/rocm}
+BACKEND_LIBRARY_PATH="$HIPVS_ROOT/lib:$HIPVS_ROOT/lib64:$ROCM_ROOT/lib:$ROCM_ROOT/lib64"
+if [[ -n "$BRIDGE" ]]; then
+  BACKEND_LIBRARY_PATH="$(dirname "$BRIDGE"):$BACKEND_LIBRARY_PATH"
+fi
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  BACKEND_LIBRARY_PATH="$BACKEND_LIBRARY_PATH:$LD_LIBRARY_PATH"
+fi
 
 MAIN_DIR=$BASE_DIR/main
 NO_GPU_DIR=$BASE_DIR/no-gpu
@@ -174,7 +190,7 @@ start_observer()
   local hide_gpu=$5
   local pid_var=$6
   local -a env_args=(
-    "LD_LIBRARY_PATH=$(dirname "$BRIDGE"):/opt/hipvs/lib:/opt/rocm/lib"
+    "LD_LIBRARY_PATH=$BACKEND_LIBRARY_PATH"
     "OB_VSAG_TRACE=1"
     "OB_VSAG_TRACE_FILE=$trace"
   )

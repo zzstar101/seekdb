@@ -88,10 +88,12 @@ else()
       libantlr4-runtime.a
       libantlr4-autogen.a
       libfmt.a)
-    # [hipVS/cuVS] optional GPU vector-index backend bridge
-    # enable: -DOB_BUILD_CUVS=ON -DCUVS_BRIDGE_LIB=/path/to/libseekdb_cuvs_bridge.so
-    if (OB_BUILD_CUVS AND EXISTS "${CUVS_BRIDGE_LIB}")
-      target_link_libraries(oblib_lib PUBLIC ${CUVS_BRIDGE_LIB})
+    # Build the optional bridge from this checkout, including when an existing
+    # contest build command still supplies CUVS_BRIDGE_LIB.  CPU builds do not
+    # discover or link any HIP dependencies.
+    if(OB_BUILD_CUVS)
+      include(${CMAKE_SOURCE_DIR}/cmake/Cuvs.cmake)
+      seekdb_link_cuvs_bridge(oblib_lib)
     endif()
   elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     target_link_libraries(oblib_lib PUBLIC

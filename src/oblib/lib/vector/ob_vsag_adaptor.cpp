@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <pthread.h>
+#ifdef OB_BUILD_CUVS
+#include "ob_cuvs_worker.h"
+#endif
 #include "vsag/vsag.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
@@ -68,6 +70,18 @@ using namespace vsag;
 // runs seekdb's real vector-adaptor data path on the GPU. PoC: single writer per
 // index, results allocated with the handle's allocator (drop-in with VSAG path).
 namespace {
+static int ob_cuvs_run_job(void *(*job)(void *), void *arg)
+{
+#ifdef OB_BUILD_CUVS
+  static detail::CuvsWorkerCache workers;
+  return workers.run(job, arg);
+#else
+  (void)job;
+  (void)arg;
+  return -1;
+#endif
+}
+
 struct ObCuvsEntry {
   void *bridge_ = nullptr;      // opaque handle from seekdb_cuvs_build
   int dim_ = 0;
@@ -157,16 +171,21 @@ struct ObCuvsJob {
   bool need_build; std::vector<unsigned> *off; std::vector<float> *dst;
   int rc_; bool built_;
 };
-// Runs on a dedicated large-stack pthread: cuVS CAGRA build/search overflow the
+// Runs on a reusable large-stack pthread: cuVS CAGRA build/search overflow the
 // small (~1.5MB) OB worker-thread stack.
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
   if (j->need_build) {
+    // Allocate the new mapping before replacing the live graph. A failed copy
+    // must leave the old graph, mapping and generation together for fallback.
+    std::vector<int64_t> build_ids(j->ent->buf_ids_);
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
     if (nb != nullptr) {
       if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
-      j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
+      j->ent->bridge_ = nb;
+      j->ent->ids_.swap(build_ids);
+      j->ent->built_n_ = j->n;
       j->built_ = true;
     }
   }
@@ -182,7 +201,7 @@ static void *ob_cuvs_job(void *arg) {
 }
 
 // [BATCH] Feed nq probe vectors to ONE cuVS call (nq>1). Same large-stack
-// pthread pattern as the single-query path (cuVS overflows the OB worker stack).
+// worker cache as the single-query path (cuVS overflows the OB worker stack).
 struct ObCuvsBatchJob {
   ObCuvsEntry *ent; const float *queries; long nq; long topk; size_t n;
   bool need_build; unsigned *off; float *dst; long served_; bool built_;
@@ -190,11 +209,14 @@ struct ObCuvsBatchJob {
 static void *ob_cuvs_batch_job(void *arg) {
   ObCuvsBatchJob *j = static_cast<ObCuvsBatchJob *>(arg);
   if (j->need_build) {
+    std::vector<int64_t> build_ids(j->ent->buf_ids_);
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->ent->dim_));
     if (nb != nullptr) {
       if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
-      j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
+      j->ent->bridge_ = nb;
+      j->ent->ids_.swap(build_ids);
+      j->ent->built_n_ = j->n;
       j->built_ = true;
     }
   }
@@ -206,7 +228,7 @@ static void *ob_cuvs_batch_job(void *arg) {
 }
 
 // [BATCH one-shot] Build a CAGRA over raw base + batch-search nq queries + free,
-// all on a 32MB-stack pthread (cuVS overflows the small PL/worker stack). Used by
+// all on a reusable 32MB-stack pthread (cuVS overflows the small PL/worker stack). Used by
 // dbms_vector.batch_knn, which reads vectors from SQL (no add_index registry).
 struct ObCuvsRawBatchJob {
   const float *base; long n; long dim; const float *query; long nq; long topk;
@@ -237,17 +259,14 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   ObCuvsEntry *ent = it->second;
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
-  // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
+  // a reusable 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
   const size_t n = ent->buf_ids_.size();
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  if (ob_cuvs_run_job(ob_cuvs_job, &job) != 0) { return false; }
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
@@ -1755,10 +1774,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
   std::vector<float> dst(static_cast<size_t>(nq) * topk);
   ObCuvsBatchJob job{ent, queries, nq, topk, n, need_build,
                      off.data(), dst.data(), 0, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  if (ob_cuvs_run_job(ob_cuvs_batch_job, &job) != 0) { return 0; }
   if (job.built_) { ob_vsag_trace("cuvs_batch_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (job.served_ != nq) { return 0; }
   for (long q = 0; q < nq; ++q) {
@@ -1776,7 +1792,7 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
 // [hipVS/cuVS] One-shot RAW batch ANN for dbms_vector.batch_knn: build CAGRA over
 // base (n x dim, row-major f32), batch-search nq queries in ONE GPU call, free.
 // out_ids/out_dist are caller-allocated [nq*topk]; out_ids get cuVS ROW OFFSETS
-// (0..n-1). Runs on a 32MB pthread. Returns nq on success, 0 on failure/disabled.
+// (0..n-1). Runs on a reusable 32MB pthread. Returns nq on success, 0 on failure/disabled.
 long cuvs_batch_knn(const float *base, long n, long dim,
                     const float *query, long nq, long topk,
                     unsigned int *out_ids, float *out_dist)
@@ -1785,10 +1801,7 @@ long cuvs_batch_knn(const float *base, long n, long dim,
   if (base == nullptr || query == nullptr || out_ids == nullptr ||
       out_dist == nullptr || n <= 0 || dim <= 0 || nq <= 0 || topk <= 0) { return 0; }
   ObCuvsRawBatchJob job{base, n, dim, query, nq, topk, out_ids, out_dist, 0};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_raw_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  if (ob_cuvs_run_job(ob_cuvs_raw_batch_job, &job) != 0) { return 0; }
   ob_vsag_trace("cuvs_raw_batch", base, nq, topk);
   return job.served_;
 }
