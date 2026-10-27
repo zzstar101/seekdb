@@ -666,6 +666,7 @@ def ai_column_dml_cleanup_steps():
 
 AI_COLUMN_WORKER_PORT = 19122
 AI_COLUMN_VECTOR_PORT = 19123
+AI_COLUMN_RETRY_PORT = 19124
 
 
 def _task_count_sql(db, table):
@@ -993,6 +994,185 @@ def ai_column_vector_cleanup_steps():
     ]
 
 
+def ai_column_retry_steps():
+    """Assertions of ai_column/t/ai_column_retry_strict.test.
+
+    Covers ``ALTER TABLE ... RETRY AI COLUMN <col> WHERE <predicate>``: retried rows
+    are invalidated, the sibling AI column is untouched, strict reads reject exactly
+    the referenced-but-incomplete AI column, a zero-match retry is a no-op, and the
+    STATUS pseudo column can be combined with business predicates.
+    """
+    db = "ai_column_retry_strict"
+    docs = db + ".docs"
+    port = AI_COLUMN_RETRY_PORT
+    strict_errors = ("select id from {} where result is null".format(docs), 11120)
+    steps = [
+        ("mockstart", port),
+        ("sql", "drop database if exists {}".format(db), COLUMN_ANY),
+        ("sql", "create database {}".format(db)),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('retry_strict_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('retry_strict_model')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL('retry_strict_model', "
+                "'{\"type\":\"completion\",\"model_name\":\"mock-complete\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('retry_strict_ep', "
+                "'{\"ai_model_name\":\"retry_strict_model\","
+                "\"url\":\"http://127.0.0.1:%d/v1/chat/completions\","
+                "\"access_key\":\"retry-key\",\"provider\":\"openai\","
+                "\"request_model_name\":\"mock-complete\"}')" % port),
+        ("sql", "drop table if exists {}".format(docs), COLUMN_ANY),
+        ("sql", "create table {}(id bigint primary key, category varchar(20), "
+                "status varchar(20), content varchar(200), "
+                "result varchar(400) AI COLUMN (AI_COMPLETE('retry_strict_model', content)) "
+                "WITH (sync_mode='async', max_retries=0), "
+                "label varchar(400) AI COLUMN (AI_COMPLETE('retry_strict_model', "
+                "concat('Label: ', content))) WITH (sync_mode='async', max_retries=0))".format(docs)),
+        ("sql", "insert into {}(id, category, status, content) values "
+                "(1, 'news', 'active', 'row-one'), (2, 'sports', 'active', 'row-two'), "
+                "(3, 'news', 'inactive', 'row-three')".format(docs)),
+        ("wait", {
+            "name": "initial results ready",
+            "sql": "select count(*) = 3 from {} where result is not null "
+                   "and label is not null".format(docs),
+            "expect": {"rows": [[1]]},
+            "timeout": 25,
+        }),
+        ("check", {
+            "name": "strict read defaults off",
+            "sql": "select @@ai_column_strict_read",
+            "expect": {"rows": [["off"]]},
+        }),
+
+        # ---- a business predicate retries exactly the selected rows ----
+        ("mockstop", port),
+        ("sql", "alter table {} retry ai column result where id in (1, 3)".format(docs)),
+        ("sql", "set session ai_column_strict_read = off"),
+        ("check", {
+            "name": "selected result invalidated",
+            "sql": "select id, result is null, label is not null from {} "
+                   "order by id".format(docs),
+            "expect": {"rows": [[1, 1, 1], [2, 0, 1], [3, 1, 1]]},
+        }),
+
+        # ---- strict read rejects only the AI column the statement references ----
+        ("sql", "set session ai_column_strict_read = on"),
+        ("check", {
+            "name": "strict read keeps plain columns readable",
+            "sql": "select id, category from {} order by id".format(docs),
+            "expect": {"rows": [[1, "news"], [2, "sports"], [3, "news"]]},
+        }),
+        ("check", {
+            "name": "ready label is readable",
+            "sql": "select count(*) = 3 from {} where label is not null".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("error", "select result from {} where id = 2".format(docs), (11120,),
+         "strict read rejects ready row of an incomplete column"),
+        ("error", "select id, result from {} order by id".format(docs), (11120,),
+         "strict read rejects a full scan of the column"),
+        ("error", strict_errors[0], (11120,), "strict read rejects IS NULL filtering"),
+        ("error", "select id from {} where id in (select id from {} where result is null)"
+                  .format(docs, docs), (11120,), "strict read rejects nested subquery"),
+        ("error", "update {} set category = category where result is null".format(docs),
+         (11120,), "strict read rejects UPDATE touching the column"),
+        ("error", "delete from {} where result is null".format(docs),
+         (11120,), "strict read rejects DELETE touching the column"),
+        ("sql", "set session ai_column_strict_read = off"),
+        ("check", {
+            "name": "rejected writes leave rows unchanged",
+            "sql": "select count(*) = 3 from {}".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("wait", {
+            "name": "failed task rows cleaned",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "expect": {"rows": [[1]]},
+            "timeout": 20,
+        }),
+        ("sql", "set session ai_column_strict_read = on"),
+        ("error", "select result from {} where id = 1".format(docs), (11120,),
+         "strict read still rejects the failed row"),
+        ("sql", "set session ai_column_strict_read = off"),
+
+        # ---- STATUS pseudo column, and a full retry that restores every row ----
+        ("sql", "alter table {} retry ai column result "
+                "where status = 'FAILED' and category = 'news'".format(docs)),
+        ("mockstart", port),
+        ("sql", "alter table {} retry ai column result".format(docs)),
+        ("wait", {
+            "name": "full retry ready",
+            "sql": "select count(*) = 3 from {} where result is not null".format(docs),
+            "expect": {"rows": [[1]]},
+            "timeout": 25,
+        }),
+        ("sql", "set session ai_column_strict_read = on"),
+        ("check", {
+            "name": "strict read succeeds when all ready",
+            "sql": "select count(*) = 3 from {} where result is not null".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("sql", "set session ai_column_strict_read = off"),
+        ("mockstop", port),
+
+        # ---- zero-match retry is a no-op, READY rows can be retried ----
+        ("sql", "alter table {} retry ai column result "
+                "where status = 'READY' and id = 999".format(docs)),
+        ("check", {
+            "name": "zero match keeps ready results",
+            "sql": "select count(*) = 3 from {} where result is not null".format(docs),
+            "expect": {"rows": [[1]]},
+        }),
+        ("check", {
+            "name": "zero match creates no tasks",
+            "sql": "select count(*) = 0 from ({}) x".format(_task_count_sql(db, "docs")),
+            "expect": {"rows": [[1]]},
+        }),
+        ("sql", "alter table {} retry ai column result "
+                "where status = 'READY' and category = 'sports'".format(docs)),
+        ("check", {
+            "name": "sports row retried",
+            "sql": "select id, result is null from {} order by id".format(docs),
+            "expect": {"rows": [[1, 0], [2, 1], [3, 0]]},
+        }),
+        ("mockstart", port),
+        ("sql", "alter table {} retry ai column result".format(docs)),
+        ("wait", {
+            "name": "retry after ready restores everything",
+            "sql": "select count(*) = 3 from {} where result is not null".format(docs),
+            "expect": {"rows": [[1]]},
+            "timeout": 25,
+        }),
+        ("mockstop", port),
+
+        # ---- backticks address the physical status column, not the pseudo column ----
+        ("sql", "alter table {} retry ai column result "
+                "where `status` = 'active' and id = 1".format(docs)),
+        ("check", {
+            "name": "physical status row retried",
+            "sql": "select id, result is null from {} order by id".format(docs),
+            "expect": {"rows": [[1, 1], [2, 0], [3, 0]]},
+        }),
+        ("error", "alter table {} retry ai column content where id = 1".format(docs),
+         (1235,), "retry targets an AI column only"),
+        ("error", "alter table {} retry ai column result where id = 1, "
+                  "add column extra_col int".format(docs),
+         (1235,), "retry cannot be mixed with another ALTER action"),
+    ]
+    return steps
+
+
+def ai_column_retry_cleanup_steps():
+    db = "ai_column_retry_strict"
+    return [
+        ("sql", "drop table if exists {}.docs".format(db), COLUMN_ANY),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('retry_strict_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('retry_strict_model')", COLUMN_DROP_MODEL),
+        ("sql", "drop database if exists {}".format(db), COLUMN_ANY),
+        ("mockstop", AI_COLUMN_RETRY_PORT),
+    ]
+
+
 def wait_port(port, timeout, host="127.0.0.1"):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1197,6 +1377,8 @@ def main():
                         help="skip the AI-column worker/retry/stale case")
     parser.add_argument("--skip-ai-column-vector", action="store_true",
                         help="skip the AI-column vector index case")
+    parser.add_argument("--skip-ai-column-retry", action="store_true",
+                        help="skip the AI-column retry/strict-read case")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir or os.environ.get("RUNNER_TEMP") or "/tmp") / "ai-e2e"
@@ -1216,7 +1398,7 @@ def main():
         steps.extend(ai_column_steps())
         steps.extend(ai_column_cleanup_steps())
     ai_column_cases = (not args.skip_ai_column_dml or not args.skip_ai_column_worker
-                       or not args.skip_ai_column_vector)
+                       or not args.skip_ai_column_vector or not args.skip_ai_column_retry)
     if ai_column_cases:
         mock_script = (Path(args.repo_root) / "tools/deploy/mysql_test/test_suite/"
                        "ai_column/include/ai_column_mock.py")
@@ -1233,6 +1415,9 @@ def main():
     if not args.skip_ai_column_vector and RUNTIME["mock"] is not None:
         steps.extend(ai_column_vector_steps())
         steps.extend(ai_column_vector_cleanup_steps())
+    if not args.skip_ai_column_retry and RUNTIME["mock"] is not None:
+        steps.extend(ai_column_retry_steps())
+        steps.extend(ai_column_retry_cleanup_steps())
     if not args.skip_file_sql:
         fixtures = prepare_file_sql_fixtures(args.repo_root, work_dir / "file_sql_data")
         if fixtures is None:
