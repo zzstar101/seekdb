@@ -110,6 +110,16 @@ jobs:
           set -euo pipefail
           ls -l build_release/src/observer/seekdb build_release/src/observer/observer
 
+      - name: Upload seekdb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: seekdb-binary
+          path: |
+            build_release/src/observer/seekdb
+            build_release/src/observer/observer
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Install MySQL client library
         if: env.RUN_AI_E2E == '1'
         shell: bash
