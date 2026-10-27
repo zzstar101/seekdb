@@ -69,8 +69,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # actions/checkout only resolves branches and tags: passing a bare SHA
+          # makes it fetch refs/heads/<sha> and fail. Check out the dispatched
+          # ref here, then fetch the benchmark target explicitly below.
           fetch-depth: 1
+
+      - name: Stage helper scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the helpers outside the workspace: the next step replaces the
+          # working tree with the benchmark target, which predates them.
+          mkdir -p "$RUNNER_TEMP/fts_tools"
+          cp -r .github/script/fts_bench/. "$RUNNER_TEMP/fts_tools/"
+          ls -l "$RUNNER_TEMP/fts_tools"
+
+      - name: Check out the benchmark target
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ inputs.ref }}"
+          if [ -z "$target" ]; then
+            echo "benchmarking the dispatched ref ${{ github.sha }}"
+          else
+            echo "fetching target $target"
+            git fetch --no-tags --depth=1 origin "$target"
+            git checkout --detach FETCH_HEAD
+          fi
+          echo "benchmarking commit: $(git rev-parse HEAD)"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install build environment
         shell: bash
@@ -177,7 +204,7 @@ jobs:
             server_pid=$!
             echo "$server_pid" > "$OUT/server-$i.pid"
 
-            python3 .github/script/fts_bench/wait_for_port.py --port 2881 --timeout 900
+            python3 "$RUNNER_TEMP/fts_tools/wait_for_port.py" --port 2881 --timeout 900
 
             echo "::group::bench repeat $i"
             LABEL="run-$i" OUTPUT="$OUT/run-$i.txt" \
@@ -200,7 +227,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/script/fts_bench/summarise_metrics.py \
+          python3 "$RUNNER_TEMP/fts_tools/summarise_metrics.py" \
             "$RUNNER_TEMP/fts-bench" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark results
