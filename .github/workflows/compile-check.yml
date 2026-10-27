@@ -117,7 +117,7 @@ jobs:
           set -euo pipefail
           python3 -m pip install --disable-pip-version-check pymysql cryptography
 
-      - name: Replay official AI-function and file-SQL evaluation
+      - name: Replay official AI-function, file-SQL and AI-column evaluation
         if: env.RUN_AI_E2E == '1'
         shell: bash
         run: |
@@ -140,6 +140,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ai-e2e-logs
-          path: ${{ runner.temp }}/ai-e2e
+          path: |
+            ${{ runner.temp }}/ai-e2e
+            /tmp/seekdb_ai_column_mock_*
           if-no-files-found: ignore
           retention-days: 7
