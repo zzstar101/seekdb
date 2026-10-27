@@ -93,8 +93,15 @@ jobs:
             echo "benchmarking the dispatched ref ${{ github.sha }}"
           else
             echo "fetching target $target"
-            git fetch --no-tags --depth=1 origin "$target"
-            git checkout --detach FETCH_HEAD
+            # A full SHA can be fetched directly on GitHub; a short SHA cannot,
+            # because the server can only resolve refs, not object prefixes.
+            if ! git fetch --no-tags --depth=1 origin "$target"; then
+              echo "direct fetch failed, resolving $target against the branch tips"
+              git fetch --no-tags --depth=1 origin '+refs/heads/*:refs/remotes/origin/*'
+              git checkout --detach "$target"
+            else
+              git checkout --detach FETCH_HEAD
+            fi
           fi
           echo "benchmarking commit: $(git rev-parse HEAD)"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
