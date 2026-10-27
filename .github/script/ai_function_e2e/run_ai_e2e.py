@@ -302,6 +302,141 @@ def file_sql_steps(data_dir):
     ]
 
 
+COLUMN_DROP_ENDPOINT = (0, 11112)
+COLUMN_DROP_MODEL = (0, 11118)
+COLUMN_ANY = (0, 1049, 1008, 11112, 11118)
+
+AI_COLUMN_DDL_ASSERTIONS = [
+    ("check", {
+        "name": "ai column metadata registers two rows",
+        "sql": "select count(*) = 2 from oceanbase.__all_ai_column a "
+               "join oceanbase.__all_table t on t.table_id = a.table_id "
+               "join oceanbase.__all_database d on d.database_id = t.database_id "
+               "where d.database_name = 'ai_column_p0_ddl' and t.table_name = 'docs'",
+        "expect": {"rows": [[1]]},
+    }),
+    ("check", {
+        "name": "ai column keeps per-column retry budget",
+        "sql": "select a.column_name, a.max_retries from oceanbase.__all_ai_column a "
+               "join oceanbase.__all_table t on t.table_id = a.table_id "
+               "join oceanbase.__all_database d on d.database_id = t.database_id "
+               "where d.database_name = 'ai_column_p0_ddl' and t.table_name = 'docs' "
+               "order by a.column_name",
+        "expect": {"rows": [["emb", 3], ["tags", 2]]},
+    }),
+    ("check", {
+        "name": "three hidden state columns per ai column",
+        "sql": "select count(*) = 6 from oceanbase.__all_ai_column a "
+               "join oceanbase.__all_table t on t.table_id = a.table_id "
+               "join oceanbase.__all_database d on d.database_id = t.database_id "
+               "join oceanbase.__all_column c on c.table_id = a.table_id "
+               "and c.column_id in (a.state_column_id, a.request_column_id, "
+               "a.result_spec_column_id) "
+               "where d.database_name = 'ai_column_p0_ddl' and t.table_name = 'docs' "
+               "and c.is_hidden = 1",
+        "expect": {"rows": [[1]]},
+    }),
+    ("check", {
+        "name": "result columns stay user visible",
+        "sql": "select count(*) = 2 from oceanbase.__all_ai_column a "
+               "join oceanbase.__all_table t on t.table_id = a.table_id "
+               "join oceanbase.__all_database d on d.database_id = t.database_id "
+               "join oceanbase.__all_column c on c.table_id = a.table_id "
+               "and c.column_id = a.column_id "
+               "where d.database_name = 'ai_column_p0_ddl' and t.table_name = 'docs' "
+               "and c.is_hidden = 0",
+        "expect": {"rows": [[1]]},
+    }),
+    ("check", {
+        "name": "json result spec prompt is persisted",
+        "sql": "select count(*) = 1 from oceanbase.__all_ai_column a "
+               "join oceanbase.__all_table t on t.table_id = a.table_id "
+               "join oceanbase.__all_database d on d.database_id = t.database_id "
+               "where d.database_name = 'ai_column_p0_ddl' and t.table_name = 'docs' "
+               "and a.column_name = 'tags' "
+               "and a.normalized_expr like '%Return exactly one valid JSON value%'",
+        "expect": {"rows": [[1]]},
+    }),
+    ("check", {
+        "name": "alter table add ai column registers metadata",
+        "sql": "select count(*) = 1 from oceanbase.__all_ai_column a "
+               "join oceanbase.__all_table t on t.table_id = a.table_id "
+               "join oceanbase.__all_database d on d.database_id = t.database_id "
+               "where d.database_name = 'ai_column_p0_ddl' and t.table_name = 'alter_docs'",
+        "expect": {"rows": [[1]]},
+    }),
+    ("error",
+     "create table ai_column_p0_ddl.bad_dimension(content varchar(20), "
+     "emb vector(4) AI COLUMN (AI_EMBED('p0_ddl_embed', content, 3)))",
+     (7600,), "dimension mismatch is rejected"),
+    ("error",
+     "create table ai_column_p0_ddl.bad_dependency(content varchar(20), "
+     "first_ai varchar(200) AI COLUMN (AI_COMPLETE('p0_ddl_complete', content)), "
+     "second_ai varchar(200) AI COLUMN (AI_COMPLETE('p0_ddl_complete', first_ai)))",
+     (1235,), "ai column cannot depend on another ai column"),
+]
+
+
+def ai_column_steps():
+    """Assertions of tools/deploy/mysql_test/test_suite/ai_column/t/ai_column_ddl.test.
+
+    That case makes no model request: it only exercises the physical DDL,
+    the metadata catalog and the validation errors.
+    """
+    return [
+        ("sql", "drop database if exists ai_column_p0_ddl", COLUMN_ANY),
+        ("sql", "create database ai_column_p0_ddl"),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_ddl_complete_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_ddl_embed_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_ddl_complete')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_ddl_embed')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_ddl_complete', "
+                "'{\"type\":\"completion\",\"model_name\":\"mock-complete\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL('p0_ddl_embed', "
+                "'{\"type\":\"dense_embedding\",\"model_name\":\"mock-embed\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_ddl_complete_ep', "
+                "'{\"ai_model_name\":\"p0_ddl_complete\","
+                "\"url\":\"http://127.0.0.1:19120/v1/chat/completions\","
+                "\"access_key\":\"p0-key\",\"provider\":\"openai\","
+                "\"request_model_name\":\"mock-complete\"}')"),
+        ("sql", "call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('p0_ddl_embed_ep', "
+                "'{\"ai_model_name\":\"p0_ddl_embed\","
+                "\"url\":\"http://127.0.0.1:19120/v1/embeddings\","
+                "\"access_key\":\"p0-key\",\"provider\":\"openai\","
+                "\"request_model_name\":\"mock-embed\"}')"),
+        ("sql", "drop table if exists ai_column_p0_ddl.docs", COLUMN_ANY),
+        ("sql", "create table ai_column_p0_ddl.docs ("
+                "id bigint primary key, content varchar(200), "
+                "tags json AI COLUMN (AI_COMPLETE('p0_ddl_complete', "
+                "concat('Classify: ', content))) WITH (sync_mode='async', max_retries=2), "
+                "emb vector(4) AI COLUMN (AI_EMBED('p0_ddl_embed', content)) "
+                "WITH (sync_mode='async', max_retries=3))"),
+    ] + AI_COLUMN_DDL_ASSERTIONS[:5] + [
+        ("sql", "drop table if exists ai_column_p0_ddl.alter_docs", COLUMN_ANY),
+        ("sql", "create table ai_column_p0_ddl.alter_docs(id bigint primary key, "
+                "content varchar(200))"),
+        ("sql", "alter table ai_column_p0_ddl.alter_docs add column tags json AI COLUMN ("
+                "AI_COMPLETE('p0_ddl_complete', content)) WITH (sync_mode='async', "
+                "max_retries=1)"),
+    ] + AI_COLUMN_DDL_ASSERTIONS[5:]
+
+
+def ai_column_cleanup_steps():
+    return [
+        ("sql", "drop table ai_column_p0_ddl.alter_docs", COLUMN_ANY),
+        ("sql", "drop table ai_column_p0_ddl.docs", COLUMN_ANY),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_ddl_complete_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('p0_ddl_embed_ep')",
+         COLUMN_DROP_ENDPOINT),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_ddl_complete')", COLUMN_DROP_MODEL),
+        ("sql", "call DBMS_AI_SERVICE.DROP_AI_MODEL('p0_ddl_embed')", COLUMN_DROP_MODEL),
+        ("sql", "drop database if exists ai_column_p0_ddl", COLUMN_ANY),
+    ]
+
+
 def wait_port(port, timeout, host="127.0.0.1"):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -428,6 +563,8 @@ def main():
                         help="checkout root, used to locate the official file_sql fixtures")
     parser.add_argument("--skip-file-sql", action="store_true",
                         help="only replay the AI-function case")
+    parser.add_argument("--skip-ai-column", action="store_true",
+                        help="skip the AI-column DDL case")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir or os.environ.get("RUNNER_TEMP") or "/tmp") / "ai-e2e"
@@ -443,6 +580,9 @@ def main():
         path.write_text("", encoding="utf-8")
 
     steps = list(STEPS)
+    if not args.skip_ai_column:
+        steps.extend(ai_column_steps())
+        steps.extend(ai_column_cleanup_steps())
     if not args.skip_file_sql:
         fixtures = prepare_file_sql_fixtures(args.repo_root, work_dir / "file_sql_data")
         if fixtures is None:
