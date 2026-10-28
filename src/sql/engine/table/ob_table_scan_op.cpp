@@ -2244,6 +2244,16 @@ int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
       brs_.end_ = true;
     } else if (MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_) {
       ret = inner_get_next_fts_index_batch(batch_size);
+    } else if (MY_SPEC.is_fts_ddl_) {
+      // Sampling precedes expansion and rescans the same scalar source. Expose
+      // one source row as a batch instead of asking its DAS iterator for rows.
+      batch_info_guard.set_batch_size(1);
+      if (OB_FAIL(get_next_row_with_das())) {
+      } else {
+        brs_.size_ = 1;
+        brs_.all_rows_active_ = true;
+        brs_.skip_->reset(1);
+      }
     } else {
       ret = get_next_batch_with_das(brs_.size_, batch_size);
     }

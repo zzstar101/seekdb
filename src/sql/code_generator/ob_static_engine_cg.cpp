@@ -783,10 +783,14 @@ int ObStaticEngineCG::generate_spec_final(ObLogicalOperator &op, ObOpSpec &spec)
     ObTableScanSpec &tsc_spec = static_cast<ObTableScanSpec&>(spec);
     ObDASScanCtDef &scan_ctdef = tsc_spec.tsc_ctdef_.scan_ctdef_;
     ObDASScanCtDef *lookup_ctdef = tsc_spec.tsc_ctdef_.lookup_ctdef_;
-    if (OB_FAIL(scan_ctdef.pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
+    // FTS expansion batches the generated word rows, but fetches source documents through
+    // get_next_row(). Keep every source scan scalar: a vectorized SSTable scanner can return
+    // OB_PUSHDOWN_STATUS_CHANGED forever to that scalar caller after the source is flushed.
+    const int64_t source_batch_size = tsc_spec.is_fts_ddl_ ? 0 : tsc_spec.max_batch_size_;
+    if (OB_FAIL(scan_ctdef.pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, source_batch_size))) {
     } else if (lookup_ctdef != nullptr &&
-        OB_FAIL(lookup_ctdef->pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
-    } else if (OB_FAIL(tsc_spec.tsc_ctdef_.attach_spec_.set_calc_exprs(spec.calc_exprs_, tsc_spec.max_batch_size_))) {
+        OB_FAIL(lookup_ctdef->pd_expr_spec_.set_calc_exprs(spec.calc_exprs_, source_batch_size))) {
+    } else if (OB_FAIL(tsc_spec.tsc_ctdef_.attach_spec_.set_calc_exprs(spec.calc_exprs_, source_batch_size))) {
     }
   }
 
