@@ -1,0 +1,29 @@
+{
+  "scope": "full benchmark ABBA sampling ablation, all rows retained",
+  "raw_build": {
+    "control": [
+      {
+        "build_ik_all_sec": 2.894,
+        "build_ik_content_sec": 2.374,
+        "build_beng_en_sec": 1.456
+      },
+      {
+        "build_ik_all_sec": 3.765,
+        "build_ik_content_sec": 2.482,
+        "build_beng_en_sec": 1.153
+      }
+    ],
+    "experiment": [
+      {
+        "build_ik_all_sec": 3.198,
+        "build_ik_content_sec": 2.576,
+        "build_beng_en_sec": 1.155
+      },
+      {
+        "build_ik_all_sec": 2.776,
+        "build_ik_content_sec": 2.372,
+        "build_beng_en_sec": 1.353
+      }
+    ]
+  }
+}

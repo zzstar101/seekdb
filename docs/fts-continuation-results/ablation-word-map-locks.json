@@ -1,0 +1,89 @@
+{
+  "scope": "non-scoring 200000 TOKENIZE CPU diagnostic, all runs retained",
+  "raw": {
+    "lock": [
+      {
+        "label": "r2-lock-long-1",
+        "binary_sha256": "d135cebb44e8b8042880b015ccd10d7f2a604f52e08959e137f642d8d4ad4681",
+        "kind": "non-scoring TOKENIZE CPU diagnostic",
+        "results": {
+          "ik": {
+            "rounds": 200000,
+            "wall_sec": 20.91865750029683,
+            "server_cpu_sec": 14.509999999999998
+          },
+          "beng": {
+            "rounds": 200000,
+            "wall_sec": 14.70324550010264,
+            "server_cpu_sec": 8.790000000000003
+          }
+        }
+      },
+      {
+        "label": "r2-lock-long-2",
+        "binary_sha256": "d135cebb44e8b8042880b015ccd10d7f2a604f52e08959e137f642d8d4ad4681",
+        "kind": "non-scoring TOKENIZE CPU diagnostic",
+        "results": {
+          "ik": {
+            "rounds": 200000,
+            "wall_sec": 19.5802266667597,
+            "server_cpu_sec": 13.829999999999998
+          },
+          "beng": {
+            "rounds": 200000,
+            "wall_sec": 13.191710709128529,
+            "server_cpu_sec": 8.059999999999999
+          }
+        }
+      }
+    ],
+    "nolock": [
+      {
+        "label": "r2-nolock-long-1",
+        "binary_sha256": "cc814d0f28eb96982cdfb7179e0700306c5f5038c680c2c9ead63ae77cd6e387",
+        "kind": "non-scoring TOKENIZE CPU diagnostic",
+        "results": {
+          "ik": {
+            "rounds": 200000,
+            "wall_sec": 19.718549083918333,
+            "server_cpu_sec": 13.819999999999999
+          },
+          "beng": {
+            "rounds": 200000,
+            "wall_sec": 14.974289750214666,
+            "server_cpu_sec": 8.780000000000001
+          }
+        }
+      },
+      {
+        "label": "r2-nolock-long-2",
+        "binary_sha256": "cc814d0f28eb96982cdfb7179e0700306c5f5038c680c2c9ead63ae77cd6e387",
+        "kind": "non-scoring TOKENIZE CPU diagnostic",
+        "results": {
+          "ik": {
+            "rounds": 200000,
+            "wall_sec": 20.060041083022952,
+            "server_cpu_sec": 13.830000000000002
+          },
+          "beng": {
+            "rounds": 200000,
+            "wall_sec": 13.841941167134792,
+            "server_cpu_sec": 8.25
+          }
+        }
+      }
+    ]
+  },
+  "summary": {
+    "ik": {
+      "lock_cpu_sec": 14.169999999999998,
+      "nolock_cpu_sec": 13.825,
+      "improvement": 0.02434721242060689
+    },
+    "beng": {
+      "lock_cpu_sec": 8.425,
+      "nolock_cpu_sec": 8.515,
+      "improvement": -0.010682492581602254
+    }
+  }
+}

@@ -46,6 +46,12 @@ The tests cover:
   NULL IDs, duplicate final IDs, partial consumption, and allocation reuse. Bulk counts also
   cover overwritten datum/payload storage, long binary IDs, allocator replacement, refill
   failures, and extreme iterator offsets without adding the offset to the batch capacity.
+- Production token-iterator batches: two token iterators share an expression frame and a
+  test DAS source, then consume the public batch API. Refills overwrite both descriptors and
+  payloads; the returned batches must retain private copies. The fixture also covers row/advance
+  transitions, reuse, reset, and source-error propagation. Separate tests check long payload growth.
+- Fixed-width document-ID comparison: every differing byte position and byte value,
+  unaligned addresses, random pairs, NULL, and length fallbacks against the generic comparator.
 - Post-build word rows: all generated columns against the original builder,
   input lifetime, partial batches, tokenless documents, and scratch-memory reuse.
 - IK dictionary character codes: DAT-local mappings, missing and malformed

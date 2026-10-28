@@ -1,5 +1,8 @@
 # FTS 批处理优化与回归记录
 
+后续基于 `f14fdbd` 的优化、正式成绩反馈和新一轮完整对照见
+[FTS 后续优化与完整复测](fts-continuation-optimization.md)。本文保留第一轮的原始数据。
+
 本次从 `8b567cf64beef624bdac4d74f851d7351ef9ee20` 继续优化。
 竞争基线使用 `2026-competition` 对应的 `5bce9e06d1281347ad61344e4b01fab9158c58a2`。
 用户提供的上一版正式 raw score 为 69.4734/100；本文的本机结果不能代替统一评测成绩。

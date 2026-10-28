@@ -1,0 +1,8 @@
+{
+  "elapsed_sec": 3.186551250051707,
+  "exit_code": 0,
+  "stdout": "6667\n",
+  "stderr": "",
+  "binary": "seekdb-scalar-source",
+  "sql": "ALTER TABLE fts_large_bench.docs ADD FULLTEXT INDEX fti_content_ik(content) WITH PARSER ik; SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('\u5168\u6587\u7d22\u5f15 \u5206\u8bcd\u5668');"
+}

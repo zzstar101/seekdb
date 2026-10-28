@@ -1,0 +1,110 @@
+{
+  "scope": "non-scoring same-data CPU diagnostic, candidate/control/control/candidate; all runs retained",
+  "raw": {
+    "control-1": {
+      "label": "r5-owned-control-1",
+      "binary_sha256": "7ce99581e6c662537cea84db4067aa4b1c462b6004d52404774c249de9992d25",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 5.871090542059392,
+          "server_cpu_sec": 4.99
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 7.259742083027959,
+          "server_cpu_sec": 6.709999999999999
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 5.441974666900933,
+          "server_cpu_sec": 4.65
+        }
+      }
+    },
+    "control-2": {
+      "label": "r5-owned-control-2",
+      "binary_sha256": "7ce99581e6c662537cea84db4067aa4b1c462b6004d52404774c249de9992d25",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 3.8619837081059813,
+          "server_cpu_sec": 3.59
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 5.9725787080824375,
+          "server_cpu_sec": 5.740000000000002
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 4.297699916642159,
+          "server_cpu_sec": 4.029999999999998
+        }
+      }
+    },
+    "candidate-1": {
+      "label": "r5-owned-candidate-1",
+      "binary_sha256": "2e9d490ed07ebafa77fb7b23a5e4a3119fab1fa6756eec23b6c29b8f1fa2ab3e",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 3.6915167500264943,
+          "server_cpu_sec": 3.43
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 5.595803624950349,
+          "server_cpu_sec": 5.220000000000001
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 5.656799917109311,
+          "server_cpu_sec": 4.68
+        }
+      }
+    },
+    "candidate-2": {
+      "label": "r5-owned-candidate-2",
+      "binary_sha256": "2e9d490ed07ebafa77fb7b23a5e4a3119fab1fa6756eec23b6c29b8f1fa2ab3e",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 3.7732399576343596,
+          "server_cpu_sec": 3.51
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 5.642423999961466,
+          "server_cpu_sec": 5.3500000000000005
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 4.373852250166237,
+          "server_cpu_sec": 4.01
+        }
+      }
+    }
+  },
+  "mean_server_cpu": {
+    "cn": {
+      "control": 4.29,
+      "candidate": 3.4699999999999998,
+      "reduction": 0.19114219114219122
+    },
+    "beng": {
+      "control": 6.2250000000000005,
+      "candidate": 5.285,
+      "reduction": 0.15100401606425706
+    },
+    "mixed": {
+      "control": 4.339999999999999,
+      "candidate": 4.345,
+      "reduction": -0.0011520737327190833
+    }
+  }
+}

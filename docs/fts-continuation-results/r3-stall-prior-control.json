@@ -1,0 +1,8 @@
+{
+  "binary": "prior-8b567cf",
+  "kind": "same persisted data DDL stall control",
+  "elapsed_sec": 3.012816207949072,
+  "exit_code": 0,
+  "stdout": "9333\n",
+  "stderr": ""
+}

@@ -1,0 +1,26 @@
+{
+  "competition": "5bce9e06d1281347ad61344e4b01fab9158c58a2",
+  "benchmark_files": {
+    "tools/benchmark/fts_large_bench.sh": {
+      "sha256": "596ea5d1c0038e666b78aa94bef22d2dfb87ffc9e84dbc7e2a1da1f746424462",
+      "identical_to_competition": true
+    },
+    "tools/benchmark/fts_large_bench_gen.py": {
+      "sha256": "b0c816dd8211ac0471f60b72a37a3fb5c62580357a5b6d7ac95f5a8c2e3f143d",
+      "identical_to_competition": true
+    },
+    "tools/benchmark/fts_large_bench_setup.sql": {
+      "sha256": "311826751df7f51ac45156fb4284aeca9bd9197370aceb88f4fb92832b458108",
+      "identical_to_competition": true
+    },
+    "tools/benchmark/fts_large_bench_score.py": {
+      "sha256": "bea52eb1c68d05693bb3ac5b910ab0e2fa0e70e01582f40466898ee1e2e3ef55",
+      "identical_to_competition": true
+    },
+    "tools/benchmark/fts_large_bench_baseline.json": {
+      "sha256": "f4e97eddb2e49c982b967fc8047f7cf37177eebe53d648f6746d85aacda91f0c",
+      "identical_to_competition": true
+    }
+  },
+  "workflows_unchanged_since": "f14fdbd386d903fa3cd360f1320043c2d8a5a671"
+}

@@ -1,0 +1,110 @@
+{
+  "kind": "non-scoring same-physical-data ABBA process CPU diagnostic",
+  "raw": {
+    "control-1": {
+      "label": "r5-docid-control-1",
+      "binary_sha256": "8cfc55b3d6e5ecdb097535dec1013c33508eba7ad46e01c032542d974352f9d5",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 4.110596541780978,
+          "server_cpu_sec": 3.85
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 6.246585125103593,
+          "server_cpu_sec": 5.9399999999999995
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 4.6998017923906446,
+          "server_cpu_sec": 4.359999999999999
+        }
+      }
+    },
+    "control-2": {
+      "label": "r5-docid-control-2",
+      "binary_sha256": "8cfc55b3d6e5ecdb097535dec1013c33508eba7ad46e01c032542d974352f9d5",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 4.143343542236835,
+          "server_cpu_sec": 3.8499999999999996
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 6.351706124842167,
+          "server_cpu_sec": 6.049999999999999
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 4.97951883263886,
+          "server_cpu_sec": 4.579999999999998
+        }
+      }
+    },
+    "candidate-1": {
+      "label": "r5-docid-candidate-1",
+      "binary_sha256": "fd0d36daf771d12bae20dd620ff8b0f3fe3b8e430b82d77ac01f4aab14519f5e",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 4.00094800023362,
+          "server_cpu_sec": 4.079999999999999
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 6.3961387923918664,
+          "server_cpu_sec": 6.15
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 4.469933667220175,
+          "server_cpu_sec": 4.17
+        }
+      }
+    },
+    "candidate-2": {
+      "label": "r5-docid-candidate-2",
+      "binary_sha256": "fd0d36daf771d12bae20dd620ff8b0f3fe3b8e430b82d77ac01f4aab14519f5e",
+      "kind": "non-scoring same-data CPU diagnostic",
+      "results": {
+        "cn": {
+          "rounds": 5000,
+          "wall_sec": 3.835313541814685,
+          "server_cpu_sec": 3.5599999999999987
+        },
+        "beng": {
+          "rounds": 5000,
+          "wall_sec": 5.805833374615759,
+          "server_cpu_sec": 5.579999999999998
+        },
+        "mixed": {
+          "rounds": 5000,
+          "wall_sec": 4.226855082903057,
+          "server_cpu_sec": 3.9299999999999997
+        }
+      }
+    }
+  },
+  "mean_server_cpu": {
+    "cn": {
+      "control": 3.8499999999999996,
+      "candidate": 3.819999999999999,
+      "reduction": 0.007792207792208017
+    },
+    "beng": {
+      "control": 5.994999999999999,
+      "candidate": 5.864999999999999,
+      "reduction": 0.021684737281067568
+    },
+    "mixed": {
+      "control": 4.469999999999999,
+      "candidate": 4.05,
+      "reduction": 0.09395973154362403
+    }
+  }
+}

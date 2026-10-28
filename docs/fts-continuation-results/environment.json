@@ -1,0 +1,72 @@
+{
+  "versions": {
+    "delivered": {
+      "source_commit": "d3270a4c1",
+      "workspace_head": "1ea12b4892ca9116b60a963a0f35735204288a81",
+      "binary": "/tmp/fts-full-score/bin/seekdb-small3",
+      "sha256": "44ce04750874ba854f8e898a21cdc7d33446242d3009eb6b80fbca8a3d675ad4",
+      "size_bytes": 191992152,
+      "version_stdout": "",
+      "version_stderr": "<jemalloc>: option background_thread currently supports pthread only\nStarting seekdb (OceanBase seekdb 1.4.0.0) source revision 1-d3270a4c1c7801bcafedf7fd0b5747f166d292cc.\n(null) (OceanBase seekdb 1.4.0.0)\n\nREVISION: 1-d3270a4c1c7801bcafedf7fd0b5747f166d292cc\nBUILD_BRANCH: codex/fts-full-score\nBUILD_TIME: Oct 28 2026 14:28:08\nBUILD_FLAGS: RelWithDebInfo\nBUILD_INFO: \n\nCopyright (c) 2011-present OceanBase Inc.\n\n",
+      "saved_at_unix": 1793169029.0008588
+    },
+    "competition": {
+      "source_commit": "5bce9e06d1281347ad61344e4b01fab9158c58a2",
+      "workspace_head": "5bce9e06d1281347ad61344e4b01fab9158c58a2",
+      "binary": "/tmp/fts-full-score/bin/seekdb-competition-5bce9e06",
+      "sha256": "bf16d698a0c56379b108bdc1a7a4f370fe5b94f98fc76a77ce4dc51c93dbb05e",
+      "size_bytes": 191915224,
+      "version_stdout": "",
+      "version_stderr": "<jemalloc>: option background_thread currently supports pthread only\nStarting seekdb (OceanBase seekdb 1.4.0.0) source revision 1-5bce9e06d1281347ad61344e4b01fab9158c58a2.\n(null) (OceanBase seekdb 1.4.0.0)\n\nREVISION: 1-5bce9e06d1281347ad61344e4b01fab9158c58a2\nBUILD_BRANCH: HEAD\nBUILD_TIME: Oct 28 2026 13:40:20\nBUILD_FLAGS: RelWithDebInfo\nBUILD_INFO: \n\nCopyright (c) 2011-present OceanBase Inc.\n\n",
+      "saved_at_unix": 1793166063.7578828
+    },
+    "candidate": {
+      "source_commit": "40f0e3f62",
+      "workspace_head": "40f0e3f6265fce884ea4ff1e395b96da2974e848",
+      "binary": "/tmp/fts-full-score/bin/seekdb-owned-count",
+      "sha256": "2e9d490ed07ebafa77fb7b23a5e4a3119fab1fa6756eec23b6c29b8f1fa2ab3e",
+      "size_bytes": 191988856,
+      "version_stdout": "",
+      "version_stderr": "<jemalloc>: option background_thread currently supports pthread only\nStarting seekdb (OceanBase seekdb 1.4.0.0) source revision 1-40f0e3f6265fce884ea4ff1e395b96da2974e848.\n(null) (OceanBase seekdb 1.4.0.0)\n\nREVISION: 1-40f0e3f6265fce884ea4ff1e395b96da2974e848\nBUILD_BRANCH: codex/fts-full-score\nBUILD_TIME: Oct 28 2026 17:54:45\nBUILD_FLAGS: RelWithDebInfo\nBUILD_INFO: \n\nCopyright (c) 2011-present OceanBase Inc.\n\n",
+      "saved_at_unix": 1793181306.793911
+    }
+  },
+  "order": [
+    [
+      "delivered",
+      "candidate",
+      "competition"
+    ],
+    [
+      "competition",
+      "candidate",
+      "delivered"
+    ],
+    [
+      "delivered",
+      "competition",
+      "candidate"
+    ]
+  ],
+  "settle_sec": 10,
+  "parameters": {
+    "ROWS": 20000,
+    "BATCH": 500,
+    "ROUNDS": 3000,
+    "QUERY_ROUNDS": 200,
+    "SAMPLES": 3,
+    "WARMUP": 30,
+    "SKIP_LOAD": 0
+  },
+  "completed": [
+    "r5-final-delivered-1",
+    "r5-final-candidate-1",
+    "r5-final-competition-1",
+    "r5-final-competition-2",
+    "r5-final-candidate-2",
+    "r5-final-delivered-2",
+    "r5-final-delivered-3",
+    "r5-final-competition-3",
+    "r5-final-candidate-3"
+  ]
+}

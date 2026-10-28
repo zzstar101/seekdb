@@ -1,0 +1,27 @@
+{
+  "pid": 23294,
+  "argv": [
+    "/private/tmp/fts-full-score/bin/seekdb-owned-count",
+    "--base-dir",
+    "/tmp/fts-full-score/db/inst-29981",
+    "--port",
+    "29981",
+    "--parameter",
+    "rpc_port=29982",
+    "--parameter",
+    "memory_limit=2G",
+    "--parameter",
+    "datafile_size=1G",
+    "--parameter",
+    "datafile_maxsize=8G",
+    "--parameter",
+    "log_disk_size=2G",
+    "--parameter",
+    "cpu_count=4",
+    "--nodaemon"
+  ],
+  "sha256": "2e9d490ed07ebafa77fb7b23a5e4a3119fab1fa6756eec23b6c29b8f1fa2ab3e",
+  "report": "/tmp/fts-full-score/reports/r5-final-candidate-3.txt",
+  "label": "r5-final-candidate-3",
+  "benchmark_sha256": "596ea5d1c0038e666b78aa94bef22d2dfb87ffc9e84dbc7e2a1da1f746424462"
+}
