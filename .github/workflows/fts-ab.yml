@@ -34,6 +34,12 @@ on:
         default: '5'
         type: choice
         options: ['3', '5']
+      order:
+        description: 'Order inside each pair. AB = A first (default); BA = B first, which cancels the warm-up advantage A gets in AB.'
+        required: false
+        default: AB
+        type: choice
+        options: ['AB', 'BA']
 
 permissions:
   contents: read
@@ -51,6 +57,7 @@ jobs:
       REF_A: ${{ inputs.ref_a || '9f846938b309a3e5320a61f71cb84ef8d375185a' }}
       REF_B: ${{ inputs.ref_b || '8b567cf64beef624bdac4d74f851d7351ef9ee20' }}
       PAIRS: ${{ inputs.repeats || '5' }}
+      ORDER: ${{ inputs.order || 'AB' }}
     steps:
       - name: Free disk space
         shell: bash
@@ -165,8 +172,14 @@ jobs:
 
           # A then B in every pair: any drift over the two hours of the loop
           # (thermal, noisy neighbour) lands on both versions equally.
+          case "${ORDER:-AB}" in
+            BA) VERSIONS="B A" ;;
+            *)  VERSIONS="A B" ;;
+          esac
+          echo "pair order: ${VERSIONS}"
+
           for i in $(seq 1 "${PAIRS}"); do
-            for v in A B; do
+            for v in $VERSIONS; do
               base="$OUT/db-$v-$i"
               rm -rf "$base"
               mkdir -p "$base"
