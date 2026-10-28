@@ -244,6 +244,26 @@ recall@10 / recall@100`，其中 recall 用 numpy 精确暴力最近邻作为 gr
 - **固定开销**：250K 档在 niter=100 时约 45–48 s，其中约 8 s 与 n 基本无关
   （cuVS 初始化、CAGRA 图序列化、辅助表写入），这是下一个要拆解的热点。
 
+### 10.4 并发缺陷的离线复现（不是推测，是可复现的实验）
+
+`tools/hipvs_bridge/test/` 里有一个不需要 GPU 的复现件：`fake_cuvs.c` 用
+确定性逻辑顶替 cuVS（ids 由查询向量第一个分量推出），`test_concurrent_search.c`
+用 8 个线程各打 200 条不同查询到**同一个句柄**，`run_fake_test.sh` 编译两个
+变体并对比：
+
+```
+== 提交版（句柄级互斥）        queries=1600 threads=8 mismatches=0
+== 同一份代码去掉互斥          queries=1600 threads=8 mismatches=1595
+```
+
+去掉锁以后 99.7% 的并发查询拿回的是**别人的**答案——不是"偶尔脏读"，是整批
+错。这印证了 §10.1 的 P1：`f6bbbe782` 那个版本只要评测端用多连接打批量查询，
+正确性硬门槛就会挂。`run_fake_test.sh` 的判定是"提交版必须 0 错、去锁版必须
+出错"，后者保证这个测试本身有鉴别力，不是恒过的假测试。
+
+机器到手后还需要跑真机版本：`bench_official.py --threads 8` 输出里的
+`concurrent_mismatch` 必须为 0。
+
 ### 10.4 验证状态（先读这一节再用本分支）
 
 本分支上有两代提交，验证程度不同：
