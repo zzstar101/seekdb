@@ -1,0 +1,13 @@
+sstable_source_membership
+hits	first_id	last_id	id_sum
+513	0	512	131328
+hits	id_sum
+257	65792
+hits	id_sum
+256	65536
+no_missing_or_extra_ids
+mismatch_count
+0
+rebuilt_sstable_source
+hits	id_sum
+513	131328

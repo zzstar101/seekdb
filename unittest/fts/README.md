@@ -76,17 +76,23 @@ The focused cases are in the existing `fts_index` mysqltest suite:
   between SSTables and memtables; its full row fields are checked by the native test.
 - `tokenize_function`: accent-, case-, and emoji-equivalent spellings plus n-gram
   representatives compared with the competition baseline.
+- `postbuild_sstable_scan`: waits for a nonempty source tablet's current major
+  compaction, then builds two indexes with parallel sampling and rescan. It checks
+  exact membership and the persisted document-ID lookup path, and restores the
+  temporarily changed compaction, sampling and PX settings.
 
 They run through the repository's existing mysqltest discovery. To execute only these
 cases against a dedicated local test instance, adjust the client connection as needed:
 
 ```bash
 export LD_LIBRARY_PATH="$PWD/deps/3rd/u01/obclient/lib:$PWD/deps/3rd/u01/obclient/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-FTS_SUITE=tools/deploy/mysql_test/test_suite/fts_index
+FTS_ROOT="$PWD"
+FTS_SUITE="$FTS_ROOT/tools/deploy/mysql_test/test_suite/fts_index"
 FTS_LOG_DIR=$(mktemp -d /tmp/seekdb-fts-mysqltest.XXXXXX)
+cd "$FTS_ROOT/tools/deploy"
 
-for FTS_CASE in no_score_projection count_only_boundaries postbuild_word_rows tokenize_function; do
-  deps/3rd/u01/obclient/bin/mysqltest \
+for FTS_CASE in no_score_projection count_only_boundaries postbuild_word_rows postbuild_sstable_scan tokenize_function; do
+  "$FTS_ROOT/deps/3rd/u01/obclient/bin/mysqltest" \
     --host=127.0.0.1 --port=2881 --user=root \
     --tmpdir="$FTS_LOG_DIR" --logdir="$FTS_LOG_DIR" --silent \
     --test-file="$FTS_SUITE/t/$FTS_CASE.test" \
@@ -95,7 +101,9 @@ done
 ```
 
 These fixtures create and drop their own `fts_no_score_projection`,
-`fts_count_boundaries`, `fts_postbuild_word_rows`, and `fts` databases. They do not change the benchmark database.
+`fts_count_boundaries`, `fts_postbuild_word_rows`, `fts_postbuild_sstable_scan`, and `fts`
+databases. Run the compaction case on a dedicated instance with administrative access;
+its major freeze also compacts other tables on that instance.
 
 ## Exact TOKENIZE differential
 
