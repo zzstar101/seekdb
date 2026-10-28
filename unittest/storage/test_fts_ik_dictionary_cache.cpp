@@ -713,10 +713,12 @@ TEST_F(IKDictionaryCacheTest, range_lookup_matches_linear_for_bounds_gaps_and_pr
   const std::vector<std::string> probes = {
       "", "A", "AA", "AB", "B", "BA", "C", "D", "DA", "E", "F", "FA",
       "G", "一", "一乙", "乙", "乙乙", "丙"};
+  ASSERT_TRUE(range.uses_binary_range_search());
   expect_range_lookup_matches_linear(range, dats, probes);
 
   // A rejected rebuild must leave both the ranges and their search index untouched.
   EXPECT_EQ(OB_INIT_TWICE, range.build_dict_from_dat_blocks(dat_blocks));
+  EXPECT_TRUE(range.uses_binary_range_search());
   expect_range_lookup_matches_linear(range, dats, probes);
 }
 
@@ -740,6 +742,7 @@ TEST_F(IKDictionaryCacheTest, range_lookup_falls_back_for_unsorted_ranges)
   }
   ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
 
+  EXPECT_FALSE(range.uses_binary_range_search());
   expect_range_lookup_matches_linear(range, dats, {"A", "AB", "B", "C", "D", "DA", "F", "G"});
 }
 
@@ -771,6 +774,7 @@ TEST_F(IKDictionaryCacheTest, range_lookup_preserves_first_match_for_overlapping
   ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
 
   found = true;
+  EXPECT_FALSE(range.uses_binary_range_search());
   ASSERT_EQ(OB_SUCCESS, range.find_word_code(ObString::make_string("B"), code, found));
   EXPECT_FALSE(found);
   expect_range_lookup_matches_linear(

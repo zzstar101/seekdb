@@ -78,6 +78,8 @@ public:
   // keep it alive and unmodified while this dict is in use.
   int build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> &dat_blocks);
 
+  bool uses_binary_range_search() const { return use_range_binary_search_; }
+
   static int try_load_cache(const ObFTDictDesc &desc,
                             const uint32_t range_count,
                             ObFTCacheRangeContainer &range_container);
