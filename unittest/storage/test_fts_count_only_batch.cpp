@@ -306,8 +306,8 @@ public:
           }
           datums_[i].set_string(payload, static_cast<uint32_t>(id->size()));
           payload_offset += static_cast<int64_t>(id->size());
-          views_[i] = &datums_[i];
         }
+        views_[i] = &datums_[i];
       }
       next_idx_ += count;
       doc_ids = views_.data();
@@ -783,19 +783,19 @@ TEST_F(CountOnlyBatchMergerTest, bulk_count_exact_capacity_and_final_partial_bat
 
 TEST_F(CountOnlyBatchMergerTest, bulk_count_survives_reused_binary_batch_storage)
 {
-  // Duplicate "c" crosses refill boundaries in every dimension. At capacity 4, the final
+  // Duplicate "c" crosses refill boundaries in every dimension. At capacity 5, the final
   // distinct id "d" comes only from the third dimension.
   const std::vector<StringIdList> inputs = {
-      {std::string("a"), std::string("c"), std::string("c"), std::string("f")},
-      {std::string("a"), std::string("b"), std::string("c"), std::string("e")},
-      {std::string("b"), std::string("c"), std::string("d"), std::string("f")}};
+      {std::nullopt, std::string("a"), std::string("c"), std::string("c"), std::string("f")},
+      {std::nullopt, std::string("a"), std::string("b"), std::string("c"), std::string("e")},
+      {std::nullopt, std::string("b"), std::string("c"), std::string("d"), std::string("f")}};
   for (const int64_t batch_size : {1, 2, 3, 4}) {
     SCOPED_TRACE(batch_size);
-    for (const int64_t capacity : {1, 2, 4, 6}) {
+    for (const int64_t capacity : {1, 2, 5, 7}) {
       SCOPED_TRACE(capacity);
       int64_t total = 0;
       run_overwriting_binary_bulk_count(inputs, batch_size, capacity, total);
-      EXPECT_EQ(6, total);
+      EXPECT_EQ(7, total);
     }
   }
 }

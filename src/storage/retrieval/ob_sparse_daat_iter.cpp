@@ -937,7 +937,7 @@ int ObSRDaaTIterImpl::get_next_rows_count_only_batch(const int64_t capacity, int
       ret = OB_ITER_END;
     }
     // Consume OFFSET in bounded chunks. Keeping offset and result capacity separate avoids
-    // overflowing their sum for legal SQL such as LIMIT 1 OFFSET INT64_MAX.
+    // overflowing their sum when an iterator request has offset INT64_MAX and a positive limit.
     while (OB_SUCC(ret) && offset_remaining > 0) {
       const int64_t skip_capacity = MIN(offset_remaining, iter_param_->max_batch_size_);
       int64_t skipped_count = 0;
