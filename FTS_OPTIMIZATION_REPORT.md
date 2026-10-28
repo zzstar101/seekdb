@@ -894,3 +894,55 @@ merger 内部做数据表示改造不会带来量级变化。
    `make_token_array_json` 为每个 token 建一个 `ObJsonString` 再序列化。
 3. **不再投入**：COUNT-only 合并循环（已平坦化，且受 DAS 逐批解码下限约束）、BENG（已贴固定开销）、
    `LIMIT` 查询（0.09 ms，权重 1/4 但绝对空间只有 0.06 ms）。
+
+---
+
+## 15 结构测量：分词与构建各自的支配项
+
+本节回答 m01467 计划里最关键的两个前置问题——IK 各子阶段占比，以及构建墙钟到底由什么决定。
+两台测量都在本地 10 核机器、与官方脚本同参数、同一实例上完成。
+
+### 15.1 IK 子阶段消融（`sample` 采样，40 万次 `tokenize(ik_91字)` 压满一个工作线程）
+
+以 `ObExprTokenize::eval_tokenize` 的 498 个采样为 100%：
+
+| 阶段 | 采样 | 占比 |
+|---|---|---|
+| `tokenize_fulltext` / `segment` | 460 | 92% |
+| ├ `ObIKFTParser::get_next_token` | 354 | 71% |
+| │ ├ `process_next_batch` | 141 | 28% |
+| │ │ ├ `ObIKCJKProcessor::do_process` | 45 | 9% |
+| │ │ │ └ `ObFTRangeDict::match`（含 `find_first_char_range`） | 23 | 4.6% |
+| │ │ ├ `ObFTCacheDict::match` | 12 | 2.4% |
+| │ │ └ `ObIKQuantifierProcessor::process_CN_number` | 23 | 4.6% |
+| │ └ 逐字符循环本体（未再下钻） | 213 | 43% |
+| ├ `ObIKArbitrator::output_result`（二次扫描） | 18 | 3.6% |
+| └ `ObFTSortList::add_token`（有序链表插入） | 4 | 0.8% |
+| `make_token_array_json` | 10 | 2% |
+| `pack_json_res` | 46 | 9% |
+| 行编码 `ObSMUtils::build_cell_value` → `ObIJsonBase::print` | 146 | 29%（同一次请求内，在表达式之外） |
+
+结论：**链表插入 + 仲裁 + 二次扫描合计只有 4.4%**，把这三处换成连续数组/有序游标最多值 4%；
+真正支配的是 `get_next_token` 的逐字符循环（71%，其中 43% 直接在循环体、28% 在批处理与词典匹配）。
+另外 29% 是协议层把二进制 JSON 打成文本（`ObIJsonBase::print`），在表达式内无法消除——
+试过 `pack_json_str_res` 直接给文本，行编码侧会按二进制 JSON 解析而报 `ERROR 1235`。
+
+### 15.2 构建的 per-row 成本（700k 行代理实验，无分词器参与）
+
+| 实验 | 墙钟 | 每行 |
+|---|---|---|
+| 700k 行 heap 表 `INSERT ... SELECT` | 1.49 s | 2.1 µs |
+| 700k 行 `ALTER TABLE ADD INDEX(word, doc_id)`（排序 + 直接装载） | 1.84–1.98 s | 2.7 µs |
+| 700k 行按索引序 `INSERT`（有序输入，仍需走 DML） | 2.58 s | 3.7 µs |
+| FTS `build_ik_all`（两张辅助表共 1.4M 行） | 4.35 s | 3.1 µs |
+
+结论：**构建墙钟 ≈ 辅助表行数 × 2–3 µs/行**，分词与排序合计只占约 30%；FTS 的 per-row 成本
+已经和「同样行数的普通插入」同量级。所以「只并行化排序/写入」拿不到 15%，先要减行或换写入通道。
+
+### 15.3 两个方向的实际量级
+
+1. **去掉 `_fts_doc_word`（70 万行）**：构建预计 −35%～−40%，足以让综合提升率越过 50%；但该表
+   深度接入 DDL/DML（`ob_fts_index_build_task.cpp` 有独立 task id 与 doc rowkey task），
+   属于存储格式级改动，必须独立设计与回归。
+2. **把 IK 逐字符循环换成多模式自动机**：命中的是 71% 那部分，理论 −25%～40% 的分词时间；
+   而仲裁/链表重写在数据上只值 4%。
