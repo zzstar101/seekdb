@@ -156,10 +156,13 @@ public:
   virtual int get_curr_score(double &) const override { return OB_NOT_IMPLEMENT; }
   virtual int get_curr_id(const ObDatum *&) const override { return OB_NOT_IMPLEMENT; }
   virtual bool support_batch_doc_ids() const override { return true; }
+  int64_t fetched_count() const { return next_idx_; }
+  const std::vector<int64_t> &requested_capacities() const { return requested_capacities_; }
   void reuse()
   {
     next_idx_ = 0;
     batch_calls_ = 0;
+    requested_capacities_.clear();
   }
   virtual int get_next_doc_id_batch(
       const int64_t capacity,
@@ -170,6 +173,7 @@ public:
     doc_ids = nullptr;
     count = 0;
     ++batch_calls_;
+    requested_capacities_.push_back(capacity);
     if (fail_on_call_ == batch_calls_) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -192,6 +196,7 @@ private:
   int64_t batch_size_;
   int64_t batch_calls_;
   int64_t fail_on_call_;
+  std::vector<int64_t> requested_capacities_;
 };
 
 class FakeStringBatchDimIter final : public ObISRDaaTDimIter
@@ -1073,6 +1078,93 @@ TEST_F(CountOnlyBatchMergerTest, outer_count_segments_offset_before_result_capac
   run_outer_count(inputs, 3, 2, 2, OB_ITER_END, 2);
   run_outer_count(inputs, 7, 2, 2, OB_ITER_END, 0);
   run_outer_count(inputs, 0, 2, 2, OB_ITER_END, 2);
+}
+
+TEST_F(CountOnlyBatchMergerTest, small_output_request_bounds_prefetch_and_later_requests_grow)
+{
+  // An attached IR scan may have no pushed-down LIMIT. Its parent requests 20 output rows
+  // from a vectorized iterator whose maximum batch size is 256.
+  for (const int64_t limit : {int64_t(-1), int64_t(INT64_MAX)}) {
+    for (const int64_t dimensions : {1, 2, 3}) {
+      SCOPED_TRACE(limit);
+      SCOPED_TRACE(dimensions);
+      common::ObLimitParam limit_param;
+      limit_param.limit_ = limit;
+      limit_param.offset_ = 0;
+      ObSparseRetrievalMergeParam param;
+      param.limit_param_ = &limit_param;
+      param.max_batch_size_ = 256;
+      param.count_only_ = true;
+      common::ObArenaAllocator allocator;
+      common::ObSEArray<ObISRDaaTDimIter *, 4> dim_iters;
+      std::vector<std::unique_ptr<FakeBatchDimIter>> sources;
+      IdList input = {std::nullopt};
+      for (uint64_t id = 0; id < 600; ++id) {
+        input.push_back(id);
+      }
+      for (int64_t i = 0; i < dimensions; ++i) {
+        sources.emplace_back(new FakeBatchDimIter(input, 256));
+        ASSERT_EQ(OB_SUCCESS, dim_iters.push_back(sources.back().get()));
+      }
+      sql::ObDatumMeta id_meta;
+      id_meta.type_ = ObUInt64Type;
+      id_meta.cs_type_ = CS_TYPE_BINARY;
+      TestCountOnlyDaaTIter iter;
+      ASSERT_EQ(OB_SUCCESS, iter.init_for_count_test(param, dim_iters, allocator, id_meta));
+      int64_t count = 0;
+      ASSERT_EQ(OB_SUCCESS, iter.get_next_rows(20, count));
+      ASSERT_EQ(20, count);
+      for (const auto &source : sources) {
+        EXPECT_EQ(21, source->fetched_count());
+        ASSERT_EQ(1, source->requested_capacities().size());
+        EXPECT_EQ(21, source->requested_capacities()[0]);
+      }
+      int64_t total = count;
+      int ret = OB_SUCCESS;
+      for (int64_t calls = 0; OB_SUCCESS == ret && calls < 10; ++calls) {
+        ret = iter.get_next_rows(256, count);
+        ASSERT_TRUE(OB_SUCCESS == ret || OB_ITER_END == ret);
+        total += count;
+      }
+      EXPECT_EQ(OB_ITER_END, ret);
+      EXPECT_EQ(601, total); // NULL and cross-source duplicates remain one distinct ID each.
+      for (const auto &source : sources) {
+        ASSERT_GT(source->requested_capacities().size(), 1);
+        EXPECT_EQ(256, source->requested_capacities()[1]);
+      }
+    }
+  }
+}
+
+TEST_F(CountOnlyBatchMergerTest, prefetch_includes_offset_and_remaining_limit)
+{
+  common::ObLimitParam limit_param;
+  limit_param.offset_ = 30;
+  limit_param.limit_ = 20;
+  ObSparseRetrievalMergeParam param;
+  param.limit_param_ = &limit_param;
+  param.max_batch_size_ = 256;
+  param.count_only_ = true;
+  common::ObArenaAllocator allocator;
+  common::ObSEArray<ObISRDaaTDimIter *, 4> dim_iters;
+  IdList input;
+  for (uint64_t id = 0; id < 600; ++id) {
+    input.push_back(id);
+  }
+  FakeBatchDimIter source(input, 256);
+  ASSERT_EQ(OB_SUCCESS, dim_iters.push_back(&source));
+  sql::ObDatumMeta id_meta;
+  id_meta.type_ = ObUInt64Type;
+  id_meta.cs_type_ = CS_TYPE_BINARY;
+  TestCountOnlyDaaTIter iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init_for_count_test(param, dim_iters, allocator, id_meta));
+  int64_t count = 0;
+  EXPECT_EQ(OB_ITER_END, iter.get_next_rows(256, count));
+  EXPECT_EQ(20, count);
+  EXPECT_EQ(51, source.fetched_count());
+  EXPECT_EQ(OB_ITER_END, iter.get_next_rows(256, count));
+  EXPECT_EQ(0, count);
+  EXPECT_EQ(51, source.fetched_count());
 }
 
 TEST_F(CountOnlyBatchMergerTest, bulk_count_three_way_large_overlap_matches_single_id_api)
