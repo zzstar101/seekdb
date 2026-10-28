@@ -1,0 +1,202 @@
+name: FTS interleaved A/B (fork)
+
+# One job, one machine, two binaries, alternating repeats.
+#
+# Comparing two workflow runs cannot answer "did this commit make the build
+# slower": each run lands on a different runner and a single benchmark repeat
+# already spreads 40-60% on the build metrics. Here both commits are built in
+# the same job, then the two binaries take turns on the same machine, so a
+# machine-level drift hits both versions equally and the paired difference is
+# the only thing we look at.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_a:
+        description: 'Commit A (baseline)'
+        required: false
+        default: '9f846938b309a3e5320a61f71cb84ef8d375185a'
+        type: string
+      ref_b:
+        description: 'Commit B (candidate)'
+        required: false
+        default: '8b567cf64beef624bdac4d74f851d7351ef9ee20'
+        type: string
+      repeats:
+        description: 'Repeat pairs (A then B counts as one)'
+        required: false
+        default: '5'
+        type: choice
+        options: ['3', '5']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fts-ab-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ab:
+    name: Interleaved A/B on one runner
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    env:
+      REF_A: ${{ inputs.ref_a || '9f846938b309a3e5320a61f71cb84ef8d375185a' }}
+      REF_B: ${{ inputs.ref_b || '8b567cf64beef624bdac4d74f851d7351ef9ee20' }}
+      PAIRS: ${{ inputs.repeats || '5' }}
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Record runner shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| runner | ${RUNNER_NAME} |"
+            echo "| cpu model | $(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | sed 's/^ *//') |"
+            echo "| nproc | $(nproc) |"
+            echo "| memory | $(awk '/MemTotal/ {printf \"%.1f GiB\", $2/1024/1024}' /proc/meminfo) |"
+            echo "| ref A | ${REF_A} |"
+            echo "| ref B | ${REF_B} |"
+            echo "| pairs | ${PAIRS} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage helper scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The helpers live on the workflow branch, not on the commits under
+          # test, so they are copied out of the working tree before the first
+          # checkout of A.
+          mkdir -p "$RUNNER_TEMP/fts_tools"
+          cp .github/script/fts_bench/*.py "$RUNNER_TEMP/fts_tools/"
+          ls -l "$RUNNER_TEMP/fts_tools"
+
+      - name: Install build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y \
+            git wget rpm rpm2cpio cpio make build-essential binutils \
+            m4 libtool-bin libncurses5 python3 python3-pip
+          sudo apt-get install -y default-mysql-client \
+            || sudo apt-get install -y mysql-client
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build A
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$REF_A"
+          git checkout --detach FETCH_HEAD
+          echo "build A commit: $(git rev-parse HEAD)"
+          ./build.sh release --init
+          echo "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/bin" >> "$GITHUB_PATH"
+          cd build_release
+          make -j"$(nproc)"
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp src/observer/seekdb "$RUNNER_TEMP/bin/seekdb-A"
+          ls -l "$RUNNER_TEMP/bin/seekdb-A"
+          sha256sum "$RUNNER_TEMP/bin/seekdb-A" | tee "$RUNNER_TEMP/bin/seekdb-A.sha256"
+
+      - name: Build B
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only the files that differ move on disk, so make recompiles the
+          # handful of touched translation units instead of the whole tree.
+          git fetch --no-tags --depth=1 origin "$REF_B"
+          git checkout --detach FETCH_HEAD
+          echo "build B commit: $(git rev-parse HEAD)"
+          cd build_release
+          make -j"$(nproc)"
+          cp src/observer/seekdb "$RUNNER_TEMP/bin/seekdb-B"
+          ls -l "$RUNNER_TEMP/bin/seekdb-B"
+          sha256sum "$RUNNER_TEMP/bin/seekdb-B" | tee "$RUNNER_TEMP/bin/seekdb-B.sha256"
+
+      - name: Interleaved benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          for lib_dir in \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib" \
+            "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/lib64"; do
+            [ -d "$lib_dir" ] && export LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          done
+
+          OUT="$RUNNER_TEMP/fts-ab"
+          mkdir -p "$OUT"
+
+          export MYSQL="mysql -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4"
+          export MYSQL_VERBOSE="mysql -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4"
+
+          # A then B in every pair: any drift over the two hours of the loop
+          # (thermal, noisy neighbour) lands on both versions equally.
+          for i in $(seq 1 "${PAIRS}"); do
+            for v in A B; do
+              base="$OUT/db-$v-$i"
+              rm -rf "$base"
+              mkdir -p "$base"
+
+              "$RUNNER_TEMP/bin/seekdb-$v" --base-dir="$base" --port=2881 --nodaemon \
+                > "$OUT/server-$v-$i.log" 2>&1 &
+              server_pid=$!
+
+              python3 "$RUNNER_TEMP/fts_tools/wait_for_port.py" --port 2881 --timeout 900
+
+              echo "::group::pair $i version $v"
+              LABEL="$v-$i" OUTPUT="$OUT/run-$v-$i.txt" \
+                bash tools/benchmark/fts_large_bench.sh | tee "$OUT/run-$v-$i.stdout.txt"
+              echo "::endgroup::"
+
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+              cp -r "$base/log" "$OUT/log-$v-$i" 2>/dev/null || true
+            done
+          done
+
+      - name: Summarise paired results
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/fts_tools/ab_summary.py" "$RUNNER_TEMP/fts-ab" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-ab-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/fts-ab/run-*.txt
+            ${{ runner.temp }}/fts-ab/*.log
+          if-no-files-found: warn
+          retention-days: 14
