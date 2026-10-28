@@ -205,6 +205,32 @@ def main():
         dur = time.time() - t
         result["qps_batch_k%d" % k] = round(args.queries / dur, 1)
 
+    # --- concurrency consistency -------------------------------------------
+    # The bridge keeps a per-handle search workspace between calls.  The same
+    # query must return the same ids whether the handle is searched by one
+    # thread or by many, otherwise the evaluator's batched run would see a
+    # corrupted answer set.  Each worker uses its own connection, so this
+    # exercises the server side only.
+    nc = min(64, args.queries)
+    ref_ids = [knn_ids(cur, queries[i], 100) for i in range(nc)]
+    got_ids = [None] * nc
+
+    def cworker(shard):
+        c = pymysql.connect(host="127.0.0.1", port=args.port, user="root",
+                            password="", autocommit=True)
+        cu = c.cursor()
+        cu.execute("use bench")
+        for i in shard:
+            got_ids[i] = knn_ids(cu, queries[i], 100)
+        c.close()
+
+    shards = [list(range(i, nc, args.threads)) for i in range(args.threads)]
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        list(ex.map(cworker, shards))
+    result["concurrent_checked"] = nc
+    result["concurrent_mismatch"] = sum(
+        1 for a, b in zip(ref_ids, got_ids) if b is None or set(a) != set(b))
+
     out = args.out or "official_%d_%d.json" % (args.n, args.dim)
     with open(out, "w") as f:
         json.dump(result, f, indent=1)

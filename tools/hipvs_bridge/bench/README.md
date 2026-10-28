@@ -11,6 +11,9 @@ Scripts used for the numbers in
 | `sweep_bench.c` | build once, then sweep several `itopk`/`search_width`/`max_iterations` search settings |
 | `make_gt_fast.py` | exact brute-force ground truth (top-100) for a `<tag>_{base,query}.f32` pair |
 | `recal.py` | recall@10 / recall@100 of a dumped id file against the ground truth |
+| `bench_official.py` | contest protocol: `m=16, ef_construction=200, ef_search=64`, top-10 **and** top-100 latency + throughput, per-row validation, `--dim 256` for the second official shape, and a concurrent-vs-single-thread answer equality check (`concurrent_mismatch`) |
+| `run_matrix.sh` | A/B a matrix of `SEEKDB_CUVS_*` settings against the same data |
+| `test_bench_official.py` | offline self-test of the harness itself (ground truth vs exhaustive sort, recall sensitivity, row validation, fvecs/bvecs readers) — no GPU or database needed |
 
 Data layout: `<tag>_base.f32` and `<tag>_query.f32` are raw little-endian float32,
 row-major, `n × dim` and `nq × dim`.
@@ -22,6 +25,18 @@ hipcc -O2 -D__HIP_PLATFORM_AMD__ -x hip -I/opt/hipvs/include cagra_bench.c \
 python3 make_gt_fast.py <tag> 250000 128 4096
 python3 recal.py <tag> ids.bin 4096
 ```
+
+The contest protocol run (this is what the evaluator does):
+
+```bash
+python3 bench_official.py --n 250000 --dim 128 --queries 4096 --threads 8
+python3 bench_official.py --n 250000 --dim 256 --queries 4096 --threads 8   # Hidden250K shape
+python3 test_bench_official.py                                              # harness self-check
+```
+
+`concurrent_mismatch` must be `0`: it replays 64 queries single-threaded and then
+through `--threads` connections, and compares the id sets. A non-zero value means
+the bridge's per-handle workspace is being shared unsafely.
 
 Bridge knobs used by these runs: `SEEKDB_CUVS_NITER`, `SEEKDB_CUVS_GRAPH_DEGREE`,
 `SEEKDB_CUVS_INTER_DEGREE`, `SEEKDB_CUVS_ITOPK`, `SEEKDB_CUVS_SEARCH_WIDTH`
