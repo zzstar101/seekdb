@@ -58,7 +58,7 @@ int ObSRDaaTBatchIdMerger::init(
     ret = OB_INIT_TWICE;
   } else if (OB_UNLIKELY(dim_iters.count() <= 0 || batch_capacity <= 0
                          || current_ids.count() < dim_iters.count()
-                         || (dim_iters.count() > 2 && OB_ISNULL(merge_heap)))) {
+                         || (dim_iters.count() > 3 && OB_ISNULL(merge_heap)))) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     // Logical reuse keeps these fixed arrays. A smaller dimension set can share the existing
@@ -101,7 +101,7 @@ int ObSRDaaTBatchIdMerger::init(
         }
       }
     }
-    if (OB_SUCC(ret) && dim_cnt_ > 2) {
+    if (OB_SUCC(ret) && dim_cnt_ > 3) {
       if (OB_UNLIKELY(!merge_heap_->empty())) {
         ret = OB_ERR_UNEXPECTED;
       }
@@ -213,6 +213,8 @@ int ObSRDaaTBatchIdMerger::get_next_distinct_id(const ObDatum *&id_datum)
     ret = get_next_from_one(id_datum);
   } else if (2 == dim_cnt_) {
     ret = get_next_from_two(id_datum);
+  } else if (3 == dim_cnt_) {
+    ret = get_next_from_three(id_datum);
   } else {
     ret = get_next_from_heap(id_datum);
   }
@@ -281,6 +283,59 @@ int ObSRDaaTBatchIdMerger::get_next_from_two(const ObDatum *&id_datum)
         } else if (OB_FAIL(advance(1))) {
         }
       } else if (OB_SUCC(ret) && OB_FAIL(advance(choose))) {
+      }
+      if (OB_SUCC(ret) && emit) {
+        id_datum = &last_id_.get_datum();
+        return OB_SUCCESS;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && 0 == active_cnt_) {
+    ret = OB_ITER_END;
+  }
+  return ret;
+}
+
+int ObSRDaaTBatchIdMerger::get_next_from_three(const ObDatum *&id_datum)
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret) && active_cnt_ > 0) {
+    int64_t choose = -1;
+    uint64_t equal_head_mask = 0;
+    // Select the minimum and all of its equal heads in at most two comparisons. A null
+    // pointer marks an exhausted dimension; a NULL datum still participates in cmp_id().
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      const ObDatum *current = current_ids_->at(i);
+      int64_t cmp_ret = 0;
+      if (OB_ISNULL(current)) {
+      } else if (choose < 0) {
+        choose = i;
+        equal_head_mask = 1ULL << i;
+      } else if (OB_FAIL(merge_cmp_->cmp_id(*current, *current_ids_->at(choose), cmp_ret))) {
+      } else if (cmp_ret < 0) {
+        choose = i;
+        equal_head_mask = 1ULL << i;
+      } else if (0 == cmp_ret) {
+        equal_head_mask |= 1ULL << i;
+      }
+    }
+    if (OB_SUCC(ret) && OB_UNLIKELY(choose < 0)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_SUCC(ret)) {
+      const ObDatum *chosen = current_ids_->at(choose);
+      int64_t last_cmp_ret = 1;
+      // Keep the chosen value before advancing any dimension can replace a batch buffer.
+      // Comparing against it also deduplicates repeated ids within a single dimension.
+      if (has_last_id_
+          && OB_FAIL(merge_cmp_->cmp_id(*chosen, last_id_.get_datum(), last_cmp_ret))) {
+      } else if (0 != last_cmp_ret && OB_FAIL(last_id_.set_datum_fast(*chosen))) {
+      } else if (0 != last_cmp_ret) {
+        has_last_id_ = true;
+      }
+      const bool emit = OB_SUCC(ret) && 0 != last_cmp_ret;
+      for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+        if (0 != (equal_head_mask & (1ULL << i)) && OB_FAIL(advance(i))) {
+        }
       }
       if (OB_SUCC(ret) && emit) {
         id_datum = &last_id_.get_datum();

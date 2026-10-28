@@ -102,6 +102,7 @@ private:
   int advance(const int64_t iter_idx);
   int get_next_from_one(const ObDatum *&id_datum);
   int get_next_from_two(const ObDatum *&id_datum);
+  int get_next_from_three(const ObDatum *&id_datum);
   int get_next_from_heap(const ObDatum *&id_datum);
 private:
   ObIArray<ObISRDaaTDimIter *> *dim_iters_;

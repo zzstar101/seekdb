@@ -175,17 +175,12 @@ protected:
     id_meta.cs_type_ = CS_TYPE_BINARY;
     ASSERT_EQ(OB_SUCCESS, cmp.init(id_meta, &current_ids));
 
-    ObSRSimpleMerger heap(cmp);
     ObSRLoserTree loser_tree(cmp);
     ObSRMergeHeap *heap_ptr = nullptr;
     if (dim_iters.count() > 3) {
       ASSERT_EQ(OB_SUCCESS, loser_tree.init(dim_iters.count(), dim_iters.count(), allocator));
       ASSERT_EQ(OB_SUCCESS, loser_tree.open(dim_iters.count()));
       heap_ptr = &loser_tree;
-    } else if (dim_iters.count() > 2) {
-      ASSERT_EQ(OB_SUCCESS, heap.init(dim_iters.count(), dim_iters.count(), allocator));
-      ASSERT_EQ(OB_SUCCESS, heap.open(dim_iters.count()));
-      heap_ptr = &heap;
     }
 
     ObSRDaaTBatchIdMerger merger;
@@ -194,6 +189,9 @@ protected:
       collect(merger, actual, first_limit);
     }
     collect(merger, actual);
+    const ObDatum *id_datum = nullptr;
+    EXPECT_EQ(OB_ITER_END, merger.get_next_distinct_id(id_datum));
+    EXPECT_EQ(nullptr, id_datum);
   }
 };
 
@@ -234,6 +232,57 @@ TEST_F(CountOnlyBatchMergerTest, n_way_resumes_after_partial_batch)
       actual,
       4);
   EXPECT_EQ(ExpectedIds({1, 2, 3, 4, 5, 6, 7, 9, 10, 11}), actual);
+}
+
+TEST_F(CountOnlyBatchMergerTest, three_way_deduplicates_nulls_and_repeated_batch_ids)
+{
+  for (const int64_t batch_size : {1, 2, 3}) {
+    SCOPED_TRACE(batch_size);
+    ExpectedIds actual;
+    run_merge(
+        {{std::nullopt, std::nullopt, 1, 1, 3, 6, 6, 9},
+         {std::nullopt, 2, 3, 3, 6, 9, 9},
+         {std::nullopt, std::nullopt, 1, 4, 6, 6, 9}},
+        batch_size,
+        actual,
+        3);
+    EXPECT_EQ(ExpectedIds({std::nullopt, 1, 2, 3, 4, 6, 9}), actual);
+  }
+}
+
+TEST_F(CountOnlyBatchMergerTest, three_way_equal_final_id_is_emitted_before_all_end)
+{
+  ExpectedIds actual;
+  run_merge({{42}, {42}, {42}}, 1, actual, 1);
+  EXPECT_EQ(ExpectedIds({42}), actual);
+}
+
+TEST_F(CountOnlyBatchMergerTest, three_way_handles_empty_and_partial_exhaustion)
+{
+  // Exercise an empty first, middle, or last dimension and a survivor after its peer ends.
+  for (int64_t empty_idx = 0; empty_idx < 3; ++empty_idx) {
+    SCOPED_TRACE(empty_idx);
+    std::vector<IdList> inputs = {{}, {1, 4}, {2, 3, 4, 5}};
+    std::swap(inputs[0], inputs[empty_idx]);
+    ExpectedIds actual;
+    run_merge(inputs, 2, actual, 2);
+    EXPECT_EQ(ExpectedIds({1, 2, 3, 4, 5}), actual);
+  }
+}
+
+TEST_F(CountOnlyBatchMergerTest, three_way_handles_all_empty_or_one_remaining_dimension)
+{
+  ExpectedIds empty_result;
+  run_merge({{}, {}, {}}, 2, empty_result);
+  EXPECT_TRUE(empty_result.empty());
+  for (int64_t active_idx = 0; active_idx < 3; ++active_idx) {
+    SCOPED_TRACE(active_idx);
+    std::vector<IdList> inputs(3);
+    inputs[active_idx] = {std::nullopt, std::nullopt, 1, 1, 4, 4};
+    ExpectedIds actual;
+    run_merge(inputs, 2, actual, 1);
+    EXPECT_EQ(ExpectedIds({std::nullopt, 1, 4}), actual);
+  }
 }
 
 TEST_F(CountOnlyBatchMergerTest, loser_tree_four_way_handles_empty_and_partial_exhaustion)
