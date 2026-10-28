@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -42,17 +43,17 @@ namespace
 
 using CharType = ObFTCharUtil::CharType;
 
-int build_dat(ObIAllocator &alloc,
-              const std::initializer_list<const char *> &words,
-              ObFTDAT *&dat)
+int build_dat_from_strings(ObIAllocator &alloc,
+                           const std::vector<std::string> &words,
+                           ObFTDAT *&dat)
 {
   int ret = OB_SUCCESS;
   size_t dat_len = 0;
   ObFTTrie<void> trie(alloc, ObCollationType::CS_TYPE_UTF8MB4_BIN);
   ObFTTrieNodeData<void> node_data;
   ObFTDATBuilder<void> builder(alloc);
-  for (const char *word : words) {
-    if (OB_FAIL(trie.insert(ObString::make_string(word), node_data))) {
+  for (const std::string &word : words) {
+    if (OB_FAIL(trie.insert(ObString(static_cast<int32_t>(word.size()), word.data()), node_data))) {
       break;
     }
   }
@@ -64,6 +65,50 @@ int build_dat(ObIAllocator &alloc,
     ret = OB_ERR_UNEXPECTED;
   }
   return ret;
+}
+
+int build_dat(ObIAllocator &alloc,
+              const std::initializer_list<const char *> &words,
+              ObFTDAT *&dat)
+{
+  std::vector<std::string> copied_words;
+  copied_words.reserve(words.size());
+  for (const char *word : words) {
+    copied_words.emplace_back(word);
+  }
+  return build_dat_from_strings(alloc, copied_words, dat);
+}
+
+std::vector<std::string> make_branching_path_words(
+    const std::vector<std::string> &path,
+    const std::vector<std::vector<std::string>> &siblings)
+{
+  std::vector<std::string> words;
+  std::string prefix;
+  for (int64_t i = 0; i < static_cast<int64_t>(path.size()); ++i) {
+    prefix.append(path[static_cast<size_t>(i)]);
+    words.push_back(prefix);
+    if (i + 1 < static_cast<int64_t>(path.size())) {
+      for (const std::string &sibling : siblings[static_cast<size_t>(i)]) {
+        words.push_back(prefix + sibling);
+      }
+    }
+  }
+  return words;
+}
+
+std::vector<std::vector<std::string>> make_sibling_lists(const std::vector<int> &counts)
+{
+  static const char *sibling_chars[] = {"二", "三", "四", "五"};
+  std::vector<std::vector<std::string>> result;
+  for (int count : counts) {
+    std::vector<std::string> siblings;
+    for (int i = 0; i < count; ++i) {
+      siblings.emplace_back(sibling_chars[i]);
+    }
+    result.push_back(siblings);
+  }
+  return result;
 }
 
 struct TokenView
@@ -253,12 +298,84 @@ public:
   int64_t legacy_match_calls() const { return legacy_match_calls_; }
   int64_t single_match_calls() const { return single_match_calls_; }
 
+  void reset_counters()
+  {
+    code_lookup_calls_ = 0;
+    code_match_calls_ = 0;
+    legacy_match_calls_ = 0;
+    single_match_calls_ = 0;
+  }
+
 private:
   ObFTDATReader<void> reader_;
   mutable int64_t code_lookup_calls_ = 0;
   mutable int64_t code_match_calls_ = 0;
   mutable int64_t legacy_match_calls_ = 0;
   mutable int64_t single_match_calls_ = 0;
+};
+
+class CountingRangeDict final : public ObIFTDict
+{
+public:
+  explicit CountingRangeDict(const ObFTRangeDict &range) : range_(range) {}
+
+  int init() override { return OB_SUCCESS; }
+
+  int match(const ObString &single_word, ObDATrieHit &hit) const override
+  {
+    ++match_calls_;
+    return range_.match(single_word, hit);
+  }
+
+  int match(const ObString &words, bool &is_match) const override
+  {
+    return range_.match(words, is_match);
+  }
+
+  int match_with_hit(const ObString &single_word,
+                     const ObDATrieHit &last_hit,
+                     ObDATrieHit &hit) const override
+  {
+    ++match_with_hit_calls_;
+    if (single_word.length() == static_cast<int32_t>(sizeof(OVERFLOW_CHAR) - 1)
+        && 0 == memcmp(single_word.ptr(), OVERFLOW_CHAR, sizeof(OVERFLOW_CHAR) - 1)) {
+      ++overflow_char_match_calls_;
+    }
+    return range_.match_with_hit(single_word, last_hit, hit);
+  }
+
+  int find_word_code(const ObString &single_word,
+                     ObFTWordCode &code,
+                     bool &found) const override
+  {
+    return range_.find_word_code(single_word, code, found);
+  }
+
+  int match_with_code(const ObString &single_word,
+                      const ObFTWordCode code,
+                      const ObDATrieHit &last_hit,
+                      ObDATrieHit &hit) const override
+  {
+    return range_.match_with_code(single_word, code, last_hit, hit);
+  }
+
+  int64_t match_calls() const { return match_calls_; }
+  int64_t match_with_hit_calls() const { return match_with_hit_calls_; }
+  int64_t overflow_char_match_calls() const { return overflow_char_match_calls_; }
+
+  void reset_counters()
+  {
+    match_calls_ = 0;
+    match_with_hit_calls_ = 0;
+    overflow_char_match_calls_ = 0;
+  }
+
+private:
+  static constexpr char OVERFLOW_CHAR[] = "甲";
+  const ObFTRangeDict &range_;
+  mutable int64_t match_calls_ = 0;
+  mutable int64_t match_with_hit_calls_ = 0;
+  mutable int64_t overflow_char_match_calls_ = 0;
 };
 
 class IKDictionaryCacheTest : public ::testing::Test
@@ -395,6 +512,84 @@ TEST_F(IKDictionaryCacheTest, cjk_processor_matches_legacy_loop_across_dat_range
   ObIKCJKProcessor processor(dict, token_allocator_);
   ASSERT_EQ(OB_SUCCESS, process_candidate(candidate_ctx, processor));
   EXPECT_EQ(collect_tokens(reference_ctx), collect_tokens(candidate_ctx));
+  EXPECT_FALSE(collect_tokens(candidate_ctx).empty());
+}
+
+TEST_F(IKDictionaryCacheTest, five_dat_overflow_matches_legacy_loop)
+{
+  std::vector<std::string> paths[5];
+  paths[0] = {"一", "丁", "七", "万", "丈", "甲"};
+  paths[1] = {"丁", "七", "万", "丈", "甲"};
+  paths[2] = {"七", "万", "丈", "甲"};
+  paths[3] = {"万", "丈", "甲"};
+  paths[4] = {"丈", "甲"};
+  std::vector<int> sibling_count_values[5] = {
+      {1, 2, 3, 4, 1}, {1, 2, 3, 1}, {1, 2, 1}, {1, 2}, {1}};
+
+  ObFTDAT *dats[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  for (int i = 0; i < 5; ++i) {
+    const std::vector<std::string> words = make_branching_path_words(
+        paths[i], make_sibling_lists(sibling_count_values[i]));
+    ASSERT_EQ(OB_SUCCESS, build_dat_from_strings(dat_allocator_, words, dats[i]));
+  }
+
+  ObFTCacheDict first_dat_dict(ObCollationType::CS_TYPE_UTF8MB4_BIN, dats[0]);
+  ASSERT_EQ(OB_SUCCESS, first_dat_dict.init());
+  ObFTWordCode ding_code = 0;
+  ObFTWordCode qi_code = 0;
+  ObFTWordCode wan_code = 0;
+  bool found = false;
+  ASSERT_EQ(OB_SUCCESS, first_dat_dict.find_word_code(ObString::make_string("丁"), ding_code, found));
+  ASSERT_TRUE(found);
+  ASSERT_EQ(OB_SUCCESS, first_dat_dict.find_word_code(ObString::make_string("七"), qi_code, found));
+  ASSERT_TRUE(found);
+  ASSERT_EQ(OB_SUCCESS, first_dat_dict.find_word_code(ObString::make_string("万"), wan_code, found));
+  ASSERT_TRUE(found);
+  EXPECT_NE(ding_code, qi_code);
+  EXPECT_NE(qi_code, wan_code);
+
+  ObFTRangeDict range(dat_allocator_,
+                      nullptr,
+                      ObFTDictDesc(ObString::make_string("ik-overflow-test"),
+                                   ObFTDictType::DICT_IK_MAIN,
+                                   ObCharsetType::CHARSET_UTF8MB4,
+                                   ObCollationType::CS_TYPE_UTF8MB4_BIN));
+  ObSEArray<ObFTDAT *, 5> dat_blocks;
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_EQ(OB_SUCCESS, dat_blocks.push_back(dats[i]));
+  }
+  ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
+  CountingRangeDict counting_range(range);
+
+  const int64_t repeats = 200;
+  std::string text;
+  text.reserve(19 * repeats);
+  for (int64_t i = 0; i < repeats; ++i) {
+    text.append("一丁七万丈甲 ");
+  }
+
+  TokenizeContext reference_ctx(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                token_allocator_,
+                                text.data(),
+                                text.size(),
+                                false);
+  TokenizeContext candidate_ctx(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                token_allocator_,
+                                text.data(),
+                                text.size(),
+                                false);
+  ASSERT_EQ(OB_SUCCESS, reference_ctx.init());
+  ASSERT_EQ(OB_SUCCESS, candidate_ctx.init());
+  ASSERT_EQ(OB_SUCCESS, process_reference(reference_ctx, counting_range, token_allocator_));
+
+  counting_range.reset_counters();
+  ObIKCJKProcessor processor(counting_range, token_allocator_);
+  ASSERT_EQ(OB_SUCCESS, process_candidate(candidate_ctx, processor));
+
+  EXPECT_EQ(collect_tokens(reference_ctx), collect_tokens(candidate_ctx));
+  EXPECT_EQ(6 * repeats, counting_range.match_calls());
+  EXPECT_EQ(2 * repeats, counting_range.match_with_hit_calls());
+  EXPECT_EQ(repeats, counting_range.overflow_char_match_calls());
   EXPECT_FALSE(collect_tokens(candidate_ctx).empty());
 }
 
