@@ -171,6 +171,7 @@ TEST_F(FTSWordRowBufferTest, empty_documents_are_skipped_without_rows)
   EXPECT_EQ(OB_ITER_END, buffer.append(allocator_, &helper_, meta_, id, ObString(), true));
   EXPECT_EQ(OB_ITER_END, buffer.append(allocator_, &helper_, meta_, id, ObString::make_string("   "), true));
   EXPECT_EQ(0, buffer.get_row_count());
+  EXPECT_EQ(0, buffer.get_retained_bytes());
 
   ASSERT_EQ(OB_SUCCESS, buffer.append(allocator_, &helper_, meta_, id,
                                       ObString::make_string("aaa"), true));
@@ -217,6 +218,7 @@ TEST_F(FTSWordRowBufferTest, one_document_can_span_multiple_output_batches)
   ObDatum id = doc_id(id_value.c_str());
   ASSERT_EQ(OB_SUCCESS, buffer.append(allocator_, &helper_, meta_, id, as_ob_string(text), true));
   ASSERT_EQ(300, buffer.get_row_count());
+  EXPECT_GT(buffer.get_retained_bytes(), 0);
 
   const blocksstable::ObStorageDatum *rows = nullptr;
   int64_t count = 0;
@@ -308,31 +310,76 @@ TEST_F(FTSWordRowBufferTest, nondivisible_documents_refill_only_from_an_empty_bu
 
   EXPECT_EQ(document_count * words_per_document, emitted_rows);
   EXPECT_EQ(batch_capacity + words_per_document, max_buffered_rows);
+  buffer.reuse();
+  EXPECT_EQ(0, buffer.get_row_count());
+  EXPECT_EQ(0, buffer.get_retained_bytes());
 }
 
-TEST_F(FTSWordRowBufferTest, batch_does_not_cross_source_task_boundaries)
+TEST_F(FTSWordRowBufferTest, matches_scalar_fulltext_row_fields)
 {
   FTSWordRowBuffer buffer;
-  std::string first_id_value = "task-zero";
-  std::string second_id_value = "task-one";
-  ObDatum first_id = doc_id(first_id_value.c_str());
-  ObDatum second_id = doc_id(second_id_value.c_str());
-  ASSERT_EQ(OB_SUCCESS, buffer.append(allocator_, &helper_, meta_, first_id,
-                                      ObString::make_string("aaa bbb ccc"), true, 0));
-  ASSERT_EQ(OB_SUCCESS, buffer.append(allocator_, &helper_, meta_, first_id,
-                                      ObString::make_string("ddd eee"), true, 0));
-  ASSERT_EQ(OB_SUCCESS, buffer.append(allocator_, &helper_, meta_, second_id,
-                                      ObString::make_string("fff ggg hhh iii"), true, 1));
-
+  std::string text;
+  for (int64_t i = 0; i < 600; ++i) {
+    if (!text.empty()) {
+      text.push_back(' ');
+    }
+    const char token[] = {
+      static_cast<char>('a' + i % 26),
+      static_cast<char>('a' + (i / 26) % 26),
+      static_cast<char>('a' + (i / (26 * 26)) % 26)};
+    text.append(token, sizeof(token));
+  }
+  const std::string id_value = "field-oracle-doc";
+  ObDatum id = doc_id(id_value.c_str());
+  ObDASDomainUtils::ObDomainIndexRow oracle_rows;
+  ASSERT_EQ(OB_SUCCESS,
+            ObDASDomainUtils::generate_fulltext_word_rows(allocator_,
+                                                           &helper_,
+                                                           meta_,
+                                                           id,
+                                                           as_ob_string(text),
+                                                           true,
+                                                           oracle_rows));
+  ASSERT_EQ(OB_SUCCESS,
+            buffer.append(allocator_, &helper_, meta_, id, as_ob_string(text), true));
+  ASSERT_EQ(600, oracle_rows.count());
+  ASSERT_EQ(600, buffer.get_row_count());
   const blocksstable::ObStorageDatum *rows = nullptr;
   int64_t count = 0;
-  int64_t source_task_idx = OB_INVALID_INDEX;
-  ASSERT_EQ(OB_SUCCESS, buffer.get_next_batch(rows, count, 10, &source_task_idx));
-  EXPECT_EQ(5, count);
-  EXPECT_EQ(0, source_task_idx);
-  ASSERT_EQ(OB_SUCCESS, buffer.get_next_batch(rows, count, 10, &source_task_idx));
-  EXPECT_EQ(4, count);
-  EXPECT_EQ(1, source_task_idx);
+  ASSERT_EQ(OB_SUCCESS, buffer.get_next_batch(rows, count, oracle_rows.count()));
+  ASSERT_EQ(oracle_rows.count(), count);
+  auto as_string = [](const ObString &value) {
+    return std::string(value.ptr(), value.length());
+  };
+  for (int64_t i = 0; i < count; ++i) {
+    const blocksstable::ObDatumRow &oracle = *oracle_rows.at(i);
+    const blocksstable::ObStorageDatum *actual =
+        rows + i * FTSWordRowBuffer::COLUMN_COUNT;
+    EXPECT_EQ(as_string(oracle.storage_datums_[0].get_string()),
+              as_string(actual[0].get_string()));
+    EXPECT_EQ(as_string(oracle.storage_datums_[1].get_string()),
+              as_string(actual[1].get_string()));
+    EXPECT_EQ(oracle.storage_datums_[2].get_uint(), actual[2].get_uint());
+    EXPECT_EQ(oracle.storage_datums_[3].get_uint(), actual[3].get_uint());
+  }
+}
+
+TEST_F(FTSWordRowBufferTest, large_tokenless_documents_release_parser_scratch)
+{
+  ObFTIndexRowCache cache;
+  ASSERT_EQ(OB_SUCCESS,
+            cache.init(true, ObString::make_string("ngram"), ObString()));
+  const std::string id_value = "tokenless-doc";
+  ObDatum id = doc_id(id_value.c_str());
+  const std::string spaces(256L * 1024L, ' ');
+  for (int64_t i = 0; i < 32; ++i) {
+    EXPECT_EQ(OB_ITER_END, cache.append(meta_, id, as_ob_string(spaces)));
+    EXPECT_EQ(0, cache.get_row_count());
+    EXPECT_EQ(0, cache.get_retained_bytes());
+    EXPECT_EQ(0, cache.get_parse_scratch_used_bytes());
+  }
+  cache.reuse();
+  EXPECT_EQ(0, cache.get_parse_scratch_used_bytes());
 }
 
 } // namespace

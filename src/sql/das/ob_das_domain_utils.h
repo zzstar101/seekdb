@@ -36,8 +36,6 @@ namespace sql
 // Stable storage for FTS word rows produced by a table-scan batch.  A row has
 // four columns and adjacent rows are contiguous, so callers can expose the
 // batch to vectorized execution without constructing one ObDatumRow per word.
-// A source task id is retained per row so checksum consumers can keep batches
-// within one DAS task boundary.
 class FTSWordRowBuffer final
 {
 public:
@@ -51,15 +49,14 @@ public:
              const common::ObObjMeta &ft_obj_meta,
              const ObDatum &doc_id_datum,
              const common::ObString &fulltext,
-             const bool is_fts_index_aux,
-             const int64_t source_task_idx = OB_INVALID_INDEX);
+             const bool is_fts_index_aux);
   int get_next_row(const blocksstable::ObStorageDatum *&row);
   int get_next_batch(const blocksstable::ObStorageDatum *&rows,
                      int64_t &row_count,
-                     const int64_t max_row_count,
-                     int64_t *source_task_idx = nullptr);
+                     const int64_t max_row_count);
   int64_t get_pending_row_count() const { return row_count_ - row_idx_; }
   int64_t get_row_count() const { return row_count_; }
+  int64_t get_retained_bytes() const { return retained_bytes_; }
   void reuse();
 
   TO_STRING_KV(K_(capacity), K_(row_count), K_(row_idx), KP_(datums));
@@ -70,10 +67,10 @@ private:
                         blocksstable::ObStorageDatum &dst);
 private:
   blocksstable::ObStorageDatum *datums_;
-  int64_t *source_task_idxs_;
   int64_t capacity_;
   int64_t row_count_;
   int64_t row_idx_;
+  int64_t retained_bytes_;
 
   DISALLOW_COPY_AND_ASSIGN(FTSWordRowBuffer);
 };
@@ -95,21 +92,22 @@ public:
       const common::ObString &parser_properties);
   int append(const common::ObObjMeta &ft_obj_meta,
              const ObDatum &doc_id,
-             const common::ObString &fulltext,
-             const int64_t source_task_idx);
+             const common::ObString &fulltext);
   int get_next_row(const blocksstable::ObStorageDatum *&row);
   int get_next_batch(const blocksstable::ObStorageDatum *&rows,
                      int64_t &row_count,
-                     const int64_t max_row_count,
-                     int64_t *source_task_idx = nullptr);
+                     const int64_t max_row_count);
   int64_t get_pending_row_count() const { return words_.get_pending_row_count(); }
   int64_t get_row_count() const { return words_.get_row_count(); }
+  int64_t get_retained_bytes() const { return words_.get_retained_bytes(); }
+  int64_t get_parse_scratch_used_bytes() const { return parse_allocator_.used(); }
   void reset();
   void reuse();
   TO_STRING_KV(K_(is_fts_index_aux), K_(helper), K_(is_inited),
                "row_count", words_.get_row_count());
 private:
   lib::MemoryContext merge_memctx_;
+  common::ObArenaAllocator parse_allocator_;
   FTSWordRowBuffer words_;
   bool is_fts_index_aux_;
   storage::ObFTParseHelper helper_;
@@ -254,7 +252,6 @@ public:
 private:
   friend class FTSWordRowBuffer;
   static int segment_and_calc_word_count(
-      common::ObIAllocator &allocator,
       storage::ObFTParseHelper *helper,
       const common::ObObjMeta &meta,
       const ObString &fulltext,

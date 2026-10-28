@@ -612,8 +612,7 @@ protected:
   int ensure_ddl_column_checksum_array();
   int get_ddl_checksum_task_idx(int64_t &task_idx) const;
   int add_ddl_column_checksum();
-  int add_ddl_column_checksum_batch(const int64_t row_count,
-                                    const int64_t task_idx_override = OB_INVALID_INDEX);
+  int add_ddl_column_checksum_batch(const int64_t row_count);
   int check_has_invalid_outrow_lob(const bool is_batch);
   int report_ddl_column_checksum();
   int get_next_batch_with_das(int64_t &count, int64_t capacity);
@@ -742,7 +741,6 @@ protected:
   ObFTIndexRowCache fts_index_;
   ObExpr *fts_output_exprs_[4];
   bool fts_source_end_;
-  int64_t fts_batch_task_idx_;
 
   // output_ is used to output data, TSC operator directly invokes output_::get_next_row(s),
   // it points to fold_iter_ in group rescan and iter_tree_ in normal scan.

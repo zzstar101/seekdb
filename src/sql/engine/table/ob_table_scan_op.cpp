@@ -681,7 +681,6 @@ ObTableScanOp::ObTableScanOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOp
     fts_index_(),
     fts_output_exprs_(),
     fts_source_end_(false),
-    fts_batch_task_idx_(OB_INVALID_INDEX),
     output_   (nullptr),
     fold_iter_(nullptr),
     iter_tree_(nullptr),
@@ -1521,7 +1520,6 @@ int ObTableScanOp::inner_close()
   if (OB_SUCC(ret)) {
     fts_index_.reuse();
     fts_source_end_ = false;
-    fts_batch_task_idx_ = OB_INVALID_INDEX;
     iter_end_ = false;
     need_init_before_get_row_ = true;
     rand_scan_processor_.reset();
@@ -1669,7 +1667,6 @@ int ObTableScanOp::inner_rescan_for_tsc()
   if (MY_SPEC.is_fts_ddl_) {
     fts_index_.reuse();
     fts_source_end_ = false;
-    fts_batch_task_idx_ = OB_INVALID_INDEX;
   }
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
@@ -2223,6 +2220,7 @@ int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
+  const bool is_fts_expansion = MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_;
   clear_evaluated_flag();
   int64_t batch_size = min(max_row_cnt, MY_SPEC.max_batch_size_);
   if (OB_UNLIKELY(0 == limit_param_.limit_)) {
@@ -2278,20 +2276,19 @@ int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
 
   if (OB_SUCC(ret)) {
     const ExprFixedArray &storage_output = MY_CTDEF.get_das_output_exprs();
-    if (!MY_SPEC.is_global_index_back()) {
+    if (!MY_SPEC.is_global_index_back() && !is_fts_expansion) {
       ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);
       guard.set_batch_size(brs_.size_);
       PRINT_VECTORIZED_ROWS(SQL, DEBUG, eval_ctx_, storage_output, brs_.size_, brs_.skip_,
                             K(MY_CTDEF.scan_ctdef_.ref_table_id_));
     }
-    const int64_t checksum_task_idx = (MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_)
-        ? fts_batch_task_idx_ : OB_INVALID_INDEX;
-    if (OB_FAIL(add_ddl_column_checksum_batch(brs_.size_, checksum_task_idx))) {
+    if (!is_fts_expansion && OB_FAIL(add_ddl_column_checksum_batch(brs_.size_))) {
     } else if (OB_FAIL(check_has_invalid_outrow_lob(true/*is_batch*/))) {
     }
   }
 
-  if (OB_SUCC(ret) && brs_.end_ && OB_NOT_NULL(scan_iter_) && scan_iter_->has_task()) {
+  if (OB_SUCC(ret) && brs_.end_ && OB_NOT_NULL(scan_iter_) && scan_iter_->has_task()
+      && !is_fts_expansion) {
 //    ObIPartitionGroup *partition = NULL;
 //    ObIPartitionGroupGuard *guard = NULL;
 //    if (OB_ISNULL(guard)) {
@@ -2789,33 +2786,22 @@ int ObTableScanOp::add_ddl_column_checksum()
   return ret;
 }
 
-int ObTableScanOp::add_ddl_column_checksum_batch(const int64_t row_count,
-                                                 const int64_t task_idx_override)
+int ObTableScanOp::add_ddl_column_checksum_batch(const int64_t row_count)
 {
   int ret = OB_SUCCESS;
   if (report_checksum_) {
     const int64_t cnt = MY_SPEC.output_.count();
     int64_t task_idx = OB_INVALID_INDEX;
     if (OB_FAIL(ensure_ddl_column_checksum_array())) {
-    } else if (row_count > 0 && OB_INVALID_INDEX != task_idx_override) {
-      if (OB_ISNULL(scan_iter_)
-          || OB_UNLIKELY(task_idx_override < 0
-                         || task_idx_override >= scan_iter_->get_das_task_cnt())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid fts checksum task index", K(ret), K(task_idx_override), KPC(scan_iter_));
-      } else {
-        task_idx = task_idx_override;
-      }
     } else if (row_count > 0 && OB_FAIL(get_ddl_checksum_task_idx(task_idx))) {
       LOG_WARN("get ddl checksum task index failed", K(ret));
-    }
-    if (OB_SUCC(ret) && OB_UNLIKELY(col_need_reshape_.count() != cnt)) {
+    } else if (row_count > 0 && OB_UNLIKELY(col_need_reshape_.count() != cnt)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("error unexpected, column cnt mismatch", K(ret), K(cnt), K(col_need_reshape_.count()));
     }
 
     ObDatum store_datum;
-    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.output_.count(); ++i) {
+    for (int64_t i = 0; OB_SUCC(ret) && row_count > 0 && i < MY_SPEC.output_.count(); ++i) {
       const ObExpr *e = MY_SPEC.output_[i];
       if (OB_ISNULL(e)) {
         ret = OB_ERR_UNEXPECTED;
@@ -2838,8 +2824,8 @@ int ObTableScanOp::add_ddl_column_checksum_batch(const int64_t row_count,
         }
       }
     }
-    if (OB_SUCC(ret)) {
-      ddl_checksum_accumulated_ = ddl_checksum_accumulated_ || row_count > 0;
+    if (OB_SUCC(ret) && row_count > 0) {
+      ddl_checksum_accumulated_ = true;
       LOG_DEBUG("add ddl column checksum",
                 K(MY_CTDEF.get_das_output_exprs()),
                 K(MY_CTDEF.get_full_acccess_cids()),
@@ -3678,19 +3664,18 @@ int ObTableScanOp::inner_get_next_fts_index_row()
 
 int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t capacity)
 {
+  static constexpr int64_t FTS_BATCH_RETAINED_BYTES_LIMIT = 1024L * 1024L;
   int ret = OB_SUCCESS;
   const blocksstable::ObStorageDatum *rows = nullptr;
   int64_t row_count = 0;
   if (OB_UNLIKELY(capacity <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    int64_t batch_task_idx = OB_INVALID_INDEX;
-    fts_batch_task_idx_ = OB_INVALID_INDEX;
     // Drain the previous fill group before scanning more documents.  Refilling
     // only from an empty buffer keeps consumed row datums from accumulating
     // until the end of the scan.
     if (fts_index_.get_pending_row_count() > 0) {
-      ret = fts_index_.get_next_batch(rows, row_count, capacity, &batch_task_idx);
+      ret = fts_index_.get_next_batch(rows, row_count, capacity);
     } else {
       fts_index_.reuse();
       {
@@ -3702,7 +3687,9 @@ int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t capacity)
         source_guard.set_batch_size(1);
         while (OB_SUCC(ret)
                && !fts_source_end_
-               && fts_index_.get_pending_row_count() < capacity) {
+               && fts_index_.get_pending_row_count() < capacity
+               && (0 == fts_index_.get_pending_row_count()
+                   || fts_index_.get_retained_bytes() < FTS_BATCH_RETAINED_BYTES_LIMIT)) {
           if (OB_FAIL(fetch_next_fts_index_rows())) {
             if (OB_ITER_END == ret) {
               ret = OB_SUCCESS;
@@ -3715,7 +3702,7 @@ int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t capacity)
       } else if (0 == fts_index_.get_pending_row_count()) {
         ret = OB_ITER_END;
       } else {
-        ret = fts_index_.get_next_batch(rows, row_count, capacity, &batch_task_idx);
+        ret = fts_index_.get_next_batch(rows, row_count, capacity);
       }
     }
     if (OB_FAIL(ret)) {
@@ -3727,7 +3714,6 @@ int ObTableScanOp::inner_get_next_fts_index_batch(const int64_t capacity)
       brs_.end_ = false;
       brs_.all_rows_active_ = true;
       brs_.skip_->reset(row_count);
-      fts_batch_task_idx_ = batch_task_idx;
       if (fts_source_end_ && 0 == fts_index_.get_pending_row_count()) {
         iter_end_ = true;
       }
@@ -3747,16 +3733,14 @@ int ObTableScanOp::fetch_next_fts_index_rows()
     ObExpr *doc_id_expr = fts_output_exprs_[doc_id_expr_idx];
     ObDatum *ft_datum = nullptr;
     ObDatum *doc_id_datum = nullptr;
-    int64_t source_task_idx = OB_INVALID_INDEX;
 
     if (OB_FAIL(ObTableScanOp::inner_get_next_row_implement())) {
-      if (OB_ITER_END != ret) {
+      if (OB_ITER_END == ret) {
+        // The scalar source reports its checksum and sets iter_end_ at this
+        // point.  Expanded word rows can still be pending, so only the FTS
+        // cache may terminate this operator.
+        iter_end_ = false;
       }
-    } else if (MY_SPEC.report_col_checksum_
-               && (OB_ISNULL(scan_iter_)
-                   || (scan_iter_->get_das_task_cnt() > 1 && !scan_iter_->is_sequential_output()))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("fts ddl checksum requires sequential das output", K(ret), KPC(scan_iter_));
     } else if (OB_UNLIKELY(0 == (++iterated_rows_ % CHECK_STATUS_ROWS_INTERVAL))
                && OB_FAIL(ctx_.check_status())) {
     } else if (OB_ISNULL(ft_expr) || OB_ISNULL(doc_id_expr)) {
@@ -3766,33 +3750,21 @@ int ObTableScanOp::fetch_next_fts_index_rows()
     } else if (OB_ISNULL(ft_datum) || OB_ISNULL(doc_id_datum)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      if (OB_NOT_NULL(scan_iter_)) {
-        if (1 == scan_iter_->get_das_task_cnt()) {
-          source_task_idx = 0;
-        } else if (scan_iter_->is_sequential_output()) {
-          source_task_idx = scan_iter_->get_current_seq_task_idx();
-        }
-      }
-      if (MY_SPEC.report_col_checksum_ && OB_UNLIKELY(source_task_idx < 0)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid fts source task index", K(ret), K(source_task_idx), KPC(scan_iter_));
+      ObString ft = ft_datum->get_string();
+      ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);
+      if (OB_FAIL(ObTextStringHelper::read_real_string_data(get_exec_ctx(),
+                                                            tmp_allocator,
+                                                            *ft_datum,
+                                                            ft_expr->datum_meta_,
+                                                            ft_expr->obj_meta_.has_lob_header(),
+                                                            ft))) {
+      } else if (OB_FAIL(fts_index_.append(ft_expr->obj_meta_, *doc_id_datum, ft))
+                 && OB_ITER_END != ret) {
+      } else if (OB_ITER_END == ret) {
+        has_segment_word = false;
+        ret = OB_SUCCESS;
       } else {
-        ObString ft = ft_datum->get_string();
-        ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);
-        if (OB_FAIL(ObTextStringHelper::read_real_string_data(get_exec_ctx(),
-                                                              tmp_allocator,
-                                                              *ft_datum,
-                                                              ft_expr->datum_meta_,
-                                                              ft_expr->obj_meta_.has_lob_header(),
-                                                              ft))) {
-        } else if (OB_FAIL(fts_index_.append(ft_expr->obj_meta_, *doc_id_datum, ft, source_task_idx))
-                   && OB_ITER_END != ret) {
-        } else if (OB_ITER_END == ret) {
-          has_segment_word = false;
-          ret = OB_SUCCESS;
-        } else {
-          has_segment_word = true;
-        }
+        has_segment_word = true;
       }
     }
   }
