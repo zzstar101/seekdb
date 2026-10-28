@@ -310,7 +310,10 @@ TEST_F(FTSWordRowBufferTest, nondivisible_documents_refill_only_from_an_empty_bu
   }
 
   EXPECT_EQ(document_count * words_per_document, emitted_rows);
-  EXPECT_EQ(batch_capacity + words_per_document, max_buffered_rows);
+  // A refill group may overshoot the target by one document, but it must not
+  // retain rows across output batches.
+  EXPECT_LE(max_buffered_rows, batch_capacity + words_per_document - 1);
+  EXPECT_GE(max_buffered_rows, batch_capacity);
   buffer.reuse();
   EXPECT_EQ(0, buffer.get_row_count());
   EXPECT_EQ(0, buffer.get_retained_bytes());
@@ -368,8 +371,9 @@ TEST_F(FTSWordRowBufferTest, matches_scalar_fulltext_row_fields)
 TEST_F(FTSWordRowBufferTest, large_tokenless_documents_release_parser_scratch)
 {
   ObFTIndexRowCache cache;
+  // ObFTIndexRowCache expects the serialized "name.version" parser form.
   ASSERT_EQ(OB_SUCCESS,
-            cache.init(true, ObString::make_string("ngram"), ObString()));
+            cache.init(true, ObString::make_string("ngram.1"), ObString()));
   const std::string id_value = "tokenless-doc";
   ObDatum id = doc_id(id_value.c_str());
   const std::string spaces(256L * 1024L, ' ');
