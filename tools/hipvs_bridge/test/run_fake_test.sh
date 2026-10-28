@@ -29,6 +29,16 @@ set +e
 rc_shipped=$?
 set -e
 
+echo "== parameter policy and serialise round trip"
+"$CC" -O2 -pthread -std=gnu11 -w \
+  -I"$HERE/stubs" -I"$BRIDGE_DIR" \
+  "$HERE/fake_cuvs.c" "$HERE/test_build_params.c" "$BRIDGE_DIR/seekdb_cuvs_bridge.c" \
+  -o "$TMP/params" -lm
+set +e
+"$TMP/params"
+rc_params=$?
+set -e
+
 echo "== build bridge with the per-handle lock removed"
 sed -e 's/pthread_mutex_lock(&h->mu)/(0)/' \
     -e 's/pthread_mutex_unlock(&h->mu)/(0)/' \
@@ -44,8 +54,8 @@ rc_nolock=$?
 set -e
 
 echo
-if [ "$rc_shipped" -eq 0 ] && [ "$rc_nolock" -ne 0 ]; then
-  echo "PASS: serialised bridge is clean, lock-free variant is caught"
+if [ "$rc_shipped" -eq 0 ] && [ "$rc_nolock" -ne 0 ] && [ "$rc_params" -eq 0 ]; then
+  echo "PASS: serialised bridge is clean, lock-free variant is caught, parameters pinned"
   exit 0
 fi
 if [ "$rc_shipped" -ne 0 ] && [ "$rc_nolock" -ne 0 ]; then

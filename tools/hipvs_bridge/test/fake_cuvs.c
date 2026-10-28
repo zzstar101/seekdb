@@ -55,6 +55,8 @@ cuvsError_t cuvsCagraSearchParamsCreate(cuvsCagraSearchParams_t* p) {
 }
 cuvsError_t cuvsCagraSearchParamsDestroy(cuvsCagraSearchParams_t p) { free(p); return CUVS_SUCCESS; }
 
+static struct fake_index g_last;
+
 cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
                            DLManagedTensor* ds, cuvsCagraIndex_t idx) {
   struct fake_index* f = (struct fake_index*)idx;
@@ -64,8 +66,13 @@ cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
   f->niter = p->nn_descent_niter;
   f->graph_degree = p->graph_degree;
   f->inter_degree = p->intermediate_graph_degree;
+  g_last = *f;
   return CUVS_SUCCESS;
 }
+
+long fake_last_niter(void) { return (long)g_last.niter; }
+long fake_last_degree(void) { return (long)g_last.graph_degree; }
+long fake_last_inter_degree(void) { return (long)g_last.inter_degree; }
 
 cuvsError_t cuvsCagraSearch(cuvsResources_t r, cuvsCagraSearchParams_t sp,
                             cuvsCagraIndex_t idx, DLManagedTensor* qt,
@@ -111,11 +118,13 @@ cuvsError_t cuvsCagraDeserialize(cuvsResources_t r, const char* path, cuvsCagraI
 }
 
 cuvsError_t cuvsCagraIndexGetSize(cuvsCagraIndex_t idx, int64_t* out) {
-  (void)idx; *out = 0; return CUVS_SUCCESS;
+  *out = (int64_t)((const struct fake_index*)idx)->n; return CUVS_SUCCESS;
 }
 cuvsError_t cuvsCagraIndexGetDims(cuvsCagraIndex_t idx, int64_t* out) {
-  (void)idx; *out = 0; return CUVS_SUCCESS;
+  *out = (int64_t)((const struct fake_index*)idx)->dim; return CUVS_SUCCESS;
 }
+
+
 
 /* the fake runtime's memcpy: the "device" and the host share memory here */
 int cudaMemcpy(void* dst, const void* src, size_t n, int kind) {
