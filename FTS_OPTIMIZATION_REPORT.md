@@ -974,3 +974,34 @@ merger 内部做数据表示改造不会带来量级变化。
 
 因此：`_fts_doc_word` 的 70 万行不是可回收的成本，该方向关闭；构建要继续下降，只能针对倒排表
 的全局排序（37%）与写入（24%），即「生成阶段就按词序分段、各段独立有序落盘再合并」这类改造。
+
+## 16 并行构建可行性的实证结论（2026-10-28）
+
+本轮目标是回答「辅助表构建能否由多个 writer 并发写同一 tablet」。结论：**当前基础设施不允许，
+而且不足 5 行的开关就能打开它**。三条证据与一个上限测量：
+
+1. `_parallel_ddl_control='create_index:off'`（server 级配置）对 FTS 辅助表构建没有任何影响：
+   交错 3 组，`on` 平均 2.97 s、`off` 平均 3.07 s（20k 行 `fti_content_ik`），差异在噪声内。
+   即该开关不会改变辅助表 insert 链路。
+2. writer 线程数 = insert DFO 的 PX task 数：`src/sql/engine/px/ob_px_sub_coord.cpp:715-718`
+   （`worker_count_ = sqc.get_task_count()`）→ `src/storage/ddl/ob_direct_insert.cpp:239-240,264`
+   （`dag_param.ddl_thread_count_ = worker_count_`、`thread_pool_.init(worker_count_)`）。
+   insert DFO 只有 1 个 task，因此 DAG 只有 1 个写线程。
+3. slice 模型是「序号区间」而非「key 区间」：`src/storage/ddl/ob_ddl_struct.h:432-471`
+   （`slice_idx_/slice_count_/start_sequence_`），`ObRsSliceWriter` 只有 `append_current_row`
+   （`src/storage/ddl/ob_tablet_slice_writer.h:175`）。`T_PSEUDO_DDL_SLICE_ID` 只有消费侧
+   （`src/sql/engine/pdml/static/ob_px_sstable_insert_op.cpp:85,327`）和一个 resolver 包装
+   （`src/sql/resolver/expr/ob_raw_expr_util.cpp:5883`），**没有任何地方为 FTS 辅助表计算它**。
+   因此今天辅助表构建必然是单 slice、`slice_idx` 恒 0。
+
+上限测量：同样 700k 行、同样 4 列的普通表走 direct-load 是 2.7 µs/行，而 FTS 辅助表构建是
+4.7 µs/行（`build_ik_content` 3.33 s / 700k）。也就是说**约 43% 的构建时间是 FTS 专用链路
+（词行展开 + 排序 + 物化 + 单流 append）的开销**，把这部分做到普通 direct-load 水平即可让三项
+构建平均再降约 40%，对应综合提升率跨过 0.50。
+
+PoC 的最小闭环（尚未实现，按依赖排序）：
+（i）辅助表 DDL 计划给 insert DFO 起 2 个 task；（ii）在 SORT 之后按 `(word, doc_id)` 的真实
+collation 序做 range-repartition，并用 `build_op_pseudo_column_expr(T_PSEUDO_DDL_SLICE_ID)`
+标注每行的 slice id，使现有 `switch_slice_if_need()` 路由到两个 writer；
+（iii）校验两 writer 活跃区间重叠、辅助表逐词 DF/posting 与旧路径一致、20k 与 10× 数据墙钟 A/B。
+止损条件：若两个 task 无法并发拿到行，或收益 < 10%，维持当前提交。
