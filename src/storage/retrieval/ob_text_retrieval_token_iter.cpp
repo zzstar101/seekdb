@@ -682,10 +682,19 @@ int ObTextRetrievalDaaTTokenIter::build_owned_doc_id_batch(
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_ISNULL(source_ids.datums_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_UNLIKELY(source_count > INT64_MAX / 16)) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (OB_FAIL(ensure_owned_payload_capacity(source_count * 16, 0))) {
+    // Reserve the fixed-width upper bound once per batch. Document ids are fixed-width keys in
+    // practice, so the common path below then needs a single copy and no per-row capacity check.
   } else {
+    ObDatum *const owned_datums = owned_batch_datums_.get_data();
     for (int64_t i = 0; OB_SUCC(ret) && i < source_count; ++i) {
+      const ObDatum *source = source_ids.datums_ + i;
       if (OB_NOT_NULL(skip) && skip->at(i)) {
         continue;
+      } else if (OB_ISNULL(source)) {
+        ret = OB_ERR_UNEXPECTED;
       } else if (OB_NOT_NULL(source_relevances)) {
         const ObDatum *relevance = source_relevances->at(i);
         if (OB_ISNULL(relevance)) {
@@ -695,8 +704,28 @@ int ObTextRetrievalDaaTTokenIter::build_owned_doc_id_batch(
         }
       }
       if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(append_owned_doc_id(*source_ids.at(i), count, count))) {
+      } else if (OB_UNLIKELY(source->is_null())) {
+        owned_datums[count].set_null();
+        ++count;
+      } else if (OB_UNLIKELY(source->len_ > 16 || 0 == source->len_)) {
+        // Variable-width and zero-length ids keep the exact-size capacity path.
+        if (OB_FAIL(append_owned_doc_id(*source, count, count))) {
+        } else {
+          ++count;
+        }
       } else {
+        char *dst = owned_payload_buf_ + owned_payload_used_;
+        if (16 == source->len_) {
+          MEMCPY(dst, source->ptr_, 16);
+        } else if (8 == source->len_) {
+          MEMCPY(dst, source->ptr_, 8);
+        } else {
+          MEMCPY(dst, source->ptr_, source->len_);
+        }
+        ObDatum &owned = owned_datums[count];
+        owned = *source;
+        owned.ptr_ = dst;
+        owned_payload_used_ += source->len_;
         ++count;
       }
     }

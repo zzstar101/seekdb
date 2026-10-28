@@ -319,6 +319,12 @@ int ObSRDaaTBatchIdMerger::get_next_distinct_count(const int64_t capacity, int64
   } else if (0 == active_cnt_) {
     ret = OB_ITER_END;
   } else {
+    // Cache the per-dimension merge state in raw pointers: scanning them out of the owning
+    // containers costs an out-of-line accessor call per document-id comparison and per advance.
+    const ObDatum **const heads = current_ids_->get_data();
+    int64_t *const positions = batch_positions_.get_data();
+    const int64_t *const counts = batch_counts_.get_data();
+    const ObDatum *const *const batch_ids = batch_ids_.get_data();
     while (OB_SUCC(ret) && count < capacity && active_cnt_ > 0) {
       int64_t choose = -1;
       uint64_t equal_head_mask = 0;
@@ -328,8 +334,8 @@ int ObSRDaaTBatchIdMerger::get_next_distinct_count(const int64_t capacity, int64
           equal_head_mask = 1;
         }
       } else if (2 == dim_cnt_) {
-        const ObDatum *left = current_ids_->at(0);
-        const ObDatum *right = current_ids_->at(1);
+        const ObDatum *left = heads[0];
+        const ObDatum *right = heads[1];
         int64_t cmp_ret = 1;
         if (OB_ISNULL(left) && OB_ISNULL(right)) {
           ret = OB_ERR_UNEXPECTED;
@@ -349,13 +355,13 @@ int ObSRDaaTBatchIdMerger::get_next_distinct_count(const int64_t capacity, int64
         }
       } else {
         for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
-          const ObDatum *current = current_ids_->at(i);
+          const ObDatum *current = heads[i];
           int64_t cmp_ret = 0;
           if (OB_ISNULL(current)) {
           } else if (choose < 0) {
             choose = i;
             equal_head_mask = 1ULL << i;
-          } else if (OB_FAIL(merge_cmp_->cmp_id(*current, *current_ids_->at(choose), cmp_ret))) {
+          } else if (OB_FAIL(merge_cmp_->cmp_id(*current, *heads[choose], cmp_ret))) {
           } else if (cmp_ret < 0) {
             choose = i;
             equal_head_mask = 1ULL << i;
@@ -367,7 +373,7 @@ int ObSRDaaTBatchIdMerger::get_next_distinct_count(const int64_t capacity, int64
       if (OB_SUCC(ret) && OB_UNLIKELY(choose < 0)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_SUCC(ret)) {
-        const ObDatum *chosen = current_ids_->at(choose);
+        const ObDatum *chosen = heads[choose];
         int64_t cmp_ret = 1;
         if (OB_ISNULL(chosen)) {
           ret = OB_ERR_UNEXPECTED;
@@ -385,9 +391,11 @@ int ObSRDaaTBatchIdMerger::get_next_distinct_count(const int64_t capacity, int64
             // payload. Keep the test inline so the common in-batch path adds no function call.
             if (has_bulk_last_id_
                 && bulk_last_id_source_dim_ == i
-                && batch_positions_[i] + 1 >= batch_counts_[i]
+                && positions[i] + 1 >= counts[i]
                 && OB_FAIL(preserve_bulk_last_id())) {
-            } else if (OB_FAIL(advance(i))) {
+            } else if (++positions[i] < counts[i]) {
+              heads[i] = batch_ids[i] + positions[i];
+            } else if (OB_FAIL(load_batch(i))) {
             }
           }
         }
