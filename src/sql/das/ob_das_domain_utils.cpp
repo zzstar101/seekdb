@@ -48,51 +48,8 @@ FTSWordRowBuffer::FTSWordRowBuffer()
     capacity_(0),
     row_count_(0),
     row_idx_(0),
-    retained_bytes_(0),
-    word_map_(),
-    word_map_create_count_(0)
+    retained_bytes_(0)
 {
-}
-
-FTSWordRowBuffer::~FTSWordRowBuffer()
-{
-  destroy_word_map();
-}
-
-int FTSWordRowBuffer::prepare_word_map(const int64_t bucket_count)
-{
-  int ret = OB_SUCCESS;
-  const int64_t expected_bucket_count = common::hash::cal_next_prime(bucket_count);
-  if (OB_UNLIKELY(bucket_count <= 0)) {
-    ret = OB_INVALID_ARGUMENT;
-  } else if (word_map_.created() && word_map_.bucket_count() == expected_bucket_count) {
-    // clear() preserves this exact bucket array. Re-inserting the same keys
-    // therefore preserves the original bucket-chain iteration order.
-  } else {
-    if (word_map_.created() && OB_FAIL(word_map_.destroy())) {
-    } else if (OB_FAIL(word_map_.create(bucket_count, common::ObMemAttr("FTWordMap")))) {
-    } else {
-      ++word_map_create_count_;
-    }
-  }
-  return ret;
-}
-
-int FTSWordRowBuffer::clear_word_map()
-{
-  int ret = OB_SUCCESS;
-  if (word_map_.created() && word_map_.size() > 0) {
-    ret = word_map_.reuse();
-  }
-  return ret;
-}
-
-void FTSWordRowBuffer::destroy_word_map()
-{
-  if (word_map_.created()) {
-    word_map_.destroy();
-  }
-  word_map_create_count_ = 0;
 }
 
 int FTSWordRowBuffer::reserve_rows(common::ObIAllocator &allocator, const int64_t need_rows)
@@ -148,6 +105,7 @@ int FTSWordRowBuffer::append(common::ObIAllocator &allocator,
   int ret = OB_SUCCESS;
   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
   const int64_t original_row_count = row_count_;
+  ObFTWordMap ft_word_map;
   int64_t doc_length = 0;
   const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
@@ -156,15 +114,15 @@ int FTSWordRowBuffer::append(common::ObIAllocator &allocator,
     ret = OB_ITER_END;
   } else if (OB_UNLIKELY(OB_ISNULL(fulltext.ptr()))) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(prepare_word_map(ft_word_bkt_cnt))) {
+  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (OB_FAIL(ObDASDomainUtils::segment_and_calc_word_count(helper,
                                                                    ft_obj_meta,
                                                                    fulltext,
                                                                    doc_length,
-                                                                   word_map_))) {
-  } else if (0 == word_map_.size()) {
+                                                                   ft_word_map))) {
+  } else if (0 == ft_word_map.size()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(reserve_rows(allocator, row_count_ + word_map_.size()))) {
+  } else if (OB_FAIL(reserve_rows(allocator, row_count_ + ft_word_map.size()))) {
   } else {
     const int64_t word_idx = is_fts_index_aux ? 0 : 1;
     const int64_t doc_id_idx = is_fts_index_aux ? 1 : 0;
@@ -173,8 +131,8 @@ int FTSWordRowBuffer::append(common::ObIAllocator &allocator,
     blocksstable::ObStorageDatum copied_doc_id;
     if (OB_FAIL(copy_string_datum(allocator, doc_id_datum, copied_doc_id))) {
     }
-    for (ObFTWordMap::const_iterator iter = word_map_.begin();
-         OB_SUCC(ret) && iter != word_map_.end();
+    for (ObFTWordMap::const_iterator iter = ft_word_map.begin();
+         OB_SUCC(ret) && iter != ft_word_map.end();
          ++iter) {
       blocksstable::ObStorageDatum *row = datums_ + row_count_ * COLUMN_COUNT;
       for (int64_t i = 0; i < COLUMN_COUNT; ++i) {
@@ -188,12 +146,6 @@ int FTSWordRowBuffer::append(common::ObIAllocator &allocator,
       row[doc_len_idx].set_uint(doc_length);
       ++row_count_;
     }
-  }
-  // Bucket keys can point into the parser scratch allocator. Drop the nodes
-  // before ObFTIndexRowCache resets that allocator, including on error paths.
-  const int clear_ret = clear_word_map();
-  if ((OB_SUCCESS == ret || OB_ITER_END == ret) && OB_SUCCESS != clear_ret) {
-    ret = clear_ret;
   }
   if (OB_FAIL(ret) && OB_ITER_END != ret) {
     row_count_ = original_row_count;
@@ -233,21 +185,8 @@ int FTSWordRowBuffer::get_next_batch(const blocksstable::ObStorageDatum *&rows,
   return ret;
 }
 
-void FTSWordRowBuffer::reset()
-{
-  destroy_word_map();
-  datums_ = nullptr;
-  capacity_ = 0;
-  row_count_ = 0;
-  row_idx_ = 0;
-  retained_bytes_ = 0;
-}
-
 void FTSWordRowBuffer::reuse()
 {
-  // Keep the bounded bucket array across scans, but never retain references
-  // into parser scratch memory between documents.
-  clear_word_map();
   datums_ = nullptr;
   capacity_ = 0;
   row_count_ = 0;
@@ -306,13 +245,9 @@ int ObFTIndexRowCache::append(const common::ObObjMeta &ft_obj_meta,
                                    fulltext,
                                    is_fts_index_aux_))) {
   }
-  // All parser/casedown work uses this scratch allocator. Retained word and
+  // All parser/casedown work uses this scratch allocator.  Retained word and
   // document bytes have already been copied into the batch memory context.
-  // If map cleanup ever fails, keep the scratch pages until reset/destruction
-  // so no surviving key can reference freed parser memory.
-  if (0 == words_.get_scratch_word_map_entry_count()) {
-    parse_allocator_.reset_remain_one_page();
-  }
+  parse_allocator_.reset_remain_one_page();
   LOG_TRACE("append word rows", K(ret), K(words_.get_row_count()), K(doc_id_datum), K(fulltext));
   return ret;
 }
@@ -341,7 +276,7 @@ int ObFTIndexRowCache::get_next_batch(const blocksstable::ObStorageDatum *&rows,
 
 void ObFTIndexRowCache::reset()
 {
-  words_.reset();
+  words_.reuse();
   is_fts_index_aux_ = true;
   helper_.reset();
   if (OB_NOT_NULL(merge_memctx_)) {
@@ -355,12 +290,10 @@ void ObFTIndexRowCache::reset()
 void ObFTIndexRowCache::reuse()
 {
   words_.reuse();
-  if (0 == words_.get_scratch_word_map_entry_count()) {
-    if (OB_NOT_NULL(merge_memctx_)) {
-      merge_memctx_->reset_remain_one_page();
-    }
-    parse_allocator_.reset_remain_one_page();
+  if (OB_NOT_NULL(merge_memctx_)) {
+    merge_memctx_->reset_remain_one_page();
   }
+  parse_allocator_.reset_remain_one_page();
 }
 
 int ObDASDomainUtils::generate_spatial_index_rows(
