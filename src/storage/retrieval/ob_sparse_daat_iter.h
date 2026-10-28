@@ -94,6 +94,8 @@ public:
   // Clear logical execution state while retaining the fixed-array storage for the next scan.
   void reuse();
   void reset();
+  // Update the hint for future refills without changing already buffered IDs.
+  int set_batch_capacity(const int64_t capacity);
   // The returned pointer refers to storage owned by this merger and stays valid until the next
   // call to get_next_distinct_id().
   int get_next_distinct_id(const ObDatum *&id_datum);

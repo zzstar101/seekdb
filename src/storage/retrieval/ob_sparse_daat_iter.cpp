@@ -142,6 +142,19 @@ int ObSRDaaTBatchIdMerger::init(
   return ret;
 }
 
+int ObSRDaaTBatchIdMerger::set_batch_capacity(const int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(capacity <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    batch_capacity_ = capacity;
+  }
+  return ret;
+}
+
 void ObSRDaaTBatchIdMerger::reuse()
 {
   last_id_.reset();
@@ -918,23 +931,34 @@ int ObSRDaaTIterImpl::get_next_rows_count_only(const int64_t capacity, int64_t &
 int ObSRDaaTIterImpl::get_next_rows_count_only_batch(const int64_t capacity, int64_t &count)
 {
   int ret = OB_SUCCESS;
-  if (!count_only_batch_started_) {
-    int64_t fetch_capacity = iter_param_->max_batch_size_;
-    const common::ObLimitParam &limit = *iter_param_->limit_param_;
-    // A short LIMIT does not need a full posting batch from every token. Keep
-    // one lookahead ID so advancing the final result normally avoids a refill.
-    // Bound each operand before adding: OFFSET and LIMIT can approach INT64_MAX.
-    if (limit.is_valid() && limit.offset_ >= 0 && limit.limit_ >= 0
-        && limit.offset_ < fetch_capacity
-        && limit.limit_ < fetch_capacity - limit.offset_) {
-      fetch_capacity = limit.offset_ + limit.limit_ + 1;
+  const common::ObLimitParam &limit = *iter_param_->limit_param_;
+  const int64_t max_batch_size = iter_param_->max_batch_size_;
+  int64_t fetch_capacity = max_batch_size;
+  int64_t needed_count = MIN(capacity, max_batch_size);
+  int64_t prefetch_offset = 0;
+  if (limit.is_valid()) {
+    needed_count = MIN(needed_count, limit.limit_ - output_row_cnt_);
+    if (input_row_cnt_ < limit.offset_) {
+      prefetch_offset = limit.offset_ - input_row_cnt_;
     }
+  }
+  // Attached IR scans receive an upper LIMIT as a small requested capacity,
+  // even when their own limit parameter is unset. Retain one lookahead ID to
+  // avoid refilling as the final requested ID is consumed. Include pending
+  // OFFSET work and bound operands before adding to avoid signed overflow.
+  if (needed_count > 0 && needed_count < max_batch_size
+      && prefetch_offset < max_batch_size - needed_count) {
+    fetch_capacity = needed_count + prefetch_offset + 1;
+  }
+  if (!count_only_batch_started_) {
     if (OB_FAIL(batch_id_merger_.init(*dim_iters_, *iter_allocator_, fetch_capacity,
                                       merge_cmp_, merge_heap_, iter_domain_ids_))) {
       LOG_WARN("failed to initialize the count-only batch merger", K(ret));
     } else {
       count_only_batch_started_ = true;
     }
+  } else if (OB_FAIL(batch_id_merger_.set_batch_capacity(fetch_capacity))) {
+    LOG_WARN("failed to update the count-only posting batch capacity", K(ret), K(fetch_capacity));
   }
   const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
   if (OB_SUCC(ret) && dim_iters_->count() > 3) {
