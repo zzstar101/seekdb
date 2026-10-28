@@ -23,6 +23,7 @@ TEST_SOURCES = (
     "unittest/storage/test_fts_char_classification.cpp",
     "unittest/lib/charset/test_fts_strcmpsp_dispatch.cpp",
     "unittest/storage/test_fts_count_only_batch.cpp",
+    "unittest/storage/test_fts_doc_id_comparison.cpp",
     "unittest/storage/test_fts_ik_dictionary_cache.cpp",
     "unittest/storage/test_fts_word_row_buffer.cpp",
 )

@@ -805,14 +805,34 @@ int ObSRMergeCmp::cmp_id(const ObDatum &l, const ObDatum &r, int64_t &cmp_ret)
   } else {
     const common::ObString &left = l.get_string();
     const common::ObString &right = r.get_string();
-    const int64_t min_len = MIN(left.length(), right.length());
-    const int cmp_res = (0 == min_len) ? 0 : MEMCMP(left.ptr(), right.ptr(), min_len);
-    if (0 != cmp_res) {
-      cmp_ret = (cmp_res < 0) ? -1 : 1;
-    } else if (left.length() == right.length()) {
-      cmp_ret = 0;
+    if (16 == left.length() && 16 == right.length()) {
+      // Fixed-width document IDs are compared as unsigned bytes. memcpy keeps
+      // these loads valid for unaligned storage; converting the first differing
+      // word to big endian gives exactly the same order as memcmp.
+      uint64_t left_word = 0;
+      uint64_t right_word = 0;
+      MEMCPY(&left_word, left.ptr(), sizeof(left_word));
+      MEMCPY(&right_word, right.ptr(), sizeof(right_word));
+      if (left_word == right_word) {
+        MEMCPY(&left_word, left.ptr() + sizeof(left_word), sizeof(left_word));
+        MEMCPY(&right_word, right.ptr() + sizeof(right_word), sizeof(right_word));
+      }
+      const uint16_t endian_probe = 1;
+      if (1 == *reinterpret_cast<const uint8_t *>(&endian_probe)) {
+        left_word = ob_htonll(left_word);
+        right_word = ob_htonll(right_word);
+      }
+      cmp_ret = (left_word < right_word) ? -1 : (left_word > right_word ? 1 : 0);
     } else {
-      cmp_ret = (left.length() < right.length()) ? -1 : 1;
+      const int64_t min_len = MIN(left.length(), right.length());
+      const int cmp_res = (0 == min_len) ? 0 : MEMCMP(left.ptr(), right.ptr(), min_len);
+      if (0 != cmp_res) {
+        cmp_ret = (cmp_res < 0) ? -1 : 1;
+      } else if (left.length() == right.length()) {
+        cmp_ret = 0;
+      } else {
+        cmp_ret = (left.length() < right.length()) ? -1 : 1;
+      }
     }
   }
   return ret;
