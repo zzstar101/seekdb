@@ -437,12 +437,15 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
 {
   int ret = OB_SUCCESS;
   void *buf = nullptr;
-  allocator_ = iter_param.allocator_;
-  if (OB_ISNULL(iter_param.eval_ctx_) || OB_ISNULL(iter_param.inv_scan_domain_id_col_) || OB_ISNULL(allocator_)) {
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(iter_param.eval_ctx_) || OB_ISNULL(iter_param.inv_scan_domain_id_col_)
+             || OB_ISNULL(iter_param.allocator_)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = allocator_->alloc(sizeof(ObTextRetrievalTokenIter)))) {
+  } else if (OB_ISNULL(buf = iter_param.allocator_->alloc(sizeof(ObTextRetrievalTokenIter)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
+    allocator_ = iter_param.allocator_;
     token_iter_ = new (buf) ObTextRetrievalTokenIter();
     if (OB_FAIL(token_iter_->init(iter_param))) {
     } else {
@@ -454,16 +457,10 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       cmp_func_ = basic_funcs->null_first_cmp_;
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
-      } else if (OB_FAIL(relevance_.init(max_batch_size_))) {
-      } else if (OB_FAIL(relevance_.prepare_allocate(max_batch_size_))) {
-      } else if (FALSE_IT(doc_id_.set_allocator(allocator_))) {
-      } else if (OB_FAIL(doc_id_.init(max_batch_size_))) {
-      } else if (OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
-      } else if (FALSE_IT(owned_batch_datums_.set_allocator(allocator_))) {
-      } else if (OB_FAIL(owned_batch_datums_.init(max_batch_size_))) {
-      } else if (OB_FAIL(owned_batch_datums_.prepare_allocate(max_batch_size_))) {
       } else {
+        relevance_.set_allocator(allocator_);
+        doc_id_.set_allocator(allocator_);
+        owned_batch_datums_.set_allocator(allocator_);
         is_inited_ = true;
       }
     }
@@ -477,7 +474,9 @@ void ObTextRetrievalDaaTTokenIter::reuse()
   count_ = 0;
   batch_doc_ids_ = nullptr;
   owned_payload_used_ = 0;
-  token_iter_->reuse();
+  if (OB_NOT_NULL(token_iter_)) {
+    token_iter_->reuse();
+  }
 }
 
 void ObTextRetrievalDaaTTokenIter::reset()
@@ -492,9 +491,28 @@ void ObTextRetrievalDaaTTokenIter::reset()
   owned_payload_buf_ = nullptr;
   owned_payload_capacity_ = 0;
   owned_payload_used_ = 0;
-  token_iter_->reset();
+  if (OB_NOT_NULL(token_iter_)) {
+    token_iter_->reset();
+  }
   cur_idx_ = -1;
   count_ = 0;
+  is_inited_ = false;
+}
+
+int ObTextRetrievalDaaTTokenIter::prepare_buffers(const bool for_batch)
+{
+  int ret = OB_SUCCESS;
+  // prepare_allocate() reserves the fixed array and constructs its elements, including the
+  // private storage in each ObDocIdExt. Do this before fetching so allocation failure does not
+  // consume source rows. Reading an existing owned batch through the row API needs no new array.
+  if (for_batch && OB_ISNULL(owned_batch_datums_.get_data())
+      && OB_FAIL(owned_batch_datums_.prepare_allocate(max_batch_size_))) {
+  } else if (!for_batch && OB_ISNULL(doc_id_.get_data())
+             && OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
+  } else if (OB_NOT_NULL(relevance_expr_) && OB_ISNULL(relevance_.get_data())
+             && OB_FAIL(relevance_.prepare_allocate(max_batch_size_))) {
+  }
+  return ret;
 }
 
 // Sparse Retrieval Dimension Iter Interfaces
@@ -503,6 +521,9 @@ int ObTextRetrievalDaaTTokenIter::get_next_row() {
   bool need_load = false;
   if (OB_LIKELY((++cur_idx_) < count_)) {
     // The row and batch APIs share get_current_id_datum(), so no per-row copy is needed here.
+  } else if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(prepare_buffers(false))) {
   } else if (!eval_ctx_->is_vectorized() && (OB_FAIL(token_iter_->get_next_row()))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
@@ -523,6 +544,11 @@ int ObTextRetrievalDaaTTokenIter::get_next_row() {
       }
     } else if (OB_FAIL(save_docids())) {
     }
+  }
+  if (OB_FAIL(ret)) {
+    cur_idx_ = -1;
+    count_ = 0;
+    batch_doc_ids_ = nullptr;
   }
   return ret;
 }
@@ -705,6 +731,8 @@ int ObTextRetrievalDaaTTokenIter::get_next_doc_id_batch(
     batch_doc_ids_ = nullptr;
     owned_payload_used_ = 0;
     const int64_t fetch_capacity = MIN(capacity, max_batch_size_);
+    if (OB_FAIL(prepare_buffers(true))) {
+    }
     while (OB_SUCC(ret) && 0 == count) {
       int64_t raw_count = 0;
       if (OB_FAIL(token_iter_->get_next_batch(fetch_capacity, raw_count))) {

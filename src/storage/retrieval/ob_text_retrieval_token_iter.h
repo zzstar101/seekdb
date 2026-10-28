@@ -148,6 +148,7 @@ public:
     return ret;
   }
 private:
+  int prepare_buffers(const bool for_batch);
   int save_relevances_and_docids();
   int save_docids();
   int build_owned_doc_id_batch(
@@ -170,7 +171,8 @@ private:
   int64_t max_batch_size_;
   int64_t cur_idx_;
   int64_t count_;
-  ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
+  // Allocated on the first fetch that needs each representation; reuse retains the storage.
+  ObFixedArray<double, ObIAllocator> relevance_;
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   ObFixedArray<ObDatum, ObIAllocator> owned_batch_datums_;
   const ObDatum *batch_doc_ids_; // contiguous owned view returned by the batch API

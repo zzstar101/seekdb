@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "data_plane/api/data_plane/access/ob_tablet_scan.h"
+#include "data_plane/api/data_plane/access/ob_table_scan_param.h"
 #include "lib/container/ob_se_array.h"
+#include "lib/rc/context.h"
 #include "query/engine/expr/ob_expr.h"
 #include "sql/das/iter/ob_das_scan_iter.h"
 #include "sql/engine/ob_exec_context.h"
@@ -57,6 +59,7 @@ public:
   explicit CountingAllocator(ObIAllocator &delegate)
     : delegate_(&delegate),
       alloc_calls_(0),
+      fail_on_call_(0),
       free_calls_(0),
       invalid_free_calls_(0),
       live_allocations_()
@@ -66,6 +69,9 @@ public:
   virtual void *alloc(const int64_t size) override
   {
     ++alloc_calls_;
+    if (alloc_calls_ == fail_on_call_) {
+      return nullptr;
+    }
     void *ptr = delegate_->alloc(size);
     if (OB_NOT_NULL(ptr)) {
       live_allocations_.insert(ptr);
@@ -76,6 +82,9 @@ public:
   virtual void *alloc(const int64_t size, const common::ObMemAttr &attr) override
   {
     ++alloc_calls_;
+    if (alloc_calls_ == fail_on_call_) {
+      return nullptr;
+    }
     void *ptr = delegate_->alloc(size, attr);
     if (OB_NOT_NULL(ptr)) {
       live_allocations_.insert(ptr);
@@ -99,6 +108,7 @@ public:
   virtual int64_t used() const override { return delegate_->used(); }
 
   int64_t alloc_calls() const { return alloc_calls_; }
+  void fail_on_call(const int64_t call) { fail_on_call_ = call; }
   int64_t free_calls() const { return free_calls_; }
   int64_t invalid_free_calls() const { return invalid_free_calls_; }
   int64_t live_allocations() const { return static_cast<int64_t>(live_allocations_.size()); }
@@ -106,6 +116,7 @@ public:
 private:
   ObIAllocator *delegate_;
   int64_t alloc_calls_;
+  int64_t fail_on_call_;
   int64_t free_calls_;
   int64_t invalid_free_calls_;
   std::set<void *> live_allocations_;
@@ -322,8 +333,8 @@ private:
   int64_t batch_size_;
 };
 
-// Minimal DAS scan source for exercising the public DaaT batch path. It owns the values it
-// publishes and writes their descriptors into the shared expression frame on each refill.
+// Minimal DAS source for the public DaaT row/batch paths. Each refill writes recorded IDs and
+// optional projected scores into the expression frame.
 class FakeDASScanIter final : public sql::ObDASScanIter
 {
 public:
@@ -331,10 +342,14 @@ public:
       std::vector<uint64_t> &values,
       const int64_t batch_size,
       sql::ObEvalCtx &eval_ctx,
-      sql::ObExpr &doc_id_expr)
+      sql::ObExpr &doc_id_expr,
+      sql::ObExpr *relevance_expr = nullptr)
     : values_(values),
       batch_size_(batch_size),
       doc_id_expr_(&doc_id_expr),
+      relevance_expr_(relevance_expr),
+      score_(2.5),
+      null_row_(-1),
       cursor_(0),
       fail_next_(false)
   {
@@ -343,12 +358,18 @@ public:
 
   void reset_source() { cursor_ = 0; }
   void fail_next() { fail_next_ = true; }
+  void set_null_row(const int64_t row) { null_row_ = row; }
+  int64_t cursor() const { return cursor_; }
 
 protected:
   virtual int inner_init(sql::ObDASIterParam &) override { return OB_SUCCESS; }
   virtual int inner_reuse() override { return OB_SUCCESS; }
   virtual int inner_release() override { return OB_SUCCESS; }
-  virtual int inner_get_next_row() override { return OB_NOT_IMPLEMENT; }
+  virtual int inner_get_next_row() override
+  {
+    int64_t count = 0;
+    return inner_get_next_rows(count, 1);
+  }
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override
   {
     int ret = OB_SUCCESS;
@@ -364,8 +385,17 @@ protected:
         count = MIN(capacity, MIN(batch_size_, remaining));
         ObDatum *datums = doc_id_expr_->locate_batch_datums(*eval_ctx_);
         for (int64_t i = 0; i < count; ++i) {
-          datums[i].ptr_ = reinterpret_cast<const char *>(&values_[cursor_ + i]);
-          datums[i].pack_ = sizeof(uint64_t);
+          if (cursor_ + i == null_row_) {
+            datums[i].set_null();
+          } else {
+            datums[i].ptr_ = reinterpret_cast<const char *>(&values_[cursor_ + i]);
+            datums[i].pack_ = sizeof(uint64_t);
+          }
+          if (nullptr != relevance_expr_) {
+            ObDatum &score = relevance_expr_->locate_batch_datums(*eval_ctx_)[i];
+            score.ptr_ = reinterpret_cast<const char *>(&score_);
+            score.pack_ = sizeof(score_);
+          }
         }
         cursor_ += count;
       }
@@ -377,8 +407,98 @@ private:
   std::vector<uint64_t> &values_;
   int64_t batch_size_;
   sql::ObExpr *doc_id_expr_;
+  sql::ObExpr *relevance_expr_;
+  double score_;
+  int64_t null_row_;
   int64_t cursor_;
   bool fail_next_;
+};
+
+class TokenBufferFixture
+{
+public:
+  static constexpr int64_t BATCH_SIZE = 3;
+  struct Frame
+  {
+    ObDatum ids_[BATCH_SIZE];
+    ObDatum scores_[BATCH_SIZE];
+    sql::ObEvalInfo score_info_;
+  };
+
+  TokenBufferFixture()
+    : allocator_(), array_allocator_(allocator_), exec_ctx_(allocator_),
+      eval_ctx_(exec_ctx_, &allocator_), frame_(), frames_{reinterpret_cast<char *>(&frame_)},
+      output_(&allocator_), values_{10, 20, 30, 40, 50}, scan_(nullptr)
+  {}
+
+  ~TokenBufferFixture()
+  {
+    iter_.reset();
+    if (nullptr != scan_) {
+      EXPECT_EQ(OB_SUCCESS, scan_->release());
+    }
+  }
+
+  void init(const bool vectorized, const bool scored)
+  {
+    eval_ctx_.frames_ = frames_;
+    eval_ctx_.set_max_batch_size(vectorized ? BATCH_SIZE : 0);
+    eval_ctx_.reuse(vectorized ? BATCH_SIZE : 1);
+    doc_id_expr_.datum_meta_.type_ = ObUInt64Type;
+    doc_id_expr_.datum_meta_.cs_type_ = CS_TYPE_BINARY;
+    doc_id_expr_.frame_idx_ = 0;
+    doc_id_expr_.datum_off_ = reinterpret_cast<char *>(frame_.ids_) - frames_[0];
+    doc_id_expr_.batch_result_ = vectorized;
+    doc_id_expr_.batch_idx_mask_ = vectorized ? UINT64_MAX : 0;
+    relevance_expr_.datum_meta_.type_ = ObDoubleType;
+    relevance_expr_.frame_idx_ = 0;
+    relevance_expr_.datum_off_ = reinterpret_cast<char *>(frame_.scores_) - frames_[0];
+    relevance_expr_.eval_info_off_ = reinterpret_cast<char *>(&frame_.score_info_) - frames_[0];
+    relevance_expr_.batch_result_ = vectorized;
+    relevance_expr_.batch_idx_mask_ = vectorized ? UINT64_MAX : 0;
+    // Supply projected scores to exercise DaaT's score storage independently of BM25 evaluation.
+    frame_.score_info_.projected_ = true;
+    ASSERT_EQ(OB_SUCCESS, output_.init(2));
+    ASSERT_EQ(OB_SUCCESS, output_.push_back(&doc_id_expr_));
+    if (scored) {
+      ASSERT_EQ(OB_SUCCESS, output_.push_back(&relevance_expr_));
+    }
+    scan_ = OB_NEWx(FakeDASScanIter, &allocator_, values_, BATCH_SIZE, eval_ctx_, doc_id_expr_,
+                   scored ? &relevance_expr_ : nullptr);
+    ASSERT_NE(nullptr, scan_);
+    sql::ObDASIterParam scan_param(sql::ObDASIterType::DAS_ITER_SCAN);
+    scan_param.max_size_ = vectorized ? BATCH_SIZE : 1;
+    scan_param.eval_ctx_ = &eval_ctx_;
+    scan_param.exec_ctx_ = &exec_ctx_;
+    scan_param.output_ = &output_;
+    ASSERT_EQ(OB_SUCCESS, scan_->init(scan_param));
+    ObTextRetrievalScanIterParam token_param;
+    token_param.allocator_ = &allocator_;
+    token_param.mem_context_ = CURRENT_CONTEXT;
+    token_param.inv_idx_scan_param_ = &table_scan_param_;
+    token_param.inv_idx_scan_iter_ = scan_;
+    token_param.eval_ctx_ = &eval_ctx_;
+    token_param.inv_scan_domain_id_col_ = &doc_id_expr_;
+    token_param.relevance_expr_ = scored ? &relevance_expr_ : nullptr;
+    ASSERT_EQ(OB_SUCCESS, iter_.init(token_param));
+    EXPECT_EQ(nullptr, iter_.doc_id_.get_data());
+    EXPECT_EQ(nullptr, iter_.relevance_.get_data());
+    EXPECT_EQ(nullptr, iter_.owned_batch_datums_.get_data());
+  }
+
+  common::ObArenaAllocator allocator_;
+  CountingAllocator array_allocator_;
+  sql::ObExecContext exec_ctx_;
+  sql::ObEvalCtx eval_ctx_;
+  Frame frame_;
+  char *frames_[1];
+  sql::ObExpr doc_id_expr_;
+  sql::ObExpr relevance_expr_;
+  sql::ExprFixedArray output_;
+  ObTableScanParam table_scan_param_;
+  std::vector<uint64_t> values_;
+  FakeDASScanIter *scan_;
+  ObTextRetrievalDaaTTokenIter iter_;
 };
 
 using IdList = std::vector<std::optional<uint64_t>>;
@@ -1256,6 +1376,7 @@ TEST(ProductionTokenIterBatchTest, advance_uses_active_batch_view)
   ASSERT_EQ(batch_count, built_count);
   iter.count_ = batch_count;
   iter.cur_idx_ = -1;
+  iter.is_inited_ = true;
 
   ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
   const ObDatum *current = nullptr;
@@ -1415,7 +1536,7 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   doc_id_expr.batch_result_ = 1;
   doc_id_expr.batch_idx_mask_ = UINT64_MAX;
 
-  std::vector<uint64_t> first_values = {10, 20, 30, 40, 50};
+  std::vector<uint64_t> first_values = {10, 20, 30, 40, 50, 60};
   std::vector<uint64_t> second_values = {70, 80, 90};
   // DAS iterators normally live in an operator arena and are released explicitly.
   FakeDASScanIter *first_scan = OB_NEWx(
@@ -1432,37 +1553,28 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   scan_param.eval_ctx_ = &eval_ctx;
   scan_param.exec_ctx_ = &exec_ctx;
   scan_param.output_ = &output;
-  ObTextRetrievalTokenIter first_token;
-  ObTextRetrievalTokenIter second_token;
   ObTextRetrievalDaaTTokenIter first_iter;
   ObTextRetrievalDaaTTokenIter second_iter;
-  common::ObDatumBasicFuncs *basic_funcs =
-      ObDatumFuncs::get_basic_func(ObUInt64Type, CS_TYPE_BINARY);
-  ASSERT_NE(nullptr, basic_funcs);
+  ObTableScanParam table_scan_param;
+  ObTextRetrievalScanIterParam token_param;
+  token_param.allocator_ = &allocator;
+  token_param.mem_context_ = CURRENT_CONTEXT;
+  token_param.inv_idx_scan_param_ = &table_scan_param;
+  token_param.eval_ctx_ = &eval_ctx;
+  token_param.inv_scan_domain_id_col_ = &doc_id_expr;
 
   auto init_iter = [&](ObTextRetrievalDaaTTokenIter &iter,
-                       ObTextRetrievalTokenIter &token_iter,
                        FakeDASScanIter &scan) {
     ASSERT_EQ(OB_SUCCESS, scan.init(scan_param));
-    token_iter.allocator_ = &allocator;
-    token_iter.inv_idx_scan_iter_ = &scan;
-    token_iter.eval_ctx_ = &eval_ctx;
-    token_iter.inv_scan_domain_id_col_ = &doc_id_expr;
-    token_iter.max_batch_size_ = batch_size;
-    token_iter.is_inited_ = true;
-    iter.allocator_ = &allocator;
-    iter.token_iter_ = &token_iter;
-    iter.eval_ctx_ = &eval_ctx;
-    iter.inv_scan_domain_id_col_ = &doc_id_expr;
-    iter.max_batch_size_ = batch_size;
-    iter.cmp_func_ = basic_funcs->null_first_cmp_;
-    iter.owned_batch_datums_.set_allocator(&allocator);
-    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.init(batch_size));
-    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_size));
-    iter.is_inited_ = true;
+    token_param.inv_idx_scan_iter_ = &scan;
+    ASSERT_EQ(OB_SUCCESS, iter.init(token_param));
+    EXPECT_EQ(nullptr, iter.relevance_.get_data());
+    EXPECT_EQ(nullptr, iter.doc_id_.get_data());
+    EXPECT_EQ(nullptr, iter.owned_batch_datums_.get_data());
   };
-  init_iter(first_iter, first_token, *first_scan);
-  init_iter(second_iter, second_token, *second_scan);
+  ASSERT_NO_FATAL_FAILURE(init_iter(first_iter, *first_scan));
+  ASSERT_NO_FATAL_FAILURE(init_iter(second_iter, *second_scan));
+  EXPECT_EQ(OB_INIT_TWICE, first_iter.init(token_param));
 
   const ObDatum *first_ids = nullptr;
   int64_t first_count = 0;
@@ -1471,6 +1583,11 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   ASSERT_NE(nullptr, first_ids);
   EXPECT_EQ(10, first_ids[0].get_uint64());
   EXPECT_EQ(20, first_ids[1].get_uint64());
+  const ObDatum *retained_datums = first_ids;
+  char *retained_payload = first_iter.owned_payload_buf_;
+  const int64_t retained_capacity = first_iter.owned_payload_capacity_;
+  EXPECT_EQ(nullptr, first_iter.doc_id_.get_data());
+  EXPECT_EQ(nullptr, first_iter.relevance_.get_data());
 
   // The second token iterator writes the same shared expression frame and payload. The first
   // iterator's public batch must remain its private copy.
@@ -1496,6 +1613,8 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   ASSERT_EQ(OB_SUCCESS, first_iter.advance_to(target));
   ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
   EXPECT_EQ(20, current->get_uint64());
+  EXPECT_EQ(nullptr, first_iter.doc_id_.get_data());
+  EXPECT_EQ(nullptr, first_iter.relevance_.get_data());
 
   // Refill the first iterator from its second source batch, then prove reuse keeps the owned
   // storage usable after the shared frame has moved on.
@@ -1503,6 +1622,29 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   ASSERT_EQ(2, first_count);
   EXPECT_EQ(30, first_ids[0].get_uint64());
   EXPECT_EQ(40, first_ids[1].get_uint64());
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_row());
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_row());
+  EXPECT_EQ(nullptr, first_iter.doc_id_.get_data());
+  // Exhausting the owned batch through the row API allocates and constructs ObDocIdExt only
+  // when the next scan batch is loaded. No relevance array is needed for this count-only scan.
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_row());
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
+  EXPECT_EQ(50, current->get_uint64());
+  EXPECT_EQ(nullptr, first_iter.batch_doc_ids_);
+  ASSERT_NE(nullptr, first_iter.doc_id_.get_data());
+  EXPECT_EQ(batch_size, first_iter.doc_id_.count());
+  EXPECT_EQ(nullptr, first_iter.relevance_.get_data());
+  const ObDocIdExt *retained_rows = first_iter.doc_id_.get_data();
+  first_values[4] = 999;
+  doc_id_expr.locate_batch_datums(eval_ctx)[0].set_null();
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
+  EXPECT_EQ(50, current->get_uint64());
+  first_values[4] = 50;
+  uint64_t target_60 = 60;
+  target.ptr_ = reinterpret_cast<const char *>(&target_60);
+  ASSERT_EQ(OB_SUCCESS, first_iter.advance_to(target));
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
+  EXPECT_EQ(60, current->get_uint64());
   first_values[0] = 10;
   first_iter.reuse();
   first_scan->reset_source();
@@ -1510,6 +1652,11 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   ASSERT_EQ(2, first_count);
   EXPECT_EQ(10, first_ids[0].get_uint64());
   EXPECT_EQ(20, first_ids[1].get_uint64());
+  EXPECT_EQ(retained_datums, first_ids);
+  EXPECT_EQ(retained_payload, first_iter.owned_payload_buf_);
+  EXPECT_EQ(retained_capacity, first_iter.owned_payload_capacity_);
+  EXPECT_EQ(retained_rows, first_iter.doc_id_.get_data());
+  EXPECT_EQ(nullptr, first_iter.relevance_.get_data());
 
   second_scan->fail_next();
   ASSERT_EQ(OB_ERR_UNEXPECTED,
@@ -1519,9 +1666,169 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   EXPECT_EQ(nullptr, first_iter.batch_doc_ids_);
   EXPECT_EQ(nullptr, first_iter.owned_payload_buf_);
   EXPECT_EQ(0, first_iter.owned_payload_capacity_);
+  EXPECT_EQ(nullptr, first_iter.doc_id_.get_data());
+  EXPECT_EQ(nullptr, first_iter.relevance_.get_data());
+  EXPECT_EQ(nullptr, first_iter.owned_batch_datums_.get_data());
+  EXPECT_EQ(OB_NOT_INIT, first_iter.get_next_row());
+  EXPECT_EQ(OB_NOT_INIT,
+            first_iter.get_next_doc_id_batch(batch_size, first_ids, first_count));
+  EXPECT_EQ(nullptr, first_ids);
+  EXPECT_EQ(0, first_count);
+  token_param.inv_idx_scan_iter_ = first_scan;
+  first_scan->reset_source();
+  ASSERT_EQ(OB_SUCCESS, first_iter.init(token_param));
+  EXPECT_EQ(nullptr, first_iter.doc_id_.get_data());
+  EXPECT_EQ(nullptr, first_iter.owned_batch_datums_.get_data());
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_row());
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
+  EXPECT_EQ(10, current->get_uint64());
+  EXPECT_EQ(nullptr, first_iter.owned_batch_datums_.get_data());
+  EXPECT_EQ(nullptr, first_iter.relevance_.get_data());
+  first_iter.reset();
   second_iter.reset();
   ASSERT_EQ(OB_SUCCESS, first_scan->release());
   ASSERT_EQ(OB_SUCCESS, second_scan->release());
+}
+
+TEST(ProductionTokenIterBatchTest, scalar_rows_allocate_only_needed_buffers)
+{
+  for (const bool scored : {false, true}) {
+    TokenBufferFixture fixture;
+    ASSERT_NO_FATAL_FAILURE(fixture.init(false, scored));
+    auto &iter = fixture.iter_;
+    fixture.scan_->set_null_row(0);
+    ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+    const ObDatum *current = nullptr;
+    ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+    EXPECT_TRUE(current->is_null());
+    ASSERT_NE(nullptr, iter.doc_id_.get_data());
+    EXPECT_EQ(1, iter.doc_id_.count());
+    EXPECT_EQ(scored ? 1 : 0, iter.relevance_.count());
+    EXPECT_EQ(nullptr, iter.owned_batch_datums_.get_data());
+    EXPECT_EQ(nullptr, iter.owned_payload_buf_);
+    double score = -1.0;
+    ASSERT_EQ(OB_SUCCESS, iter.get_curr_score(score));
+    EXPECT_DOUBLE_EQ(scored ? 2.5 : -1.0, score);
+
+    const ObDocIdExt *rows = iter.doc_id_.get_data();
+    const double *scores = iter.relevance_.get_data();
+    ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+    fixture.values_[1] = 999;
+    ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+    EXPECT_EQ(20, current->get_uint64());
+    fixture.scan_->fail_next();
+    ASSERT_EQ(OB_ERR_UNEXPECTED, iter.get_next_row());
+    EXPECT_EQ(OB_ARRAY_OUT_OF_RANGE, iter.get_curr_id(current));
+    ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+    ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+    EXPECT_EQ(30, current->get_uint64());
+    iter.reuse();
+    fixture.scan_->reset_source();
+    ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+    EXPECT_EQ(rows, iter.doc_id_.get_data());
+    EXPECT_EQ(scores, iter.relevance_.get_data());
+    EXPECT_EQ(nullptr, iter.owned_batch_datums_.get_data());
+    iter.reset();
+    EXPECT_EQ(nullptr, iter.doc_id_.get_data());
+    EXPECT_EQ(nullptr, iter.relevance_.get_data());
+  }
+}
+
+TEST(ProductionTokenIterBatchTest, scored_batches_allocate_row_storage_only_on_row_refill)
+{
+  TokenBufferFixture fixture;
+  ASSERT_NO_FATAL_FAILURE(fixture.init(true, true));
+  auto &iter = fixture.iter_;
+  fixture.scan_->set_null_row(0);
+  iter.token_iter_->get_skip()->set(1);
+  const ObDatum *ids = nullptr;
+  int64_t count = 0;
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_doc_id_batch(3, ids, count));
+  ASSERT_EQ(2, count);
+  EXPECT_TRUE(ids[0].is_null());
+  EXPECT_EQ(30, ids[1].get_uint64());
+  EXPECT_EQ(nullptr, iter.doc_id_.get_data());
+  ASSERT_NE(nullptr, iter.relevance_.get_data());
+  const double *scores = iter.relevance_.get_data();
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+  double score = 0;
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_score(score));
+  EXPECT_DOUBLE_EQ(2.5, score);
+  uint64_t target_value = 30;
+  ObDatum target;
+  target.ptr_ = reinterpret_cast<const char *>(&target_value);
+  target.pack_ = sizeof(target_value);
+  ASSERT_EQ(OB_SUCCESS, iter.advance_to(target));
+  const ObDatum *current = nullptr;
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(30, current->get_uint64());
+  EXPECT_EQ(nullptr, iter.doc_id_.get_data());
+
+  iter.token_iter_->get_skip()->init(TokenBufferFixture::BATCH_SIZE);
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(40, current->get_uint64());
+  ASSERT_NE(nullptr, iter.doc_id_.get_data());
+  EXPECT_EQ(scores, iter.relevance_.get_data());
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_score(score));
+  EXPECT_DOUBLE_EQ(2.5, score);
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(50, current->get_uint64());
+  EXPECT_EQ(OB_ITER_END, iter.get_next_row());
+}
+
+TEST(ProductionTokenIterBatchTest, lazy_array_allocation_errors_leave_source_unconsumed)
+{
+  for (const bool for_batch : {false, true}) {
+    TokenBufferFixture fixture;
+    ASSERT_NO_FATAL_FAILURE(fixture.init(true, true));
+    auto &iter = fixture.iter_;
+    auto &allocator = fixture.array_allocator_;
+    iter.doc_id_.set_allocator(&allocator);
+    iter.owned_batch_datums_.set_allocator(&allocator);
+    iter.relevance_.set_allocator(&allocator);
+    const ObDatum *ids = nullptr;
+    int64_t count = 0;
+    auto fetch = [&]() {
+      return for_batch ? iter.get_next_doc_id_batch(3, ids, count) : iter.get_next_row();
+    };
+    allocator.fail_on_call(1);
+    ASSERT_EQ(OB_ALLOCATE_MEMORY_FAILED, fetch());
+    EXPECT_EQ(0, fixture.scan_->cursor());
+    EXPECT_EQ(nullptr, iter.doc_id_.get_data());
+    EXPECT_EQ(nullptr, iter.owned_batch_datums_.get_data());
+    EXPECT_EQ(nullptr, iter.relevance_.get_data());
+    const ObDatum *current = nullptr;
+    EXPECT_EQ(OB_ARRAY_OUT_OF_RANGE, iter.get_curr_id(current));
+
+    // Retain the first successful array when relevance allocation fails, then retry safely.
+    allocator.fail_on_call(3);
+    ASSERT_EQ(OB_ALLOCATE_MEMORY_FAILED, fetch());
+    EXPECT_EQ(0, fixture.scan_->cursor());
+    EXPECT_EQ(nullptr, iter.relevance_.get_data());
+    EXPECT_EQ(nullptr, ids);
+    EXPECT_EQ(0, count);
+    EXPECT_EQ(OB_ARRAY_OUT_OF_RANGE, iter.get_curr_id(current));
+    ASSERT_EQ(OB_SUCCESS, fetch());
+    if (for_batch) {
+      ASSERT_EQ(3, count);
+      ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+    }
+    ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+    EXPECT_EQ(10, current->get_uint64());
+    double score = 0;
+    ASSERT_EQ(OB_SUCCESS, iter.get_curr_score(score));
+    EXPECT_DOUBLE_EQ(2.5, score);
+    EXPECT_EQ(4, allocator.alloc_calls());
+    iter.reuse();
+    fixture.scan_->reset_source();
+    ASSERT_EQ(OB_SUCCESS, fetch());
+    EXPECT_EQ(4, allocator.alloc_calls());
+    iter.reset();
+    EXPECT_EQ(0, allocator.live_allocations());
+    EXPECT_EQ(0, allocator.invalid_free_calls());
+  }
 }
 
 } // namespace
