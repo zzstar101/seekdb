@@ -423,6 +423,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     count_(0),
     relevance_(),
     doc_id_(),
+    batch_doc_ids_(),
     cmp_func_(nullptr),
     is_inited_(false)
 {
@@ -455,6 +456,9 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       } else if (FALSE_IT(doc_id_.set_allocator(allocator_))) {
       } else if (OB_FAIL(doc_id_.init(max_batch_size_))) {
       } else if (OB_FAIL(doc_id_.prepare_allocate(max_batch_size_))) {
+      } else if (FALSE_IT(batch_doc_ids_.set_allocator(allocator_))) {
+      } else if (OB_FAIL(batch_doc_ids_.init(max_batch_size_))) {
+      } else if (OB_FAIL(batch_doc_ids_.prepare_allocate(max_batch_size_))) {
       } else {
         is_inited_ = true;
       }
@@ -474,6 +478,7 @@ void ObTextRetrievalDaaTTokenIter::reset()
 {
   relevance_.reset();
   doc_id_.reset();
+  batch_doc_ids_.reset();
   token_iter_->reset();
   cur_idx_ = -1;
   count_ = 0;
@@ -548,7 +553,72 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
 
 int ObTextRetrievalDaaTTokenIter::get_next_batch(const int64_t capacity, int64_t &count)
 {
-  return OB_NOT_IMPLEMENT;
+  const ObDatum **doc_ids = nullptr;
+  return get_next_doc_id_batch(capacity, doc_ids, count);
+}
+
+int ObTextRetrievalDaaTTokenIter::get_next_doc_id_batch(
+    const int64_t capacity,
+    const ObDatum **&doc_ids,
+    int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  doc_ids = nullptr;
+  count = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(capacity <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int64_t fetch_capacity = MIN(capacity, max_batch_size_);
+    while (OB_SUCC(ret) && 0 == count) {
+      int64_t raw_count = 0;
+      if (OB_FAIL(token_iter_->get_next_batch(fetch_capacity, raw_count))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        } else if (0 == raw_count) {
+          break;
+        } else {
+          ret = OB_SUCCESS;
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_UNLIKELY(raw_count <= 0 || raw_count > max_batch_size_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_NOT_NULL(relevance_expr_)
+                 && OB_FAIL(relevance_expr_->eval_batch(*eval_ctx_, *token_iter_->get_skip(), raw_count))) {
+      } else {
+        const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+        ObDatumVector relevance_datum;
+        if (OB_NOT_NULL(relevance_expr_)) {
+          relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
+        }
+        int64_t valid_count = 0;
+        for (int64_t i = 0; OB_SUCC(ret) && i < raw_count; ++i) {
+          if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
+            if (OB_FAIL(doc_id_[valid_count].set_datum_fast(*doc_id_datum.at(i)))) {
+            } else {
+              batch_doc_ids_[valid_count] = &doc_id_[valid_count].get_datum();
+              if (OB_NOT_NULL(relevance_expr_)) {
+                relevance_[valid_count] = relevance_datum.at(i)->get_double();
+              }
+              ++valid_count;
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          count = valid_count;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && count > 0) {
+      // This entry point exposes the batch as a prefetch. A caller that continues through
+      // get_next_row() must start with the first document in the batch.
+      cur_idx_ = -1;
+      count_ = count;
+      doc_ids = batch_doc_ids_.get_data();
+    }
+  }
+  return ret;
 }
 
 int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)

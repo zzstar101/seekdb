@@ -23,6 +23,323 @@ namespace oceanbase
 namespace storage
 {
 
+ObSRDaaTBatchIdMerger::ObSRDaaTBatchIdMerger()
+  : dim_iters_(nullptr),
+    merge_cmp_(nullptr),
+    merge_heap_(nullptr),
+    current_ids_(nullptr),
+    batch_ids_(),
+    batch_counts_(),
+    batch_positions_(),
+    last_id_(),
+    dim_cnt_(0),
+    active_cnt_(0),
+    batch_capacity_(0),
+    has_last_id_(false),
+    is_inited_(false)
+{
+}
+
+ObSRDaaTBatchIdMerger::~ObSRDaaTBatchIdMerger()
+{
+  reset();
+}
+
+int ObSRDaaTBatchIdMerger::init(
+    ObIArray<ObISRDaaTDimIter *> &dim_iters,
+    ObIAllocator &allocator,
+    const int64_t batch_capacity,
+    ObSRMergeCmp &merge_cmp,
+    ObSRMergeHeap *merge_heap,
+    ObFixedArray<const ObDatum *, ObIAllocator> &current_ids)
+{
+  int ret = OB_SUCCESS;
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_UNLIKELY(dim_iters.count() <= 0 || batch_capacity <= 0
+                         || current_ids.count() < dim_iters.count()
+                         || (dim_iters.count() > 2 && OB_ISNULL(merge_heap)))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    // Logical reuse keeps these fixed arrays. A smaller dimension set can share the existing
+    // capacity; growing beyond it would require abandoning arena memory that cannot be freed.
+    const int64_t allocated_dim_cnt = batch_ids_.count();
+    if (allocated_dim_cnt > 0
+        && (allocated_dim_cnt < dim_iters.count()
+            || batch_counts_.count() < dim_iters.count()
+            || batch_positions_.count() < dim_iters.count())) {
+      ret = OB_NOT_SUPPORTED;
+    }
+    dim_iters_ = &dim_iters;
+    merge_cmp_ = &merge_cmp;
+    merge_heap_ = merge_heap;
+    current_ids_ = &current_ids;
+    dim_cnt_ = dim_iters.count();
+    active_cnt_ = dim_cnt_;
+    batch_capacity_ = batch_capacity;
+    if (OB_FAIL(ret)) {
+    } else if (0 == allocated_dim_cnt) {
+      batch_ids_.set_allocator(&allocator);
+      batch_counts_.set_allocator(&allocator);
+      batch_positions_.set_allocator(&allocator);
+      if (OB_FAIL(batch_ids_.init(dim_cnt_))) {
+      } else if (OB_FAIL(batch_ids_.prepare_allocate(dim_cnt_))) {
+      } else if (OB_FAIL(batch_counts_.init(dim_cnt_))) {
+      } else if (OB_FAIL(batch_counts_.prepare_allocate(dim_cnt_))) {
+      } else if (OB_FAIL(batch_positions_.init(dim_cnt_))) {
+      } else if (OB_FAIL(batch_positions_.prepare_allocate(dim_cnt_))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < dim_cnt_; ++i) {
+        ObISRDaaTDimIter *dim_iter = dim_iters.at(i);
+        if (OB_ISNULL(dim_iter) || OB_UNLIKELY(!dim_iter->support_batch_doc_ids())) {
+          ret = OB_NOT_SUPPORTED;
+        } else if (OB_FAIL(load_batch(i))) {
+          LOG_WARN("failed to load the first document-id batch", K(ret), K(i));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && dim_cnt_ > 2) {
+      if (OB_UNLIKELY(!merge_heap_->empty())) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < dim_cnt_; ++i) {
+        if (OB_NOT_NULL(current_ids_->at(i))) {
+          ObSRMergeItem item;
+          item.relevance_ = 1.0;
+          item.iter_idx_ = i;
+          if (OB_FAIL(merge_heap_->push(item))) {
+            LOG_WARN("failed to seed the document-id merge heap", K(ret), K(i));
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !merge_heap_->empty() && OB_FAIL(merge_heap_->rebuild())) {
+        LOG_WARN("failed to build the document-id merge heap", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      has_last_id_ = false;
+      is_inited_ = true;
+    }
+  }
+  return ret;
+}
+
+void ObSRDaaTBatchIdMerger::reuse()
+{
+  last_id_.reset();
+  dim_iters_ = nullptr;
+  merge_cmp_ = nullptr;
+  merge_heap_ = nullptr;
+  current_ids_ = nullptr;
+  dim_cnt_ = 0;
+  active_cnt_ = 0;
+  batch_capacity_ = 0;
+  has_last_id_ = false;
+  is_inited_ = false;
+}
+
+void ObSRDaaTBatchIdMerger::reset()
+{
+  reuse();
+  batch_ids_.reset();
+  batch_counts_.reset();
+  batch_positions_.reset();
+}
+
+int ObSRDaaTBatchIdMerger::load_batch(const int64_t iter_idx)
+{
+  int ret = OB_SUCCESS;
+  const ObDatum **doc_ids = nullptr;
+  int64_t count = 0;
+  if (OB_UNLIKELY(iter_idx < 0 || iter_idx >= dim_cnt_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(dim_iters_->at(iter_idx)->get_next_doc_id_batch(
+                 batch_capacity_, doc_ids, count))) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      LOG_WARN("failed to load document-id batch", K(ret), K(iter_idx));
+    } else if (0 == count) {
+      ret = OB_SUCCESS;
+      current_ids_->at(iter_idx) = nullptr;
+      batch_ids_[iter_idx] = nullptr;
+      batch_counts_[iter_idx] = 0;
+      batch_positions_[iter_idx] = 0;
+      --active_cnt_;
+      return ret;
+    } else {
+      ret = OB_SUCCESS;
+    }
+  }
+  if (OB_SUCC(ret) && OB_UNLIKELY(0 == count)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_SUCC(ret) && count > 0) {
+    if (OB_ISNULL(doc_ids) || OB_UNLIKELY(count > batch_capacity_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      batch_ids_[iter_idx] = doc_ids;
+      batch_counts_[iter_idx] = count;
+      batch_positions_[iter_idx] = 0;
+      current_ids_->at(iter_idx) = doc_ids[0];
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTBatchIdMerger::advance(const int64_t iter_idx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(iter_idx < 0 || iter_idx >= dim_cnt_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(batch_positions_[iter_idx] >= batch_counts_[iter_idx])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (++batch_positions_[iter_idx] < batch_counts_[iter_idx]) {
+    current_ids_->at(iter_idx) = batch_ids_[iter_idx][batch_positions_[iter_idx]];
+  } else if (OB_FAIL(load_batch(iter_idx))) {
+  }
+  return ret;
+}
+
+int ObSRDaaTBatchIdMerger::get_next_distinct_id(const ObDatum *&id_datum)
+{
+  int ret = OB_SUCCESS;
+  id_datum = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (0 == active_cnt_) {
+    ret = OB_ITER_END;
+  } else if (1 == dim_cnt_) {
+    ret = get_next_from_one(id_datum);
+  } else if (2 == dim_cnt_) {
+    ret = get_next_from_two(id_datum);
+  } else {
+    ret = get_next_from_heap(id_datum);
+  }
+  return ret;
+}
+
+int ObSRDaaTBatchIdMerger::get_next_from_one(const ObDatum *&id_datum)
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret) && active_cnt_ > 0) {
+    const ObDatum *current = current_ids_->at(0);
+    int64_t cmp_ret = 1;
+    if (OB_ISNULL(current)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (has_last_id_
+               && OB_FAIL(merge_cmp_->cmp_id(*current, last_id_.get_datum(), cmp_ret))) {
+    } else if (0 != cmp_ret) {
+      if (OB_FAIL(last_id_.set_datum_fast(*current))) {
+      } else {
+        has_last_id_ = true;
+      }
+    }
+    const bool emit = OB_SUCC(ret) && 0 != cmp_ret;
+    if (OB_SUCC(ret) && OB_FAIL(advance(0))) {
+    } else if (OB_SUCC(ret) && emit) {
+      id_datum = &last_id_.get_datum();
+      return OB_SUCCESS;
+    }
+  }
+  if (OB_SUCC(ret) && 0 == active_cnt_) {
+    ret = OB_ITER_END;
+  }
+  return ret;
+}
+
+int ObSRDaaTBatchIdMerger::get_next_from_two(const ObDatum *&id_datum)
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret) && active_cnt_ > 0) {
+    const ObDatum *left = current_ids_->at(0);
+    const ObDatum *right = current_ids_->at(1);
+    int64_t choose = -1;
+    int64_t cmp_ret = 1;
+    if (OB_ISNULL(left) && OB_ISNULL(right)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(left)) {
+      choose = 1;
+    } else if (OB_ISNULL(right)) {
+      choose = 0;
+    } else if (OB_FAIL(merge_cmp_->cmp_id(*left, *right, cmp_ret))) {
+    } else {
+      choose = cmp_ret <= 0 ? 0 : 1;
+    }
+    if (OB_SUCC(ret)) {
+      const ObDatum *chosen = 0 == choose ? left : right;
+      int64_t last_cmp_ret = 1;
+      if (has_last_id_
+          && OB_FAIL(merge_cmp_->cmp_id(*chosen, last_id_.get_datum(), last_cmp_ret))) {
+      } else if (0 != last_cmp_ret && OB_FAIL(last_id_.set_datum_fast(*chosen))) {
+      } else if (0 != last_cmp_ret) {
+        has_last_id_ = true;
+      }
+      const bool emit = OB_SUCC(ret) && 0 != last_cmp_ret;
+      if (OB_SUCC(ret) && OB_NOT_NULL(left) && OB_NOT_NULL(right) && 0 == cmp_ret) {
+        if (OB_FAIL(advance(0))) {
+        } else if (OB_FAIL(advance(1))) {
+        }
+      } else if (OB_SUCC(ret) && OB_FAIL(advance(choose))) {
+      }
+      if (OB_SUCC(ret) && emit) {
+        id_datum = &last_id_.get_datum();
+        return OB_SUCCESS;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && 0 == active_cnt_) {
+    ret = OB_ITER_END;
+  }
+  return ret;
+}
+
+int ObSRDaaTBatchIdMerger::get_next_from_heap(const ObDatum *&id_datum)
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret) && !merge_heap_->empty()) {
+    const ObSRMergeItem *top = nullptr;
+    if (OB_FAIL(merge_heap_->top(top)) || OB_ISNULL(top)) {
+      if (OB_SUCCESS == ret) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    } else {
+      const int64_t iter_idx = top->iter_idx_;
+      const ObDatum *current = current_ids_->at(iter_idx);
+      int64_t cmp_ret = 1;
+      if (OB_ISNULL(current)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (has_last_id_
+                 && OB_FAIL(merge_cmp_->cmp_id(*current, last_id_.get_datum(), cmp_ret))) {
+      } else if (0 != cmp_ret && OB_FAIL(last_id_.set_datum_fast(*current))) {
+      } else if (0 != cmp_ret) {
+        has_last_id_ = true;
+      }
+      const bool emit = OB_SUCC(ret) && 0 != cmp_ret;
+      if (OB_SUCC(ret) && OB_FAIL(merge_heap_->pop())) {
+      } else if (OB_SUCC(ret) && OB_FAIL(advance(iter_idx))) {
+      } else if (OB_SUCC(ret) && OB_NOT_NULL(current_ids_->at(iter_idx))) {
+        ObSRMergeItem item;
+        item.relevance_ = 1.0;
+        item.iter_idx_ = iter_idx;
+        if (OB_FAIL(merge_heap_->push(item))) {
+          LOG_WARN("failed to advance the document-id merge heap", K(ret), K(iter_idx));
+        } else if (!merge_heap_->empty() && OB_FAIL(merge_heap_->rebuild())) {
+          LOG_WARN("failed to rebuild the document-id merge heap", K(ret), K(iter_idx));
+        }
+      }
+      if (OB_SUCC(ret) && emit) {
+        id_datum = &last_id_.get_datum();
+        return OB_SUCCESS;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && merge_heap_->empty()) {
+    ret = OB_ITER_END;
+  }
+  return ret;
+}
+
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     cmp_mode_(CMP_MODE_GENERIC),
@@ -90,10 +407,13 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_domain_ids_(),
     buffered_relevances_(),
     next_round_iter_idxes_(),
+    batch_id_merger_(),
     next_round_cnt_(0),
     set_datum_func_(nullptr),
     need_score_(true),
-    count_only_(false)
+    count_only_(false),
+    count_only_batch_capable_(false),
+    count_only_batch_started_(false)
 {
 }
 
@@ -126,6 +446,12 @@ int ObSRDaaTIterImpl::init(
     // plan said so (a bare COUNT over the match predicate). It is never inferred from "the
     // relevance is not projected" alone.
     count_only_ = iter_param_->need_count_only();
+    count_only_batch_capable_ = count_only_ && !need_score_ && !iter_param_->need_filter()
+        && relevance_collector_->support_count_only_union() && dim_iters.count() > 0;
+    for (int64_t i = 0; count_only_batch_capable_ && i < dim_iters.count(); ++i) {
+      const ObISRDaaTDimIter *dim_iter = dim_iters.at(i);
+      count_only_batch_capable_ = OB_NOT_NULL(dim_iter) && dim_iter->support_batch_doc_ids();
+    }
     const int64_t max_batch_size = OB_MAX(iter_param_->eval_ctx_->max_batch_size_, iter_param_->max_batch_size_);
     if (iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type) {
       set_datum_func_ = ObISparseRetrievalMergeIter::set_datum_int;
@@ -179,9 +505,12 @@ void ObSRDaaTIterImpl::reset()
   buffered_domain_ids_.reset();
   buffered_relevances_.reset();
   next_round_iter_idxes_.reset();
+  batch_id_merger_.reset();
   next_round_cnt_ = 0;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
+  count_only_batch_capable_ = false;
+  count_only_batch_started_ = false;
   is_inited_ = false;
 }
 
@@ -200,8 +529,10 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reuse();
   }
+  batch_id_merger_.reuse();
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
+  count_only_batch_started_ = false;
 }
 
   int ObSRDaaTIterImpl::get_query_max_score(double &score)
@@ -308,22 +639,51 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
 int ObSRDaaTIterImpl::get_next_rows_count_only(const int64_t capacity, int64_t &count)
 {
   int ret = OB_SUCCESS;
+  count = 0;
   if (0 == dim_iters_->count()) {
     ret = OB_ITER_END;
   } else if (iter_param_->limit_param_->is_valid() && output_row_cnt_ >= iter_param_->limit_param_->limit_) {
     ret = OB_ITER_END;
   } else if (OB_FAIL(pre_process())) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
-    } else {
-      count = 0;
     }
+  } else if (count_only_batch_capable_ && support_count_only_batch()) {
+    ret = get_next_rows_count_only_batch(capacity, count);
   } else {
-    count = 0;
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
     while (OB_SUCC(ret) && count < real_capacity) {
       if (OB_FAIL(do_one_count_round(count))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::get_next_rows_count_only_batch(const int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  if (!count_only_batch_started_) {
+    if (OB_FAIL(batch_id_merger_.init(*dim_iters_, *iter_allocator_, iter_param_->max_batch_size_,
+                                      merge_cmp_, merge_heap_, iter_domain_ids_))) {
+      LOG_WARN("failed to initialize the count-only batch merger", K(ret));
+    } else {
+      count_only_batch_started_ = true;
+    }
+  }
+  const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+  while (OB_SUCC(ret) && count < real_capacity) {
+    const ObDatum *id_datum = nullptr;
+    if (OB_FAIL(batch_id_merger_.get_next_distinct_id(id_datum))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get the next distinct document id", K(ret));
+      }
+    } else if (OB_ISNULL(id_datum)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(count_result(count))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to count a matching document", K(ret));
       }
     }
   }

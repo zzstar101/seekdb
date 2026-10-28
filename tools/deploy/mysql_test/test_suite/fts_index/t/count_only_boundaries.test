@@ -4,6 +4,9 @@
 # built_docs is loaded before index creation; mem_docs is populated after index
 # creation. Later DML overlays the built index with new versions and tombstones.
 # Scored INSERT SELECT stores observable scores and stays outside count-only.
+# The varchar-PK and heap-table sections cover string document ids, 1/2/3/4-term
+# batch merges, plan rescan, terminal partial batches, LIMIT/OFFSET fallback,
+# and transactional DML rollback without changing benchmark inputs.
 --disable_query_log
 --disable_warnings
 DROP DATABASE IF EXISTS fts_count_boundaries;
@@ -246,6 +249,134 @@ SELECT
   (SELECT COUNT(*) FROM built_docs WHERE MATCH(body) AGAINST('echo'))
   = (SELECT COUNT(*) FROM score_oracle WHERE term = 'echo' AND score > 0)
   AS count_matches_oracle;
+
+--echo varchar_domain_batch_counts
+
+CREATE TABLE varchar_docs (
+  id VARCHAR(16) PRIMARY KEY,
+  body VARCHAR(200),
+  FULLTEXT INDEX body_beng(body) WITH PARSER beng
+);
+
+INSERT INTO varchar_docs
+SELECT CONCAT('v', n),
+       CONCAT(IF(n <= 255, 'alpha ', ''),
+              IF(n <= 257, 'bravo ', ''),
+              'tail')
+FROM (SELECT 1 + a.n + 10 * b.n + 100 * c.n AS n
+      FROM digits a CROSS JOIN digits b CROSS JOIN digits c) numbers
+WHERE n <= 300;
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('tail');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('alpha tail');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('alpha bravo tail');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('missingzzterm');
+
+--echo varchar_domain_limit_offset
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM varchar_docs WHERE MATCH(body) AGAINST('tail') LIMIT 0) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM varchar_docs WHERE MATCH(body) AGAINST('tail') LIMIT 1 OFFSET 255) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM varchar_docs WHERE MATCH(body) AGAINST('tail') LIMIT 256 OFFSET 256) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM varchar_docs WHERE MATCH(body) AGAINST('tail') LIMIT 1 OFFSET 299) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM varchar_docs WHERE MATCH(body) AGAINST('tail') LIMIT 300 OFFSET 300) t;
+
+--echo varchar_domain_rescan
+
+PREPARE varchar_count_stmt FROM 'SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST(?)';
+
+SET @term = 'tail';
+
+EXECUTE varchar_count_stmt USING @term;
+
+SET @term = 'missingzzterm';
+
+EXECUTE varchar_count_stmt USING @term;
+
+SET @term = 'alpha bravo tail';
+
+EXECUTE varchar_count_stmt USING @term;
+
+--echo varchar_domain_dml_rollback
+
+START TRANSACTION;
+UPDATE varchar_docs SET body = 'alpha tail' WHERE id = 'v256';
+DELETE FROM varchar_docs WHERE id = 'v257';
+INSERT INTO varchar_docs VALUES ('v301', 'bravo tail');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('tail');
+
+SET @term = 'tail';
+
+EXECUTE varchar_count_stmt USING @term;
+
+ROLLBACK;
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('tail');
+
+EXECUTE varchar_count_stmt USING @term;
+
+DEALLOCATE PREPARE varchar_count_stmt;
+
+--echo heap_table_batch_counts
+
+CREATE TABLE heap_docs (
+  body VARCHAR(200),
+  FULLTEXT INDEX body_beng(body) WITH PARSER beng
+);
+
+INSERT INTO heap_docs
+SELECT CONCAT(IF(n <= 255, 'alpha ', ''),
+              IF(n > 255 AND n <= 300, 'bravo ', ''),
+              'charlie heap row ', n)
+FROM (SELECT 1 + a.n + 10 * b.n + 100 * c.n AS n
+      FROM digits a CROSS JOIN digits b CROSS JOIN digits c) numbers
+WHERE n <= 300;
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('heap');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha bravo');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha bravo charlie');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha bravo charlie heap');
+
+SELECT COUNT(*) AS hits FROM (SELECT body FROM heap_docs WHERE MATCH(body) AGAINST('alpha') LIMIT 1 OFFSET 254) t;
+
+--echo heap_table_dml_rollback
+
+START TRANSACTION;
+UPDATE heap_docs SET body = 'alpha heap row 256' WHERE body = 'bravo charlie heap row 256';
+DELETE FROM heap_docs WHERE body = 'bravo charlie heap row 257';
+INSERT INTO heap_docs VALUES ('bravo heap row 999');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('heap');
+
+ROLLBACK;
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('heap');
 
 DROP DATABASE fts_count_boundaries;
 --enable_query_log

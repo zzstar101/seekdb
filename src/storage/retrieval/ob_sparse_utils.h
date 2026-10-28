@@ -37,6 +37,9 @@ struct ObSRDaaTRelevanceCollector
   virtual void reuse() = 0;
   virtual int collect_one_dim(const int64_t dim_idx, const double relevance) = 0;
   virtual int get_result(double &relevance, bool &is_valid) = 0;
+  // True only when every document present in at least one input dimension is a match. A
+  // count-only merge can then count the distinct document ids without invoking the collector.
+  virtual bool support_count_only_union() const { return false; }
 };
 
 struct ObSRDaaTInnerProductRelevanceCollector : ObSRDaaTRelevanceCollector
@@ -52,6 +55,7 @@ struct ObSRDaaTInnerProductRelevanceCollector : ObSRDaaTRelevanceCollector
   virtual void reuse() override;
   virtual int collect_one_dim(const int64_t dim_idx, const double) override;
   virtual int get_result(double &relevance, bool &is_valid) override;
+  virtual bool support_count_only_union() const override { return should_match_ <= 1; }
 private:
   double total_relevance_;
   int64_t matched_cnt_;

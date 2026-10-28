@@ -76,6 +76,50 @@ typedef ObSimpleRowsMerger<ObSRMergeItem, ObSRMergeCmp> ObSRSimpleMerger;
 typedef ObMergeLoserTree<ObSRMergeItem, ObSRMergeCmp> ObSRLoserTree;
 typedef common::ObRowsMerger<ObSRMergeItem, ObSRMergeCmp> ObSRMergeHeap;
 
+// Merges sorted document-id batches from several dimensions and returns each distinct id once.
+// It is used by the count-only union path, so it deliberately avoids the per-row dimension
+// virtual calls, relevance collector, and materialized output of the generic merge loop.
+class ObSRDaaTBatchIdMerger
+{
+public:
+  ObSRDaaTBatchIdMerger();
+  ~ObSRDaaTBatchIdMerger();
+  int init(
+      ObIArray<ObISRDaaTDimIter *> &dim_iters,
+      ObIAllocator &allocator,
+      const int64_t batch_capacity,
+      ObSRMergeCmp &merge_cmp,
+      ObSRMergeHeap *merge_heap,
+      ObFixedArray<const ObDatum *, ObIAllocator> &current_ids);
+  // Clear logical execution state while retaining the fixed-array storage for the next scan.
+  void reuse();
+  void reset();
+  // The returned pointer refers to storage owned by this merger and stays valid until the next
+  // call to get_next_distinct_id().
+  int get_next_distinct_id(const ObDatum *&id_datum);
+private:
+  int load_batch(const int64_t iter_idx);
+  int advance(const int64_t iter_idx);
+  int get_next_from_one(const ObDatum *&id_datum);
+  int get_next_from_two(const ObDatum *&id_datum);
+  int get_next_from_heap(const ObDatum *&id_datum);
+private:
+  ObIArray<ObISRDaaTDimIter *> *dim_iters_;
+  ObSRMergeCmp *merge_cmp_;
+  ObSRMergeHeap *merge_heap_;
+  ObFixedArray<const ObDatum *, ObIAllocator> *current_ids_;
+  ObFixedArray<const ObDatum **, ObIAllocator> batch_ids_;
+  ObFixedArray<int64_t, ObIAllocator> batch_counts_;
+  ObFixedArray<int64_t, ObIAllocator> batch_positions_;
+  ObDocIdExt last_id_;
+  int64_t dim_cnt_;
+  int64_t active_cnt_;
+  int64_t batch_capacity_;
+  bool has_last_id_;
+  bool is_inited_;
+  DISALLOW_COPY_AND_ASSIGN(ObSRDaaTBatchIdMerger);
+};
+
 // implementation of basic DaaT query processing algorithm primitives
 class ObSRDaaTIterImpl : public ObISparseRetrievalMergeIter
 {
@@ -109,7 +153,11 @@ protected:
   // neither the document id copy nor the projection of the output row is done.
   int get_next_rows_count_only(const int64_t capacity, int64_t &count);
   virtual int do_one_count_round(int64_t &count);
+  int get_next_rows_count_only_batch(const int64_t capacity, int64_t &count);
   int count_result(int64_t &count);
+  // Whether the concrete retrieval mode and its merge predicate permit replacing the generic
+  // count loop with a deduplicated union of document-id batches.
+  virtual bool support_count_only_batch() const { return false; }
   // Merge the dimension iterators with a direct comparison of their current document ids
   // instead of the generic merge heap. It can only be used when the per-dimension relevance is
   // not consumed by the query, so the merge only has to produce every distinct document id in
@@ -133,10 +181,13 @@ protected:
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
+  ObSRDaaTBatchIdMerger batch_id_merger_;
   int64_t next_round_cnt_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
   bool need_score_;
   bool count_only_;
+  bool count_only_batch_capable_;
+  bool count_only_batch_started_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

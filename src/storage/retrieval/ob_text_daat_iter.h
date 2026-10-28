@@ -63,6 +63,10 @@ public:
   virtual void reset() override;
 protected:
   virtual int pre_process() override;
+  virtual bool support_count_only_batch() const override
+  {
+    return sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE == mode_flag_;
+  }
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;

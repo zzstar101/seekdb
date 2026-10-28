@@ -129,6 +129,11 @@ public:
   void reset();
   virtual int get_next_row() override;
   virtual int get_next_batch(const int64_t capacity, int64_t &count) override;
+  virtual bool support_batch_doc_ids() const override { return true; }
+  virtual int get_next_doc_id_batch(
+      const int64_t capacity,
+      const ObDatum **&doc_ids,
+      int64_t &count) override;
   virtual int advance_to(const ObDatum &id_datum) override;
   virtual int get_curr_score(double &score) const override;
   virtual int get_curr_id(const ObDatum *&id_datum) const override;
@@ -155,6 +160,7 @@ private:
   int64_t count_;
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
+  ObFixedArray<const ObDatum *, ObIAllocator> batch_doc_ids_;
   common::ObDatumCmpFuncType cmp_func_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
