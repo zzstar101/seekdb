@@ -359,37 +359,44 @@ CPU/GPU 建图对比。注意两类数字的采集层次不同，GPU 一侧含 s
 
 ## 12. 验证工具（一条命令给出结论）
 
-两个脚本把“还剩多少把握”变成可执行的判断，而不是叙述：
-
 ```bash
-# 召回/加速 A/B：同一二进制、同一数据，只改 NN-descent 预算
+# 配置扫描：同一二进制、同一数据，只改 bridge 旋钮
 N=250000 DIM=128 SEEKDB_HOME=/path/to/cand_home \
-  tools/hipvs_bridge/bench/verify_niter_ab.sh
+  tools/hipvs_bridge/bench/verify_configs.sh
 # 256 维同理
 N=250000 DIM=256 SEEKDB_HOME=/path/to/cand_home \
-  tools/hipvs_bridge/bench/verify_niter_ab.sh
+  tools/hipvs_bridge/bench/verify_configs.sh
 
 # 单条查询的成本分解（客户端与解析 / 存储取行 / 索引检索）
 SEEKDB_HOME=/path/to/cand_home BASE=/root/work/run/eval \
   tools/hipvs_bridge/bench/prof_query.sh
 ```
 
-`verify_niter_ab.sh` 逐轮跑 `bench_official.py`（m=16、ef_construction=200、
-ef_search=64、4096 条查询、精确暴力 GT），再由 `summarize_niter.py` 按赛题口径
-输出加速比与相对 `niter=100` 的召回差，并按 0.005 门槛给出 PASS/FAIL。
+`verify_configs.sh` 按 `CONFIGS="label:ENV=V[,ENV=V]"` 逐轮跑 `bench_official.py`
+（m=16、ef_construction=200、ef_search=64、4096 条查询、精确暴力 GT），
+`summarize_runs.py` 以 `base`（`SEEKDB_CUVS_NITER=100`，即冻结基线图）为参照，
+输出加速比、召回差和按 0.005 门槛的 PASS/FAIL。默认扫描四档：
 
-用本项目实测的 250K×128 数字（§10.6 表）喂进该工具，结论是：
+| label | 配置 | 含义 |
+| --- | --- | --- |
+| `base` | niter=100 | 复现冻结基线图，作为参照 |
+| `n50` | niter=50 | 实测的召回安全档 |
+| `n30` | niter=30 | 当前默认档（激进） |
+| `ivfpq` | niter=50 + `build_algo=0` | **待验证的关键假设**：用 IVF-PQ 建初始图，再靠 50 轮 NN-descent 精修补回质量 |
+
+用本项目实测的 250K×128 数字喂进该工具：
 
 ```
-niter 100  46.40s  1.00x  r@10 0.9890  PASS
-niter  50  25.92s  1.79x  r@10 0.9890  PASS
-niter  30  22.13s  2.10x  r@10 0.9820  FAIL(r10)   <- 当前默认档
+base   100  46.40s  1.00x  r@10 0.9890  PASS
+n50     50  25.92s  1.79x  r@10 0.9890  PASS
+n30     30  22.13s  2.10x  r@10 0.9820  FAIL(r10)   <- 当前默认档
 ```
 
-也就是说：**默认档在单位化随机 250K 数据上是“2.10x 但召回差 0.007 不过线”**，
-安全档是 1.79x。这个选择被显式记录在 §10.6，工具只负责让它可复现、可反驳——
-换成 SIFT 类真实数据后跑同一条命令即可定论。
+即：**默认档在单位化随机 250K 上是“2.10x 但召回差 0.007 不过线”，安全档只有
+1.79x**。`ivfpq` 这一档是唯一可能“2.0x 且不押召回”的路径——基线里初始图 + 剪枝
+占 7.5 s（250K），而 IVF-PQ 初始图只要约 3 s，若 50 轮精修能把质量补回 0.005 以内，
+就能同时拿到满分构建分与硬门槛。这一档尚未在真机上跑过，是本项目唯一悬置的实验。
 
 `prof_query.sh` 把一次查询拆成四段：`SELECT 1` 往返、主键点查、索引 top-10、
-索引 top-100。本项目实测 SQL 端到端 p50 落在 6.6–7.7 ms，而单次 CAGRA 检索缓存后
-仅 0.386 ms，差额即客户端/解析/取行开销，这一层基线与候选逐字相同。
+索引 top-100。实测 SQL 端到端 p50 落在 6.6–7.7 ms，而单次 CAGRA 检索缓存后仅
+0.386 ms，差额即客户端/解析/取行开销，这一层基线与候选逐字相同。
