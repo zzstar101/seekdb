@@ -105,6 +105,11 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
     else if (n <= 400000) niter = 50;
     else if (n <= 1000000) niter = 60;
     else                  niter = 100;
+    /* NN-descent converges more slowly per round in higher dimension (distance
+     * concentration is weaker), so the 128-dim budget is not carried over to
+     * 192+ dim datasets blindly: keep a floor of 60 rounds there until the
+     * per-dimension quality has been measured. */
+    if (dim >= 192 && niter < 60) niter = 60;
   }
   h->ip->nn_descent_niter = (size_t)niter;
   fprintf(stderr,
@@ -236,6 +241,7 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
   if (!filename || n <= 0 || dim <= 0) return NULL;
   sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
   if (!index) return NULL;
+  pthread_mutex_init(&index->mu, NULL);
   if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
   if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
   if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
