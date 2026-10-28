@@ -341,7 +341,6 @@ public:
     eval_ctx_ = &eval_ctx;
   }
 
-  void mark_inited() { inited_ = true; }
   void reset_source() { cursor_ = 0; }
   void fail_next() { fail_next_ = true; }
 
@@ -1418,8 +1417,21 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
 
   std::vector<uint64_t> first_values = {10, 20, 30, 40, 50};
   std::vector<uint64_t> second_values = {70, 80, 90};
-  FakeDASScanIter first_scan(first_values, 2, eval_ctx, doc_id_expr);
-  FakeDASScanIter second_scan(second_values, 3, eval_ctx, doc_id_expr);
+  // DAS iterators normally live in an operator arena and are released explicitly.
+  FakeDASScanIter *first_scan = OB_NEWx(
+      FakeDASScanIter, &allocator, first_values, 2, eval_ctx, doc_id_expr);
+  FakeDASScanIter *second_scan = OB_NEWx(
+      FakeDASScanIter, &allocator, second_values, 3, eval_ctx, doc_id_expr);
+  ASSERT_NE(nullptr, first_scan);
+  ASSERT_NE(nullptr, second_scan);
+  sql::ExprFixedArray output(&allocator);
+  ASSERT_EQ(OB_SUCCESS, output.init(1));
+  ASSERT_EQ(OB_SUCCESS, output.push_back(&doc_id_expr));
+  sql::ObDASIterParam scan_param(sql::ObDASIterType::DAS_ITER_SCAN);
+  scan_param.max_size_ = batch_size;
+  scan_param.eval_ctx_ = &eval_ctx;
+  scan_param.exec_ctx_ = &exec_ctx;
+  scan_param.output_ = &output;
   ObTextRetrievalTokenIter first_token;
   ObTextRetrievalTokenIter second_token;
   ObTextRetrievalDaaTTokenIter first_iter;
@@ -1431,7 +1443,7 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   auto init_iter = [&](ObTextRetrievalDaaTTokenIter &iter,
                        ObTextRetrievalTokenIter &token_iter,
                        FakeDASScanIter &scan) {
-    scan.mark_inited();
+    ASSERT_EQ(OB_SUCCESS, scan.init(scan_param));
     token_iter.allocator_ = &allocator;
     token_iter.inv_idx_scan_iter_ = &scan;
     token_iter.eval_ctx_ = &eval_ctx;
@@ -1449,8 +1461,8 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
     ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_size));
     iter.is_inited_ = true;
   };
-  init_iter(first_iter, first_token, first_scan);
-  init_iter(second_iter, second_token, second_scan);
+  init_iter(first_iter, first_token, *first_scan);
+  init_iter(second_iter, second_token, *second_scan);
 
   const ObDatum *first_ids = nullptr;
   int64_t first_count = 0;
@@ -1493,13 +1505,13 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   EXPECT_EQ(40, first_ids[1].get_uint64());
   first_values[0] = 10;
   first_iter.reuse();
-  first_scan.reset_source();
+  first_scan->reset_source();
   ASSERT_EQ(OB_SUCCESS, first_iter.get_next_doc_id_batch(batch_size, first_ids, first_count));
   ASSERT_EQ(2, first_count);
   EXPECT_EQ(10, first_ids[0].get_uint64());
   EXPECT_EQ(20, first_ids[1].get_uint64());
 
-  second_scan.fail_next();
+  second_scan->fail_next();
   ASSERT_EQ(OB_ERR_UNEXPECTED,
             second_iter.get_next_doc_id_batch(batch_size, second_ids, second_count));
 
@@ -1507,6 +1519,9 @@ TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_wit
   EXPECT_EQ(nullptr, first_iter.batch_doc_ids_);
   EXPECT_EQ(nullptr, first_iter.owned_payload_buf_);
   EXPECT_EQ(0, first_iter.owned_payload_capacity_);
+  second_iter.reset();
+  ASSERT_EQ(OB_SUCCESS, first_scan->release());
+  ASSERT_EQ(OB_SUCCESS, second_scan->release());
 }
 
 } // namespace
