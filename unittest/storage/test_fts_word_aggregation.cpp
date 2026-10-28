@@ -135,7 +135,41 @@ TEST_F(WordAggregationTest, collation_equal_tokens_match_baseline_insertion)
   }
   EXPECT_EQ(baseline_words_.size(), words_.size());
   EXPECT_EQ(entries(baseline_words_), entries(words_));
+  int64_t count = 0;
+  ASSERT_EQ(OB_SUCCESS, words_.get_refactored(ObFTWord(4, "cafe", meta_), count));
+  EXPECT_EQ(4, count);
+  ASSERT_EQ(OB_SUCCESS, words_.get_refactored(
+      ObFTWord(4, "\xF0\x9F\x98\x80", meta_), count));
+  EXPECT_EQ(2, count);
   EXPECT_EQ(10, add.get_add_word_count());
+}
+
+TEST_F(WordAggregationTest, word_hash_and_assignment_are_shallow)
+{
+  const ObCollationType collations[] = {
+    common::CS_TYPE_UTF8MB4_GENERAL_CI,
+    common::CS_TYPE_UTF8MB4_UNICODE_CI,
+  };
+  for (const ObCollationType collation : collations) {
+    meta_.set_collation_type(collation);
+    ObFTWord upper_cafe(4, "CAFE", meta_);
+    ObFTWord accented_cafe(5, "caf\xc3\xa9", meta_);
+    EXPECT_EQ(upper_cafe, accented_cafe);
+    uint64_t upper_hash = 0;
+    uint64_t accented_hash = 0;
+    ASSERT_EQ(OB_SUCCESS, upper_cafe.hash(upper_hash));
+    ASSERT_EQ(OB_SUCCESS, accented_cafe.hash(accented_hash));
+    EXPECT_EQ(upper_hash, accented_hash);
+
+    ObFTWord assigned;
+    assigned = accented_cafe;
+    EXPECT_EQ(accented_cafe, assigned);
+    EXPECT_EQ(accented_cafe.get_collation_type(), assigned.get_collation_type());
+    EXPECT_EQ(static_cast<const void *>(accented_cafe.get_word().get_string().ptr()),
+              static_cast<const void *>(assigned.get_word().get_string().ptr()));
+    EXPECT_EQ(accented_cafe.get_word().get_string().length(),
+              assigned.get_word().get_string().length());
+  }
 }
 
 TEST_F(WordAggregationTest, colliding_new_words_and_updates_keep_all_entries)
@@ -150,17 +184,18 @@ TEST_F(WordAggregationTest, colliding_new_words_and_updates_keep_all_entries)
   }
   ObAddWord add(property_, meta_, flag_, allocator_, words_);
   for (const auto &token : inputs) {
+    ASSERT_EQ(OB_SUCCESS, baseline_groupby_word(
+        baseline_words_, meta_, token.data(), token.size(), 1/*word freq*/));
     ASSERT_EQ(OB_SUCCESS, add.process_word(token.data(), token.size(), token.size(), 1));
   }
   ASSERT_EQ(key_count, words_.size());
-  Entries expected = entries(words_);
-  for (auto &entry : expected) {
-    entry.second = 3;
-  }
+  EXPECT_EQ(entries(baseline_words_), entries(words_));
   for (auto it = inputs.rbegin(); it != inputs.rend(); ++it) {
+    ASSERT_EQ(OB_SUCCESS, baseline_groupby_word(
+        baseline_words_, meta_, it->data(), it->size(), 2/*word freq*/));
     ASSERT_EQ(OB_SUCCESS, add.process_word(it->data(), it->size(), it->size(), 2));
   }
-  EXPECT_EQ(expected, entries(words_));
+  EXPECT_EQ(entries(baseline_words_), entries(words_));
   EXPECT_EQ(3 * key_count, add.get_add_word_count());
 }
 
