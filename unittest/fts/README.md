@@ -7,7 +7,7 @@ by the FTS optimizations. The official benchmark and its fixed baseline are unch
 
 First finish a normal seekdb build with its pinned dependencies installed. The helper
 uses that build's actual compiler flags and production link command, substitutes the
-three test translation units for the server entry point, and links the installed
+regression test translation units for the server entry point, and links the installed
 Google Test libraries. It does not rebuild seekdb or substitute mock implementations.
 
 From the repository root:
@@ -31,10 +31,10 @@ outside the production dependency directories, pass its prefix (for example,
 production-linked regression sources with repeated `--test-source` arguments;
 paths are relative to the repository root.
 
-The 12 tests cover:
+The tests cover:
 
 - Word aggregation: first-occurrence frequency, repeated words, collation equality,
-  first spelling, forced bucket collisions, error propagation, and parser-helper
+  baseline representative spelling, forced bucket collisions, error propagation, and parser-helper
   reuse across populated and empty documents.
 - IK classification: all 1,112,064 valid UTF-8 Unicode scalar values, every UTF-16
   code unit in both byte orders, and malformed, truncated, and null inputs. The
@@ -42,10 +42,17 @@ The 12 tests cover:
 - String comparison: every supported collation, both trailing-space modes, empty
   strings, embedded NUL, Unicode and malformed byte sequences, and invalid inputs.
   Results are compared with the original production collation handler.
+- Count-only batch merging: single, two-way and loser-tree unions; empty inputs,
+  NULL IDs, duplicate final IDs, partial consumption, and allocation reuse.
+- Post-build word rows: all generated columns against the original builder,
+  input lifetime, partial batches, tokenless documents, and scratch-memory reuse.
+- IK dictionary character codes: DAT-local mappings, missing and malformed
+  characters, overlapping prefixes, and overflow of the bounded cache compared
+  with the original matching loop.
 
 ## SQL regression tests
 
-The two new cases are in the existing `fts_index` mysqltest suite:
+The focused cases are in the existing `fts_index` mysqltest suite:
 
 - `no_score_projection`: independent expected counts and IDs; observable score
   materialization as an oracle for threshold and top-k behavior; prepared statements;
@@ -56,6 +63,14 @@ The two new cases are in the existing `fts_index` mysqltest suite:
   and incrementally maintained indexes, updates/deletes, transaction visibility,
   rollback, and an independently materialized scored result.
 
+- `postbuild_word_rows`: partitioned post-build versus incremental membership,
+  documents crossing output-batch boundaries, empty/NULL input, frequency-sensitive
+  scores on small documents, and a secondary-index smoke check. The large document
+  occupies its own partition because the existing average-length estimator differs
+  between SSTables and memtables; its full row fields are checked by the native test.
+- `tokenize_function`: accent-, case-, and emoji-equivalent spellings plus n-gram
+  representatives compared with the competition baseline.
+
 They run through the repository's existing mysqltest discovery. To execute only these
 cases against a dedicated local test instance, adjust the client connection as needed:
 
@@ -64,7 +79,7 @@ export LD_LIBRARY_PATH="$PWD/deps/3rd/u01/obclient/lib:$PWD/deps/3rd/u01/obclien
 FTS_SUITE=tools/deploy/mysql_test/test_suite/fts_index
 FTS_LOG_DIR=$(mktemp -d /tmp/seekdb-fts-mysqltest.XXXXXX)
 
-for FTS_CASE in no_score_projection count_only_boundaries; do
+for FTS_CASE in no_score_projection count_only_boundaries postbuild_word_rows tokenize_function; do
   deps/3rd/u01/obclient/bin/mysqltest \
     --host=127.0.0.1 --port=2881 --user=root \
     --tmpdir="$FTS_LOG_DIR" --logdir="$FTS_LOG_DIR" --silent \
@@ -73,8 +88,8 @@ for FTS_CASE in no_score_projection count_only_boundaries; do
 done
 ```
 
-These fixtures create and drop their own `fts_no_score_projection` and
-`fts_count_boundaries` databases. They do not change the benchmark database.
+These fixtures create and drop their own `fts_no_score_projection`,
+`fts_count_boundaries`, `fts_postbuild_word_rows`, and `fts` databases. They do not change the benchmark database.
 
 ## Exact TOKENIZE differential
 
@@ -92,7 +107,7 @@ python3 unittest/storage/fts_word_aggregation_diff.py \
 ```
 
 This compares 533 complete JSON results byte for byte, including token order and
-first spelling. It covers five parsers, the three supported UTF-8 collations, both
+baseline representative spelling. It covers five parsers, the three supported UTF-8 collations, both
 output modes, a binary-collation BENG fallback, empty/NULL input, Unicode, embedded
 NUL, repeated words, long words, and alternating input rows. It also checks independent
 frequency and empty-input invariants. All statements in this differential are reads.

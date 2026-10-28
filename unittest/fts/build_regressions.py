@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the FTS native regressions against an existing seekdb build.
 
-The default is a dry run. --execute compiles three independent test objects and
+The default is a dry run. --execute compiles the regression test objects and
 links them with the production archives and the installed Google Test libraries.
 It neither rebuilds seekdb nor runs the tests. All output stays outside the source
 and build trees.
@@ -22,6 +22,9 @@ TEST_SOURCES = (
     "unittest/storage/test_fts_word_aggregation.cpp",
     "unittest/storage/test_fts_char_classification.cpp",
     "unittest/lib/charset/test_fts_strcmpsp_dispatch.cpp",
+    "unittest/storage/test_fts_count_only_batch.cpp",
+    "unittest/storage/test_fts_ik_dictionary_cache.cpp",
+    "unittest/storage/test_fts_word_row_buffer.cpp",
 )
 
 
