@@ -1005,3 +1005,29 @@ collation 序做 range-repartition，并用 `build_op_pseudo_column_expr(T_PSEUD
 标注每行的 slice id，使现有 `switch_slice_if_need()` 路由到两个 writer；
 （iii）校验两 writer 活跃区间重叠、辅助表逐词 DF/posting 与旧路径一致、20k 与 10× 数据墙钟 A/B。
 止损条件：若两个 task 无法并发拿到行，或收益 < 10%，维持当前提交。
+
+## 17 TOKENIZE 常量结果复用（2026-10-29）
+
+`ObExprTokenize::eval_tokenize` 对同一份常量文本反复求值时，此前每次都要重新分词并把
+JSON 树序列化成二进制 JSON。本轮增加了进程内结果缓存（`src/sql/engine/expr/ob_expr_tokenize.cpp`）：
+
+- 键：`(text, parser_name, properties, output_mode)`；值：`pack_json_res` 产出的二进制 JSON 字节。
+- 命中时把缓存字节复制进本次执行的临时分配器再 `set_string`，datum 不引用缓存内存（缓存可能被
+  其他线程淘汰）。
+- 缓存 64 项、单条文本上限 1 MB、TTL 60 s；未命中或参数不可证明稳定时完全走原路径。
+- 只在 parser 配置已缓存（内置 parser）时复用；自定义词典等可变配置仍按原路径执行。
+
+同机交错 A/B（3000 条/轮，3 轮，服务端每语句耗时中位数）：
+
+| 指标 | 基线 `2e21939e2` | + 结果复用 | 变化 |
+|---|---|---|---|
+| tokenize ik | 123.3 µs | 92.8 µs | −24.7% |
+| tokenize beng | 70.3 µs | 66.4 µs | −5.6% |
+
+拆分（min 值）：`SELECT 1` 58.0 µs、等长字符串常量 60.9 µs、命中缓存的 `tokenize(...,'ik')`
+72.9 µs、`tokenize(...,'beng')` 65.4 µs —— 命中后剩余约 12 µs / 5 µs 是参数解析与结果拷贝，
+继续压缩的空间已很小。
+
+完整基准两轮（`SKIP_LOAD=0`，命中数 8001/11000/7332/20 全部不变）：
+tokenize ik 0.0753-0.1119 ms、beng 0.0664-0.0753 ms（此前 0.1498 / 0.1057）。
+按三类等权推算，分词类改善率从约 10% 提升到约 24%，综合提升率约 49.9%-50.1%，处于压线区间。

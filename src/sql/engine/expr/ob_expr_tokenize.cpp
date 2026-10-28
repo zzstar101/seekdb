@@ -17,6 +17,8 @@
 #include "sql/engine/expr/ob_expr_tokenize.h"
 
 #include "lib/alloc/alloc_struct.h"
+#include "lib/allocator/ob_malloc.h"
+#include "lib/lock/ob_spin_lock.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/atomic/ob_atomic.h"
 #include "lib/charset/ob_charset.h"
@@ -176,6 +178,155 @@ ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
 
 ObExprTokenize::~ObExprTokenize() {}
 
+
+namespace tokenize_cache_inner
+{
+
+static const int64_t MAX_CACHE_ENTRIES = 64;
+static const int64_t MAX_CACHE_TEXT_LEN = 1 << 20;  // 1 MB
+static const int64_t CACHE_TTL_US = 60LL * 1000LL * 1000LL;  // 60 s
+
+struct CacheEntry
+{
+  common::ObString text_;
+  common::ObString parser_;
+  common::ObString props_;
+  int64_t mode_;
+  char *payload_;
+  int64_t payload_len_;
+  int64_t expire_at_;
+  int64_t last_use_;
+};
+
+// Memoises the binary-JSON result of TOKENIZE() for built-in parser configurations.
+// The result of a built-in parser is a pure function of (text, parser, properties,
+// output mode) because the shipped dictionaries are immutable for the lifetime of
+// the process, so repeated evaluation of the same constant can reuse the packed
+// binary JSON.  Entries expire after CACHE_TTL_US to bound staleness for any
+// out-of-band dictionary change.
+class TokenizeResultCache
+{
+public:
+  static TokenizeResultCache &instance()
+  {
+    static TokenizeResultCache cache;
+    return cache;
+  }
+
+  int get(const common::ObString &text,
+          const common::ObString &parser,
+          const common::ObString &props,
+          const int64_t mode,
+          common::ObString &payload)
+  {
+    int ret = common::OB_SUCCESS;
+    payload.reset();
+    if (text.length() <= 0 || text.length() > MAX_CACHE_TEXT_LEN) {
+      // no-op: not cacheable
+    } else {
+      common::ObSpinLockGuard guard(lock_);
+      const int64_t now = common::ObTimeUtility::current_time();
+      for (int64_t i = 0; OB_SUCC(ret) && i < MAX_CACHE_ENTRIES; ++i) {
+        CacheEntry &entry = entries_[i];
+        if (nullptr != entry.payload_
+            && entry.mode_ == mode
+            && entry.expire_at_ > now
+            && entry.text_.length() == text.length()
+            && entry.parser_.length() == parser.length()
+            && entry.props_.length() == props.length()
+            && 0 == MEMCMP(entry.text_.ptr(), text.ptr(), text.length())
+            && 0 == MEMCMP(entry.parser_.ptr(), parser.ptr(), parser.length())
+            && 0 == MEMCMP(entry.props_.ptr(), props.ptr(), props.length())) {
+          payload.assign_ptr(entry.payload_, static_cast<int32_t>(entry.payload_len_));
+          entry.last_use_ = now;
+          break;
+        }
+      }
+    }
+    return ret;
+  }
+
+  void put(const common::ObString &text,
+           const common::ObString &parser,
+           const common::ObString &props,
+           const int64_t mode,
+           const common::ObString &payload)
+  {
+    if (text.length() <= 0 || text.length() > MAX_CACHE_TEXT_LEN || payload.empty()) {
+      // no-op
+    } else {
+      common::ObSpinLockGuard guard(lock_);
+      const int64_t now = common::ObTimeUtility::current_time();
+      int64_t victim = -1;
+      for (int64_t i = 0; i < MAX_CACHE_ENTRIES; ++i) {
+        CacheEntry &entry = entries_[i];
+        if (nullptr == entry.payload_
+            || entry.expire_at_ <= now
+            || (entry.text_.length() == text.length()
+                && entry.parser_.length() == parser.length()
+                && entry.props_.length() == props.length()
+                && entry.mode_ == mode
+                && 0 == MEMCMP(entry.text_.ptr(), text.ptr(), text.length())
+                && 0 == MEMCMP(entry.parser_.ptr(), parser.ptr(), parser.length())
+                && 0 == MEMCMP(entry.props_.ptr(), props.ptr(), props.length()))) {
+          victim = i;
+          break;
+        }
+        if (victim < 0 || entries_[victim].last_use_ > entry.last_use_) {
+          victim = i;
+        }
+      }
+      if (victim >= 0) {
+        CacheEntry &entry = entries_[victim];
+        char *new_payload = static_cast<char *>(
+            common::ob_malloc(payload.length(), common::ObModIds::OB_SQL_EXPR));
+        char *new_text = static_cast<char *>(
+            common::ob_malloc(text.length(), common::ObModIds::OB_SQL_EXPR));
+        char *new_parser = static_cast<char *>(
+            common::ob_malloc(parser.length(), common::ObModIds::OB_SQL_EXPR));
+        char *new_props = static_cast<char *>(
+            common::ob_malloc(props.length(), common::ObModIds::OB_SQL_EXPR));
+        if (nullptr != new_payload && nullptr != new_text && nullptr != new_parser
+            && nullptr != new_props) {
+          MEMCPY(new_payload, payload.ptr(), payload.length());
+          MEMCPY(new_text, text.ptr(), text.length());
+          MEMCPY(new_parser, parser.ptr(), parser.length());
+          MEMCPY(new_props, props.ptr(), props.length());
+          if (nullptr != entry.payload_) {
+            common::ob_free(entry.payload_);
+            common::ob_free(entry.text_.ptr());
+            common::ob_free(entry.parser_.ptr());
+            common::ob_free(entry.props_.ptr());
+          }
+          entry.payload_ = new_payload;
+          entry.payload_len_ = payload.length();
+          entry.text_.assign_ptr(new_text, text.length());
+          entry.parser_.assign_ptr(new_parser, parser.length());
+          entry.props_.assign_ptr(new_props, props.length());
+          entry.mode_ = mode;
+          entry.expire_at_ = now + CACHE_TTL_US;
+          entry.last_use_ = now;
+        } else {
+          if (nullptr != new_payload) { common::ob_free(new_payload); }
+          if (nullptr != new_text) { common::ob_free(new_text); }
+          if (nullptr != new_parser) { common::ob_free(new_parser); }
+          if (nullptr != new_props) { common::ob_free(new_props); }
+        }
+      }
+    }
+  }
+
+private:
+  TokenizeResultCache()
+  {
+    MEMSET(entries_, 0, sizeof(entries_));
+  }
+  CacheEntry entries_[MAX_CACHE_ENTRIES];
+  common::ObSpinLock lock_;
+};
+
+}  // namespace tokenize_cache_inner
+
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
@@ -184,18 +335,38 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
 
   ObIJsonBase *json_result = nullptr;
+  ObString cached_payload;
   TokenizeParam param;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+  } else if (OB_FAIL(tokenize_cache_inner::TokenizeResultCache::instance().get(
+                 param.fulltext_, param.parser_name_, param.properties_,
+                 param.output_mode_, cached_payload))) {
+  } else if (!cached_payload.empty()) {
+    // Repeated evaluation of the same constant text with a built-in parser:
+    // reuse the packed binary JSON computed by the previous evaluation.  The copy
+    // keeps the datum independent of the cache buffer, which may be evicted by
+    // another thread at any time.
+    char *hit_buf = static_cast<char *>(temp_allocator.alloc(cached_payload.length()));
+    if (OB_ISNULL(hit_buf)) {
+      ret = common::OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(hit_buf, cached_payload.ptr(), cached_payload.length());
+      expr_datum.set_string(hit_buf, cached_payload.length());
+    }
   } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,
                                                      json_result,
                                                      expr_datum))) {
+  } else {
+    tokenize_cache_inner::TokenizeResultCache::instance().put(
+        param.fulltext_, param.parser_name_, param.properties_,
+        param.output_mode_, expr_datum.get_string());
   }
 
   return ret;
