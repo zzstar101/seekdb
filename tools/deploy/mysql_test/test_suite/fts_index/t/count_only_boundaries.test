@@ -379,5 +379,15 @@ SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('bravo');
 
 SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('heap');
 
+--echo extreme_offset_empty_result
+
+SELECT COUNT(*) AS hits FROM (SELECT body FROM heap_docs WHERE MATCH(body) AGAINST('alpha') LIMIT 1 OFFSET 9223372036854775807) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT body FROM heap_docs WHERE MATCH(body) AGAINST('alpha bravo') LIMIT 2 OFFSET 9223372036854775807) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT body FROM heap_docs WHERE MATCH(body) AGAINST('alpha bravo charlie') LIMIT 256 OFFSET 9223372036854775806) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT body FROM heap_docs WHERE MATCH(body) AGAINST('unfindabletoken') LIMIT 1 OFFSET 9223372036854775807) t;
+
 DROP DATABASE fts_count_boundaries;
 --enable_query_log
