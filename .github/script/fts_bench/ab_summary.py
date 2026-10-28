@@ -43,15 +43,20 @@ def read_metrics(path: Path) -> dict[str, float]:
     return values
 
 
+RUN_RE = re.compile(r"^run-([AB])-(\d+)\.txt$")
+
+
 def collect(results: Path) -> tuple[dict[int, dict[str, float]], dict[int, dict[str, float]]]:
+    # The workflow tees each round to run-<v>-<i>.stdout.txt as well; only the
+    # plain run-<v>-<i>.txt is the report that carries the metrics.
     a: dict[int, dict[str, float]] = {}
     b: dict[int, dict[str, float]] = {}
-    for path in results.glob("run-A-*.txt"):
-        index = int(path.stem.rsplit("-", 1)[1])
-        a[index] = read_metrics(path)
-    for path in results.glob("run-B-*.txt"):
-        index = int(path.stem.rsplit("-", 1)[1])
-        b[index] = read_metrics(path)
+    for path in sorted(results.iterdir()):
+        match = RUN_RE.match(path.name)
+        if not match:
+            continue
+        version, index = match.group(1), int(match.group(2))
+        (a if version == "A" else b)[index] = read_metrics(path)
     return a, b
 
 
