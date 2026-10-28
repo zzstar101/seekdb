@@ -207,7 +207,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   long niter = sk_env_long("SEEKDB_CUVS_NITER", -1);
   if (niter < 0) {
     if (n <= 50000)       niter = 30;
-    else if (n <= 400000) niter = 25;
+    else if (n <= 400000) niter = 20;
     else if (n <= 1000000) niter = 60;
     else                  niter = 100;
   }
