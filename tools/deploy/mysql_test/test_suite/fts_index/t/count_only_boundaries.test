@@ -269,6 +269,7 @@ WHERE n <= 300;
 
 SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('tail');
 
+# alpha is a subset of tail; natural-language terms are ORed.
 SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('alpha tail');
 
 SELECT COUNT(*) AS hits FROM varchar_docs WHERE MATCH(body) AGAINST('alpha bravo tail');

@@ -69,13 +69,20 @@ public:
   FakeBatchDimIter(
       const std::vector<std::optional<uint64_t>> &ids,
       const int64_t batch_size)
-    : ids_(), views_(), next_idx_(0), batch_size_(batch_size)
+    : values_(), ids_(), views_(), next_idx_(0), batch_size_(batch_size)
   {
-    ids_.reserve(ids.size());
+    // ObDatum::set_int() writes through ptr_; a default-constructed ObDatum has a null data
+    // pointer. Keep the integers in stable storage and make each datum point at its value.
+    values_.reserve(ids.size());
     for (const std::optional<uint64_t> &id : ids) {
+      values_.push_back(id.value_or(0));
+    }
+    ids_.reserve(ids.size());
+    for (int64_t i = 0; i < static_cast<int64_t>(ids.size()); ++i) {
       ObDatum datum;
-      if (id.has_value()) {
-        datum.set_int(static_cast<int64_t>(*id));
+      if (ids[i].has_value()) {
+        datum.ptr_ = reinterpret_cast<const char *>(&values_[i]);
+        datum.pack_ = sizeof(int64_t);
       } else {
         datum.set_null();
       }
@@ -114,6 +121,7 @@ public:
   }
 
 private:
+  std::vector<int64_t> values_;
   std::vector<ObDatum> ids_;
   std::vector<const ObDatum *> views_;
   int64_t next_idx_;
