@@ -36,11 +36,13 @@ protected:
     meta_.set_collation_type(common::CS_TYPE_UTF8MB4_BIN);
     flag_.set_groupby_word();
     ASSERT_EQ(OB_SUCCESS, words_.create(5, "FTSAggTest"));
+    ASSERT_EQ(OB_SUCCESS, baseline_words_.create(5, "FTSAggBaseline"));
   }
 
   void TearDown() override
   {
     words_.destroy();
+    baseline_words_.destroy();
   }
 
   using Entries = std::vector<std::pair<std::string, int64_t>>;
@@ -54,11 +56,37 @@ protected:
     return result;
   }
 
+  // Oracle for the insertion algorithm at 5bce9e0, before the single-probe
+  // rewrite. An overwrite replaces both the collation-equal key and its count.
+  static int baseline_groupby_word(
+      ObFTWordMap &words,
+      const ObObjMeta &meta,
+      const char *text,
+      const int64_t length,
+      const int64_t word_freq)
+  {
+    int ret = OB_SUCCESS;
+    int64_t word_count = 0;
+    ObFTWord word(length, text, meta);
+    if (OB_FAIL(words.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
+    } else {
+      if (OB_HASH_NOT_EXIST == ret) {
+        word_count = 1;
+      } else {
+        word_count += word_freq;
+      }
+      if (OB_FAIL(words.set_refactored(word, word_count, 1/*overwrite*/))) {
+      }
+    }
+    return ret;
+  }
+
   common::ObArenaAllocator allocator_;
   common::ObObjMeta meta_;
   ObFTParserProperty property_;
   ObAddWordFlag flag_;
   ObFTWordMap words_;
+  ObFTWordMap baseline_words_;
 };
 
 TEST_F(WordAggregationTest, new_and_repeated_words_keep_frequency_contract)
@@ -83,17 +111,31 @@ TEST_F(WordAggregationTest, new_and_repeated_words_keep_frequency_contract)
   EXPECT_EQ(14, add.get_add_word_count());
 }
 
-TEST_F(WordAggregationTest, collation_equal_tokens_keep_first_spelling)
+TEST_F(WordAggregationTest, collation_equal_tokens_match_baseline_insertion)
 {
   meta_.set_collation_type(common::CS_TYPE_UTF8MB4_GENERAL_CI);
   ObAddWord add(property_, meta_, flag_, allocator_, words_);
-  ASSERT_EQ(OB_SUCCESS, add.process_word("Cafe", 4, 4, 1));
-  ASSERT_EQ(OB_SUCCESS, add.process_word("caf\xc3\xa9", 5, 4, 1));
-  ASSERT_EQ(OB_SUCCESS, add.process_word("CAFE ", 5, 5, 1));
-  ASSERT_EQ(1, words_.size());
-  const Entries expected{{"Cafe", 3}};
-  EXPECT_EQ(expected, entries(words_));
-  EXPECT_EQ(3, add.get_add_word_count());
+  const char *inputs[] = {
+    "cafe",
+    "caf\xc3\xa9",
+    "CAFE",
+    "CAF\xc3\x89",
+    "resume",
+    "r\xc3\xa9sum\xc3\xa9",
+    "RESUME",
+    "R\xc3\xa9sum\xc3\xa9",
+    "\xF0\x9F\x98\x80",
+    "\xF0\x9F\x8D\xA3",
+  };
+  for (const char *input : inputs) {
+    const int64_t length = STRLEN(input);
+    ASSERT_EQ(OB_SUCCESS, baseline_groupby_word(
+        baseline_words_, meta_, input, length, 1/*word freq*/));
+    ASSERT_EQ(OB_SUCCESS, add.process_word(input, length, 1/*char count*/, 1/*word freq*/));
+  }
+  EXPECT_EQ(baseline_words_.size(), words_.size());
+  EXPECT_EQ(entries(baseline_words_), entries(words_));
+  EXPECT_EQ(10, add.get_add_word_count());
 }
 
 TEST_F(WordAggregationTest, colliding_new_words_and_updates_keep_all_entries)

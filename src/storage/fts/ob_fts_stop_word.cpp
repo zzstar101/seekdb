@@ -356,20 +356,23 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
+  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
+  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    // Update the counter in place: one hash plus one probe on the found entry is
-    // cheaper than a lookup followed by a second hashed write on the same key.
-    int64_t *word_count = word_map_.get(word);
-    if (OB_ISNULL(word_count)) {
-      if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
-      }
+    if (OB_HASH_NOT_EXIST == ret) {
+      word_count = 1;
     } else {
-      *word_count += word_freq;
+      word_count += word_freq;
+    }
+    // An overwrite must also replace the stored key: collation-equal tokens may
+    // have different bytes, and TOKENIZE exposes the last spelling in the slot
+    // where the token first appeared.
+    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
     }
   }
   return ret;

@@ -35,6 +35,11 @@ select tokenize('hello world', 'ngram');
 select tokenize('hello world', 'space', '[{"output": "all"}]');
 select tokenize('hello world', 'space', '[{"output": "default"}]');
 
+# Collation-equal spellings retain the baseline representative key, count and order.
+select tokenize('cafe café CAFE CAFÉ resume résumé RESUME Résumé' collate utf8mb4_general_ci, 'beng', '[{"output": "all"}]');
+select tokenize('alpha😀beta 😀 𠀀全文索引 🍣 Tokyo東京 カタカナ 한국어' collate utf8mb4_general_ci, 'beng', '[{"output": "all"}]');
+select tokenize('cafe café CAFE CAFÉ resume résumé RESUME Résumé' collate utf8mb4_general_ci, 'ngram', '[{"output": "all"}]');
+
 
 # output empty result
 
