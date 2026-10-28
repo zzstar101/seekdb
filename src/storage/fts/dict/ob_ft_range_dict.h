@@ -40,8 +40,9 @@ public:
   ObFTRangeDict(ObIAllocator &alloc,
                 ObFTCacheRangeContainer *range_container,
                 const ObFTDictDesc &desc)
-      : is_inited_(false), desc_(desc), range_alloc_(lib::ObMemAttr("Range Dict")),
-        range_dicts_(&range_alloc_), range_container_(range_container)
+      : is_inited_(false), use_range_binary_search_(false), desc_(desc),
+        range_alloc_(lib::ObMemAttr("Range Dict")), range_dicts_(&range_alloc_),
+        range_container_(range_container)
   {
   }
   ~ObFTRangeDict() override{};
@@ -111,11 +112,13 @@ private:
     range_alloc_.reset();
   }
 
+  void update_range_search_index();
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
 
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
   bool is_inited_;
+  bool use_range_binary_search_;
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;

@@ -143,6 +143,65 @@ void expect_same_hit(const ObDATrieHit &expected, const ObDATrieHit &actual)
   EXPECT_EQ(expected.char_cnt_, actual.char_cnt_);
 }
 
+int range_bound_byte_cmp(const ObString &bound, const ObString &word)
+{
+  const int64_t len = MIN(bound.length(), word.length());
+  int cmp = len > 0 ? memcmp(bound.ptr(), word.ptr(), static_cast<size_t>(len)) : 0;
+  if (0 == cmp) {
+    cmp = static_cast<int>(bound.length() - word.length());
+  }
+  return cmp;
+}
+
+int64_t find_first_range_linearly(const std::vector<ObFTDAT *> &dats, const ObString &word)
+{
+  for (int64_t i = 0; i < static_cast<int64_t>(dats.size()); ++i) {
+    if (range_bound_byte_cmp(dats[static_cast<size_t>(i)]->start_word_.get_word(), word) <= 0
+        && range_bound_byte_cmp(dats[static_cast<size_t>(i)]->end_word_.get_word(), word) >= 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void expect_range_lookup_matches_linear(const ObFTRangeDict &range,
+                                        const std::vector<ObFTDAT *> &dats,
+                                        const std::vector<std::string> &probes)
+{
+  for (const std::string &probe_string : probes) {
+    const ObString probe(static_cast<int32_t>(probe_string.size()), probe_string.data());
+    const int64_t range_idx = find_first_range_linearly(dats, probe);
+
+    ObFTWordCode actual_code = 0;
+    bool actual_found = false;
+    ASSERT_EQ(OB_SUCCESS, range.find_word_code(probe, actual_code, actual_found));
+
+    ObDATrieHit actual_hit(&range, 0);
+    ASSERT_EQ(OB_SUCCESS, range.match(probe, actual_hit));
+    if (range_idx < 0) {
+      EXPECT_FALSE(actual_found);
+      EXPECT_TRUE(actual_hit.is_unmatch());
+      continue;
+    }
+
+    ObFTCacheDict expected_dict(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                dats[static_cast<size_t>(range_idx)]);
+    ASSERT_EQ(OB_SUCCESS, expected_dict.init());
+
+    ObFTWordCode expected_code = 0;
+    bool expected_found = false;
+    ASSERT_EQ(OB_SUCCESS, expected_dict.find_word_code(probe, expected_code, expected_found));
+    EXPECT_EQ(expected_found, actual_found);
+    if (expected_found) {
+      EXPECT_EQ(expected_code, actual_code);
+    }
+
+    ObDATrieHit expected_hit(&expected_dict, 0);
+    ASSERT_EQ(OB_SUCCESS, expected_dict.match(probe, expected_hit));
+    expect_same_hit(expected_hit, actual_hit);
+  }
+}
+
 // Reference implementation of the original CJK matching loop. It deliberately
 // uses only the pre-existing match_with_hit API for every active prefix hit.
 int process_reference(TokenizeContext &ctx,
@@ -625,6 +684,97 @@ TEST_F(IKDictionaryCacheTest, cjk_processor_reuses_code_for_active_prefixes)
   EXPECT_EQ(repeats, dict.legacy_match_calls());
   EXPECT_EQ(4 * repeats, dict.single_match_calls());
   EXPECT_FALSE(ctx.token_list().tokens().empty());
+}
+
+TEST_F(IKDictionaryCacheTest, range_lookup_matches_linear_for_bounds_gaps_and_prefixes)
+{
+  ObFTDAT *dat_a = nullptr;
+  ObFTDAT *dat_d = nullptr;
+  ObFTDAT *dat_yi = nullptr;
+  ObFTDAT *dat_yi2 = nullptr;
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"A", "B"}, dat_a));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"D", "F"}, dat_d));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"一"}, dat_yi));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"乙"}, dat_yi2));
+
+  const std::vector<ObFTDAT *> dats = {dat_a, dat_d, dat_yi, dat_yi2};
+  ObFTRangeDict range(dat_allocator_,
+                      nullptr,
+                      ObFTDictDesc(ObString::make_string("ik-range-sorted-test"),
+                                   ObFTDictType::DICT_IK_MAIN,
+                                   ObCharsetType::CHARSET_UTF8MB4,
+                                   ObCollationType::CS_TYPE_UTF8MB4_BIN));
+  ObSEArray<ObFTDAT *, 4> dat_blocks;
+  for (ObFTDAT *dat : dats) {
+    ASSERT_EQ(OB_SUCCESS, dat_blocks.push_back(dat));
+  }
+  ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
+
+  const std::vector<std::string> probes = {
+      "", "A", "AA", "AB", "B", "BA", "C", "D", "DA", "E", "F", "FA",
+      "G", "一", "一乙", "乙", "乙乙", "丙"};
+  expect_range_lookup_matches_linear(range, dats, probes);
+
+  // A rejected rebuild must leave both the ranges and their search index untouched.
+  EXPECT_EQ(OB_INIT_TWICE, range.build_dict_from_dat_blocks(dat_blocks));
+  expect_range_lookup_matches_linear(range, dats, probes);
+}
+
+TEST_F(IKDictionaryCacheTest, range_lookup_falls_back_for_unsorted_ranges)
+{
+  ObFTDAT *dat_d = nullptr;
+  ObFTDAT *dat_a = nullptr;
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"D", "F"}, dat_d));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"A", "B"}, dat_a));
+
+  const std::vector<ObFTDAT *> dats = {dat_d, dat_a};
+  ObFTRangeDict range(dat_allocator_,
+                      nullptr,
+                      ObFTDictDesc(ObString::make_string("ik-range-unsorted-test"),
+                                   ObFTDictType::DICT_IK_MAIN,
+                                   ObCharsetType::CHARSET_UTF8MB4,
+                                   ObCollationType::CS_TYPE_UTF8MB4_BIN));
+  ObSEArray<ObFTDAT *, 2> dat_blocks;
+  for (ObFTDAT *dat : dats) {
+    ASSERT_EQ(OB_SUCCESS, dat_blocks.push_back(dat));
+  }
+  ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
+
+  expect_range_lookup_matches_linear(range, dats, {"A", "AB", "B", "C", "D", "DA", "F", "G"});
+}
+
+TEST_F(IKDictionaryCacheTest, range_lookup_preserves_first_match_for_overlapping_ranges)
+{
+  ObFTDAT *dat_a = nullptr;
+  ObFTDAT *dat_b = nullptr;
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"A", "C"}, dat_a));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"B", "D"}, dat_b));
+
+  ObFTCacheDict second_dict(ObCollationType::CS_TYPE_UTF8MB4_BIN, dat_b);
+  ASSERT_EQ(OB_SUCCESS, second_dict.init());
+  ObFTWordCode code = 0;
+  bool found = false;
+  ASSERT_EQ(OB_SUCCESS, second_dict.find_word_code(ObString::make_string("B"), code, found));
+  ASSERT_TRUE(found);
+
+  const std::vector<ObFTDAT *> dats = {dat_a, dat_b};
+  ObFTRangeDict range(dat_allocator_,
+                      nullptr,
+                      ObFTDictDesc(ObString::make_string("ik-range-overlap-test"),
+                                   ObFTDictType::DICT_IK_MAIN,
+                                   ObCharsetType::CHARSET_UTF8MB4,
+                                   ObCollationType::CS_TYPE_UTF8MB4_BIN));
+  ObSEArray<ObFTDAT *, 2> dat_blocks;
+  for (ObFTDAT *dat : dats) {
+    ASSERT_EQ(OB_SUCCESS, dat_blocks.push_back(dat));
+  }
+  ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
+
+  found = true;
+  ASSERT_EQ(OB_SUCCESS, range.find_word_code(ObString::make_string("B"), code, found));
+  EXPECT_FALSE(found);
+  expect_range_lookup_matches_linear(
+      range, dats, {"A", "B", "BB", "C", "CC", "D", "DD", "E"});
 }
 
 } // namespace

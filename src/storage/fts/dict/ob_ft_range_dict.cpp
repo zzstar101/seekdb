@@ -305,9 +305,8 @@ int ObFTRangeDict::init()
   int ret = OB_SUCCESS;
   if (is_inited_) {
     ret = OB_INIT_TWICE;
+  } else if (OB_FAIL(build_dict_from_cache(*range_container_))) {
   } else {
-    if (OB_FAIL(build_dict_from_cache(*range_container_))) {
-    }
     is_inited_ = true;
   }
   return ret;
@@ -426,11 +425,31 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; !found && i < range_dicts_.size(); ++i) {
-    if (range_bound_cmp(range_dicts_[i].start_.get_word(), single_word) <= 0
-        && range_bound_cmp(range_dicts_[i].end_.get_word(), single_word) >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  if (use_range_binary_search_) {
+    int64_t left = 0;
+    int64_t right = range_dicts_.size();
+    while (left < right) {
+      const int64_t mid = left + (right - left) / 2;
+      if (range_bound_cmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+    if (left > 0) {
+      const int64_t range_idx = left - 1;
+      if (range_bound_cmp(range_dicts_[range_idx].end_.get_word(), single_word) >= 0) {
+        dict = range_dicts_[range_idx].dict_;
+        found = true;
+      }
+    }
+  } else {
+    for (int64_t i = 0; !found && i < range_dicts_.size(); ++i) {
+      if (range_bound_cmp(range_dicts_[i].start_.get_word(), single_word) <= 0
+          && range_bound_cmp(range_dicts_[i].end_.get_word(), single_word) >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -440,11 +459,35 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   return ret;
 }
 
+void ObFTRangeDict::update_range_search_index()
+{
+  // Binary lookup is valid only when starts are strictly ordered and neighboring
+  // ranges are disjoint. Otherwise retain the original order and linear lookup,
+  // which defines the first-match behavior for custom or overlapping ranges.
+  use_range_binary_search_ = range_dicts_.size() > 0;
+  for (int64_t i = 0; use_range_binary_search_ && i < range_dicts_.size(); ++i) {
+    const ObString start = range_dicts_[i].start_.get_word();
+    const ObString end = range_dicts_[i].end_.get_word();
+    if (range_bound_cmp(start, end) > 0) {
+      use_range_binary_search_ = false;
+    } else if (i > 0) {
+      const ObString prev_start = range_dicts_[i - 1].start_.get_word();
+      const ObString prev_end = range_dicts_[i - 1].end_.get_word();
+      if (range_bound_cmp(prev_start, start) >= 0 || range_bound_cmp(prev_end, start) >= 0) {
+        use_range_binary_search_ = false;
+      }
+    }
+  }
+}
+
 int ObFTRangeDict::build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> &dat_blocks)
 {
   int ret = OB_SUCCESS;
   if (is_inited_) {
     ret = OB_INIT_TWICE;
+  }
+  if (OB_SUCC(ret)) {
+    use_range_binary_search_ = false;
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < dat_blocks.count(); ++i) {
     ObFTCacheDict *dict = nullptr;
@@ -469,6 +512,7 @@ int ObFTRangeDict::build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> 
     }
   }
   if (OB_SUCC(ret)) {
+    update_range_search_index();
     is_inited_ = true;
   }
   return ret;
@@ -477,6 +521,7 @@ int ObFTRangeDict::build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
 {
   int ret = OB_SUCCESS;
+  use_range_binary_search_ = false;
   for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
        OB_SUCC(ret) && iter != range_container.get_handles().end();
        iter++) {
@@ -493,6 +538,9 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    update_range_search_index();
   }
   return ret;
 }
