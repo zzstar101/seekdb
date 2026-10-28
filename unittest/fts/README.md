@@ -42,13 +42,17 @@ The tests cover:
 - String comparison: every supported collation, both trailing-space modes, empty
   strings, embedded NUL, Unicode and malformed byte sequences, and invalid inputs.
   Results are compared with the original production collation handler.
-- Count-only batch merging: single, two-way and loser-tree unions; empty inputs,
-  NULL IDs, duplicate final IDs, partial consumption, and allocation reuse.
+- Count-only batch merging: single, two-way, three-way and loser-tree unions; empty inputs,
+  NULL IDs, duplicate final IDs, partial consumption, and allocation reuse. Bulk counts also
+  cover overwritten datum/payload storage, long binary IDs, allocator replacement, refill
+  failures, and extreme iterator offsets without adding the offset to the batch capacity.
 - Post-build word rows: all generated columns against the original builder,
   input lifetime, partial batches, tokenless documents, and scratch-memory reuse.
 - IK dictionary character codes: DAT-local mappings, missing and malformed
   characters, overlapping prefixes, and overflow of the bounded cache compared
-  with the original matching loop.
+  with the original matching loop. Range lookup checks both boundaries and gaps, and
+  explicitly verifies that unordered, overlapping or invalid ranges use linear first-match
+  lookup while ordered disjoint ranges use binary lookup.
 
 ## SQL regression tests
 
