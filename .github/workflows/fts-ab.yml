@@ -10,6 +10,12 @@ name: FTS interleaved A/B (fork)
 # the only thing we look at.
 
 on:
+  # A push trigger is what registers the workflow with Actions in the first
+  # place; a workflow that only declares workflow_dispatch cannot be dispatched
+  # until it exists on the default branch.
+  push:
+    branches:
+      - ci/fts-ab
   workflow_dispatch:
     inputs:
       ref_a:
