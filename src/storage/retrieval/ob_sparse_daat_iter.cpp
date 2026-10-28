@@ -935,31 +935,45 @@ int ObSRDaaTIterImpl::get_next_rows_count_only_batch(const int64_t capacity, int
     }
     if (OB_UNLIKELY(target_count <= 0)) {
       ret = OB_ITER_END;
-    } else if (OB_UNLIKELY(offset_remaining > INT64_MAX - target_count)) {
-      ret = OB_SIZE_OVERFLOW;
-    } else {
-      const int64_t consume_capacity = target_count + offset_remaining;
-      int64_t distinct_count = 0;
-      const int merge_ret = batch_id_merger_.get_next_distinct_count(consume_capacity, distinct_count);
+    }
+    // Consume OFFSET in bounded chunks. Keeping offset and result capacity separate avoids
+    // overflowing their sum for legal SQL such as LIMIT 1 OFFSET INT64_MAX.
+    while (OB_SUCC(ret) && offset_remaining > 0) {
+      const int64_t skip_capacity = MIN(offset_remaining, iter_param_->max_batch_size_);
+      int64_t skipped_count = 0;
+      const int merge_ret = batch_id_merger_.get_next_distinct_count(skip_capacity, skipped_count);
       if (OB_SUCCESS != merge_ret && OB_ITER_END != merge_ret) {
         ret = merge_ret;
-        LOG_WARN("failed to count distinct document ids in a batch", K(ret), K(consume_capacity));
-      } else if (OB_UNLIKELY(distinct_count < 0 || distinct_count > consume_capacity
-                             || (OB_SUCCESS == merge_ret && distinct_count != consume_capacity))) {
+        LOG_WARN("failed to skip a document-id batch for offset", K(ret), K(skip_capacity));
+      } else if (OB_UNLIKELY(skipped_count < 0 || skipped_count > skip_capacity
+                             || (OB_SUCCESS == merge_ret && skipped_count != skip_capacity))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected skipped id count from a batch", K(ret), K(merge_ret),
+                 K(skipped_count), K(skip_capacity));
+      } else {
+        input_row_cnt_ += skipped_count;
+        offset_remaining -= skipped_count;
+        if (OB_ITER_END == merge_ret) {
+          ret = OB_ITER_END;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      int64_t accepted_count = 0;
+      const int merge_ret = batch_id_merger_.get_next_distinct_count(target_count, accepted_count);
+      if (OB_SUCCESS != merge_ret && OB_ITER_END != merge_ret) {
+        ret = merge_ret;
+        LOG_WARN("failed to count distinct document ids in a batch", K(ret), K(target_count));
+      } else if (OB_UNLIKELY(accepted_count < 0 || accepted_count > target_count
+                             || (OB_SUCCESS == merge_ret && accepted_count != target_count))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected distinct id count from a batch", K(ret), K(merge_ret),
-                 K(distinct_count), K(consume_capacity));
+                 K(accepted_count), K(target_count));
       } else {
-        const int64_t skipped_count = MIN(distinct_count, offset_remaining);
-        const int64_t accepted_count = MIN(distinct_count - skipped_count, target_count);
-        input_row_cnt_ += distinct_count;
+        input_row_cnt_ += accepted_count;
         count += accepted_count;
         output_row_cnt_ += accepted_count;
-        if (OB_UNLIKELY(OB_SUCCESS == merge_ret && accepted_count != target_count)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("batch count did not fill the requested count", K(ret),
-                   K(accepted_count), K(target_count), K(distinct_count), K(offset_remaining));
-        } else if (limit_param->is_valid() && output_row_cnt_ >= limit_param->limit_) {
+        if (limit_param->is_valid() && output_row_cnt_ >= limit_param->limit_) {
           ret = OB_ITER_END;
         } else if (OB_ITER_END == merge_ret) {
           ret = OB_ITER_END;

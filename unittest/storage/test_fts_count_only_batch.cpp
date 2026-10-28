@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "data_plane/api/data_plane/access/ob_tablet_scan.h"
 #include "lib/container/ob_se_array.h"
 #include "storage/retrieval/ob_sparse_daat_iter.h"
 
@@ -223,6 +224,49 @@ using IdList = std::vector<std::optional<uint64_t>>;
 using ExpectedIds = std::vector<std::optional<uint64_t>>;
 using StringIdList = std::vector<std::optional<std::string>>;
 
+class TestCountOnlyDaaTIter final : public ObSRDaaTIterImpl
+{
+public:
+  TestCountOnlyDaaTIter() = default;
+  virtual ~TestCountOnlyDaaTIter() override { reset(); }
+
+  int init_for_count_test(
+      ObSparseRetrievalMergeParam &iter_param,
+      ObIArray<ObISRDaaTDimIter *> &dim_iters,
+      ObIAllocator &allocator,
+      const sql::ObDatumMeta &id_meta)
+  {
+    int ret = OB_SUCCESS;
+    iter_param_ = &iter_param;
+    dim_iters_ = &dim_iters;
+    iter_allocator_ = &allocator;
+    merge_heap_ = nullptr;
+    relevance_collector_ = nullptr;
+    need_score_ = false;
+    count_only_ = true;
+    count_only_batch_capable_ = true;
+    count_only_batch_started_ = false;
+    input_row_cnt_ = 0;
+    output_row_cnt_ = 0;
+    if (0 == dim_iters.count()) {
+      is_inited_ = true;
+    } else {
+      iter_domain_ids_.set_allocator(&allocator);
+      if (OB_FAIL(iter_domain_ids_.init(dim_iters.count()))) {
+      } else if (OB_FAIL(iter_domain_ids_.prepare_allocate(dim_iters.count()))) {
+      } else if (OB_FAIL(merge_cmp_.init(id_meta, &iter_domain_ids_))) {
+      } else {
+        is_inited_ = true;
+      }
+    }
+    return ret;
+  }
+
+protected:
+  virtual int pre_process() override { return OB_SUCCESS; }
+  virtual bool support_count_only_batch() const override { return true; }
+};
+
 class CountOnlyBatchMergerTest : public ::testing::Test
 {
 protected:
@@ -345,6 +389,40 @@ protected:
     int64_t terminal_count = -1;
     EXPECT_EQ(OB_ITER_END, merger.get_next_distinct_count(capacity, terminal_count));
     EXPECT_EQ(0, terminal_count);
+  }
+
+  void run_outer_count(
+      const std::vector<IdList> &inputs,
+      const int64_t offset,
+      const int64_t limit,
+      const int64_t capacity,
+      const int expected_ret,
+      const int64_t expected_count)
+  {
+    common::ObLimitParam limit_param;
+    limit_param.offset_ = offset;
+    limit_param.limit_ = limit;
+    ObSparseRetrievalMergeParam param;
+    param.limit_param_ = &limit_param;
+    param.max_batch_size_ = MAX(capacity, 1);
+    param.count_only_ = true;
+
+    common::ObArenaAllocator allocator;
+    common::ObSEArray<ObISRDaaTDimIter *, 4> dim_iters;
+    std::vector<std::unique_ptr<FakeBatchDimIter>> owned_iters;
+    owned_iters.reserve(inputs.size());
+    for (const IdList &ids : inputs) {
+      owned_iters.emplace_back(new FakeBatchDimIter(ids, 2));
+      ASSERT_EQ(OB_SUCCESS, dim_iters.push_back(owned_iters.back().get()));
+    }
+    sql::ObDatumMeta id_meta;
+    id_meta.type_ = ObUInt64Type;
+    id_meta.cs_type_ = CS_TYPE_BINARY;
+    TestCountOnlyDaaTIter iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init_for_count_test(param, dim_iters, allocator, id_meta));
+    int64_t count = -1;
+    EXPECT_EQ(expected_ret, iter.get_next_rows(capacity, count));
+    EXPECT_EQ(expected_count, count);
   }
 
   void run_string_bulk_count(
@@ -526,6 +604,34 @@ TEST_F(CountOnlyBatchMergerTest, bulk_count_exact_capacity_and_final_partial_bat
   run_bulk_count({{1, 2, 3}}, 1, 2, partial_chunks, partial_count);
   EXPECT_EQ(3, partial_count);
   EXPECT_EQ(std::vector<int64_t>({2, 1}), partial_chunks);
+}
+
+TEST_F(CountOnlyBatchMergerTest, outer_count_extreme_offset_is_not_an_overflow)
+{
+  std::vector<std::vector<IdList>> datasets;
+  datasets.push_back(std::vector<IdList>());
+  datasets.push_back(std::vector<IdList>(3));
+  datasets.push_back({
+      {1, 2, 3, 3, 5},
+      {2, 3, 4, 7},
+      {1, 4, 5, 6, 7}});
+  for (const std::vector<IdList> &inputs : datasets) {
+    for (const int64_t target_count : {1, 2, 256}) {
+      SCOPED_TRACE(target_count);
+      run_outer_count(inputs, INT64_MAX, target_count, target_count, OB_ITER_END, 0);
+    }
+  }
+}
+
+TEST_F(CountOnlyBatchMergerTest, outer_count_segments_offset_before_result_capacity)
+{
+  const std::vector<IdList> inputs = {
+      {1, 2, 3, 3, 5},
+      {2, 3, 4, 7},
+      {1, 4, 5, 6, 7}};
+  run_outer_count(inputs, 3, 2, 2, OB_ITER_END, 2);
+  run_outer_count(inputs, 7, 2, 2, OB_ITER_END, 0);
+  run_outer_count(inputs, 0, 2, 2, OB_ITER_END, 2);
 }
 
 TEST_F(CountOnlyBatchMergerTest, bulk_count_three_way_large_overlap_matches_single_id_api)
