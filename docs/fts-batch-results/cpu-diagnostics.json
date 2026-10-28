@@ -1,0 +1,114 @@
+{
+  "scope": "Non-scoring diagnostic: two runs of 5000 statements per query on the same physical index, process CPU includes background threads.",
+  "runs": {
+    "prior": [
+      {
+        "label": "prior-cpu",
+        "binary_sha256": "f72e4623b99870b17a78aeaf46a6ffd4ebb0eefa612aabfbabc9bef8b184bc3c",
+        "kind": "non-scoring same-data CPU diagnostic",
+        "results": {
+          "cn": {
+            "rounds": 5000,
+            "wall_sec": 5.157934374641627,
+            "server_cpu_sec": 5.11
+          },
+          "beng": {
+            "rounds": 5000,
+            "wall_sec": 7.950301457662135,
+            "server_cpu_sec": 7.700000000000001
+          },
+          "mixed": {
+            "rounds": 5000,
+            "wall_sec": 5.7531460002064705,
+            "server_cpu_sec": 5.52
+          }
+        }
+      },
+      {
+        "label": "prior-cpu2",
+        "binary_sha256": "f72e4623b99870b17a78aeaf46a6ffd4ebb0eefa612aabfbabc9bef8b184bc3c",
+        "kind": "non-scoring same-data CPU diagnostic",
+        "results": {
+          "cn": {
+            "rounds": 5000,
+            "wall_sec": 5.565325957722962,
+            "server_cpu_sec": 5.27
+          },
+          "beng": {
+            "rounds": 5000,
+            "wall_sec": 8.544238791801035,
+            "server_cpu_sec": 7.969999999999999
+          },
+          "mixed": {
+            "rounds": 5000,
+            "wall_sec": 5.8332203747704625,
+            "server_cpu_sec": 5.579999999999998
+          }
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "label": "small3-cpu",
+        "binary_sha256": "44ce04750874ba854f8e898a21cdc7d33446242d3009eb6b80fbca8a3d675ad4",
+        "kind": "non-scoring same-data CPU diagnostic",
+        "results": {
+          "cn": {
+            "rounds": 5000,
+            "wall_sec": 4.105750166112557,
+            "server_cpu_sec": 3.8600000000000065
+          },
+          "beng": {
+            "rounds": 5000,
+            "wall_sec": 6.171060915803537,
+            "server_cpu_sec": 5.939999999999998
+          },
+          "mixed": {
+            "rounds": 5000,
+            "wall_sec": 4.644968125037849,
+            "server_cpu_sec": 4.369999999999997
+          }
+        }
+      },
+      {
+        "label": "small3-cpu2",
+        "binary_sha256": "44ce04750874ba854f8e898a21cdc7d33446242d3009eb6b80fbca8a3d675ad4",
+        "kind": "non-scoring same-data CPU diagnostic",
+        "results": {
+          "cn": {
+            "rounds": 5000,
+            "wall_sec": 4.077876583207399,
+            "server_cpu_sec": 3.9899999999999993
+          },
+          "beng": {
+            "rounds": 5000,
+            "wall_sec": 6.319663750007749,
+            "server_cpu_sec": 6.1
+          },
+          "mixed": {
+            "rounds": 5000,
+            "wall_sec": 4.660070290789008,
+            "server_cpu_sec": 4.420000000000002
+          }
+        }
+      }
+    ]
+  },
+  "summary": {
+    "cn": {
+      "prior_cpu_sec": 5.1899999999999995,
+      "candidate_cpu_sec": 3.925000000000003,
+      "improvement": 0.2437379576107893
+    },
+    "beng": {
+      "prior_cpu_sec": 7.835,
+      "candidate_cpu_sec": 6.019999999999999,
+      "improvement": 0.2316528398213148
+    },
+    "mixed": {
+      "prior_cpu_sec": 5.549999999999999,
+      "candidate_cpu_sec": 4.395,
+      "improvement": 0.20810810810810798
+    }
+  }
+}

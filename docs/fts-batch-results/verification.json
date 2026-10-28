@@ -1,0 +1,45 @@
+{
+  "candidate_production_commit": "d3270a4c1c7801bcafedf7fd0b5747f166d292cc",
+  "competition_commit": "5bce9e06d1281347ad61344e4b01fab9158c58a2",
+  "native": {
+    "passed": 40,
+    "suites": 6,
+    "log": "native-tests.txt"
+  },
+  "mysqltest": {
+    "no_score_projection": 0,
+    "count_only_boundaries": 0,
+    "postbuild_word_rows": 0
+  },
+  "tokenize": {
+    "cases": 533,
+    "comparison": "Complete JSON bytes including order, representative spelling and frequencies",
+    "candidate_reference_sha256": "b58c7a590e43fe9507b00da6759d118831097ded8b825295446dfa9c557f3898",
+    "competition_comparison": "PASS"
+  },
+  "tokenize_function": {
+    "result": "PASS",
+    "client_adapter": "Only --result_format 4 changed to 1 in temporary test copy; all SQL and error expectations unchanged.",
+    "reference_sha256": "678f6c6e6c379b08246de213cc249a54617423edc49947c51ca25ff57a98c8a6"
+  },
+  "full_query_results": {
+    "cn": {
+      "rows": 8001,
+      "sha256": "1f0deb70fd2b0096f7b3d6393cabe3957a4f169bea9f39a6fd61cb54039b7659"
+    },
+    "beng": {
+      "rows": 11000,
+      "sha256": "33cc396c69f51f7c6795d17c85bc72c09d920a9c21221dc1feda115113c27925"
+    },
+    "mixed": {
+      "rows": 7332,
+      "sha256": "95f08efdbd9fa282eba87f40a72f64d6fc31a672796b438b01419ec66b8c054d"
+    },
+    "limit_members": {
+      "rows": 9333,
+      "sha256": "ec30d9c45563fc80b94c3842157db67c3d619f9d5d2a1c7cd582e7fa5cd62b90"
+    }
+  },
+  "same_physical_index_comparison": "PASS: candidate builds the dataset, then competition reads the same dataset; full ID and ROUND(score,12) bytes equal for all four sets.",
+  "score_comparison_limit": "Separate index rebuilds can produce different average-document-length statistics, so cross-rebuild exact score equality is not used as an oracle."
+}

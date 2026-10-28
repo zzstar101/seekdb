@@ -1,5 +1,8 @@
 # FTS 优化与实测记录
 
+后续相对 `2026-competition` 的语义核对与批处理优化见 [最新记录](fts-batch-optimization.md)。
+后续核对发现了等价 token 代表拼写的历史偏差，已在新版本恢复 competition 行为。
+
 基于提交 [9f846938b309a3e5320a61f71cb84ef8d375185a](https://github.com/zzstar101/seekdb/commit/9f846938b309a3e5320a61f71cb84ef8d375185a)。
 本次在真实 seekdb 上完成构建、CPU 采样、代码优化、回归和完整性能对照。
 最终保留 7 个生产源文件的修改。三轮完整对照的三类等权综合耗时下降为 **6.02%**。

@@ -1,0 +1,63 @@
+{
+  "measurement_date": "2026-10-28",
+  "os": "macOS 27.2 (26B5091g)",
+  "architecture": "arm64",
+  "hardware_model": "Mac17,3",
+  "logical_cpus": 10,
+  "physical_memory_bytes": 25769803776,
+  "compiler": "Apple Clang 21.0.0 (clang-2100.3.20.102)",
+  "build": "Ninja unity, RelWithDebInfo, -O2 -g -DNDEBUG, -j6",
+  "instance": {
+    "cpu_count": 4,
+    "memory_limit": "2G",
+    "datafile_size": "1G",
+    "datafile_maxsize": "8G",
+    "log_disk_size": "2G"
+  },
+  "benchmark_configuration": {
+    "rows": 20000,
+    "batch": 500,
+    "rounds": 3000,
+    "query_rounds": 200,
+    "samples": 3,
+    "warmup": 30,
+    "skip_load": 0
+  },
+  "order": [
+    "prior-1",
+    "candidate-1",
+    "competition-1",
+    "competition-2",
+    "candidate-2",
+    "prior-2",
+    "prior-3",
+    "competition-3",
+    "candidate-3"
+  ],
+  "startup_settle_seconds": 10,
+  "notes": [
+    "Other desktop applications remained running; this is not the official CI host.",
+    "No compilation, native tests or CPU sampling ran during full benchmark timing.",
+    "Report git_head is the benchmark checkout HEAD, not the running server. Use binary provenance below."
+  ],
+  "binaries": {
+    "prior": {
+      "source_commit": "8b567cf64beef624bdac4d74f851d7351ef9ee20",
+      "sha256": "f72e4623b99870b17a78aeaf46a6ffd4ebb0eefa612aabfbabc9bef8b184bc3c",
+      "size_bytes": 191964504,
+      "version_stderr": "<jemalloc>: option background_thread currently supports pthread only\nStarting seekdb (OceanBase seekdb 1.4.0.0) source revision 1-8b567cf64beef624bdac4d74f851d7351ef9ee20.\n(null) (OceanBase seekdb 1.4.0.0)\n\nREVISION: 1-8b567cf64beef624bdac4d74f851d7351ef9ee20\nBUILD_BRANCH: codex/fts-full-score\nBUILD_TIME: Oct 28 2026 13:30:55\nBUILD_FLAGS: RelWithDebInfo\nBUILD_INFO: \n\nCopyright (c) 2011-present OceanBase Inc.\n\n"
+    },
+    "competition": {
+      "source_commit": "5bce9e06d1281347ad61344e4b01fab9158c58a2",
+      "sha256": "bf16d698a0c56379b108bdc1a7a4f370fe5b94f98fc76a77ce4dc51c93dbb05e",
+      "size_bytes": 191915224,
+      "version_stderr": "<jemalloc>: option background_thread currently supports pthread only\nStarting seekdb (OceanBase seekdb 1.4.0.0) source revision 1-5bce9e06d1281347ad61344e4b01fab9158c58a2.\n(null) (OceanBase seekdb 1.4.0.0)\n\nREVISION: 1-5bce9e06d1281347ad61344e4b01fab9158c58a2\nBUILD_BRANCH: HEAD\nBUILD_TIME: Oct 28 2026 13:40:20\nBUILD_FLAGS: RelWithDebInfo\nBUILD_INFO: \n\nCopyright (c) 2011-present OceanBase Inc.\n\n"
+    },
+    "candidate": {
+      "source_commit": "d3270a4c1",
+      "sha256": "44ce04750874ba854f8e898a21cdc7d33446242d3009eb6b80fbca8a3d675ad4",
+      "size_bytes": 191992152,
+      "version_stderr": "<jemalloc>: option background_thread currently supports pthread only\nStarting seekdb (OceanBase seekdb 1.4.0.0) source revision 1-d3270a4c1c7801bcafedf7fd0b5747f166d292cc.\n(null) (OceanBase seekdb 1.4.0.0)\n\nREVISION: 1-d3270a4c1c7801bcafedf7fd0b5747f166d292cc\nBUILD_BRANCH: codex/fts-full-score\nBUILD_TIME: Oct 28 2026 14:28:08\nBUILD_FLAGS: RelWithDebInfo\nBUILD_INFO: \n\nCopyright (c) 2011-present OceanBase Inc.\n\n"
+    }
+  }
+}

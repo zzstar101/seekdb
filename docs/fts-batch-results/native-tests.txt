@@ -1,0 +1,107 @@
+COMPILED /Users/zzstar/.codex/worktrees/fts-full-score/seekdb/unittest/storage/test_fts_count_only_batch.cpp
+COMPILED /Users/zzstar/.codex/worktrees/fts-full-score/seekdb/unittest/storage/test_fts_word_row_buffer.cpp
+<jemalloc>: option background_thread currently supports pthread only
+Running main() from googletest/src/gtest_main.cc
+[==========] Running 40 tests from 6 test suites.
+[----------] Global test environment set-up.
+[----------] 6 tests from WordAggregationTest
+[ RUN      ] WordAggregationTest.new_and_repeated_words_keep_frequency_contract
+[       OK ] WordAggregationTest.new_and_repeated_words_keep_frequency_contract (0 ms)
+[ RUN      ] WordAggregationTest.collation_equal_tokens_match_baseline_insertion
+[       OK ] WordAggregationTest.collation_equal_tokens_match_baseline_insertion (0 ms)
+[ RUN      ] WordAggregationTest.word_hash_and_assignment_are_shallow
+[       OK ] WordAggregationTest.word_hash_and_assignment_are_shallow (0 ms)
+[ RUN      ] WordAggregationTest.colliding_new_words_and_updates_keep_all_entries
+[       OK ] WordAggregationTest.colliding_new_words_and_updates_keep_all_entries (0 ms)
+[ RUN      ] WordAggregationTest.errors_do_not_add_words_or_document_length
+[       OK ] WordAggregationTest.errors_do_not_add_words_or_document_length (0 ms)
+[ RUN      ] WordAggregationTest.helper_reuse_clears_only_previous_document
+[       OK ] WordAggregationTest.helper_reuse_clears_only_previous_document (0 ms)
+[----------] 6 tests from WordAggregationTest (0 ms total)
+
+[----------] 4 tests from CharClassificationTest
+[ RUN      ] CharClassificationTest.every_valid_utf8_scalar_matches_legacy
+[       OK ] CharClassificationTest.every_valid_utf8_scalar_matches_legacy (34 ms)
+[ RUN      ] CharClassificationTest.utf8_invalid_and_truncated_inputs_keep_errors_and_type
+[       OK ] CharClassificationTest.utf8_invalid_and_truncated_inputs_keep_errors_and_type (0 ms)
+[ RUN      ] CharClassificationTest.every_utf16_code_unit_keeps_existing_behavior
+[       OK ] CharClassificationTest.every_utf16_code_unit_keeps_existing_behavior (3 ms)
+[ RUN      ] CharClassificationTest.utf16_surrogate_pairs_and_prefixes_keep_existing_behavior
+[       OK ] CharClassificationTest.utf16_surrogate_pairs_and_prefixes_keep_existing_behavior (0 ms)
+[----------] 4 tests from CharClassificationTest (38 ms total)
+
+[----------] 3 tests from CharsetStrcmpspDispatch
+[ RUN      ] CharsetStrcmpspDispatch.initialized_and_first_use_keep_handler_results
+[       OK ] CharsetStrcmpspDispatch.initialized_and_first_use_keep_handler_results (6 ms)
+[ RUN      ] CharsetStrcmpspDispatch.null_pointer_with_zero_length_remains_empty
+[       OK ] CharsetStrcmpspDispatch.null_pointer_with_zero_length_remains_empty (0 ms)
+[ RUN      ] CharsetStrcmpspDispatch.invalid_arguments_keep_the_existing_zero_result
+[       OK ] CharsetStrcmpspDispatch.invalid_arguments_keep_the_existing_zero_result (0 ms)
+[----------] 3 tests from CharsetStrcmpspDispatch (6 ms total)
+
+[----------] 13 tests from CountOnlyBatchMergerTest
+[ RUN      ] CountOnlyBatchMergerTest.one_way_crosses_batch_boundaries
+[       OK ] CountOnlyBatchMergerTest.one_way_crosses_batch_boundaries (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.final_single_id_is_emitted_before_eof
+[       OK ] CountOnlyBatchMergerTest.final_single_id_is_emitted_before_eof (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.two_way_counts_union_and_deduplicates
+[       OK ] CountOnlyBatchMergerTest.two_way_counts_union_and_deduplicates (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.two_way_equal_last_id_is_emitted_once
+[       OK ] CountOnlyBatchMergerTest.two_way_equal_last_id_is_emitted_once (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.n_way_resumes_after_partial_batch
+[       OK ] CountOnlyBatchMergerTest.n_way_resumes_after_partial_batch (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.three_way_deduplicates_nulls_and_repeated_batch_ids
+[       OK ] CountOnlyBatchMergerTest.three_way_deduplicates_nulls_and_repeated_batch_ids (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.three_way_equal_final_id_is_emitted_before_all_end
+[       OK ] CountOnlyBatchMergerTest.three_way_equal_final_id_is_emitted_before_all_end (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.three_way_handles_empty_and_partial_exhaustion
+[       OK ] CountOnlyBatchMergerTest.three_way_handles_empty_and_partial_exhaustion (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.three_way_handles_all_empty_or_one_remaining_dimension
+[       OK ] CountOnlyBatchMergerTest.three_way_handles_all_empty_or_one_remaining_dimension (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.loser_tree_four_way_handles_empty_and_partial_exhaustion
+[       OK ] CountOnlyBatchMergerTest.loser_tree_four_way_handles_empty_and_partial_exhaustion (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.repeated_reuse_keeps_batch_allocations_stable
+[       OK ] CountOnlyBatchMergerTest.repeated_reuse_keeps_batch_allocations_stable (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.null_document_id_is_emitted_once
+[       OK ] CountOnlyBatchMergerTest.null_document_id_is_emitted_once (0 ms)
+[ RUN      ] CountOnlyBatchMergerTest.union_capability_requires_at_most_one_match
+[       OK ] CountOnlyBatchMergerTest.union_capability_requires_at_most_one_match (0 ms)
+[----------] 13 tests from CountOnlyBatchMergerTest (0 ms total)
+
+[----------] 5 tests from IKDictionaryCacheTest
+[ RUN      ] IKDictionaryCacheTest.code_lookup_matches_oracle_for_each_dat_and_miss
+[       OK ] IKDictionaryCacheTest.code_lookup_matches_oracle_for_each_dat_and_miss (0 ms)
+[ RUN      ] IKDictionaryCacheTest.character_codes_are_local_to_each_dat
+[       OK ] IKDictionaryCacheTest.character_codes_are_local_to_each_dat (0 ms)
+[ RUN      ] IKDictionaryCacheTest.cjk_processor_matches_legacy_loop_across_dat_ranges
+[       OK ] IKDictionaryCacheTest.cjk_processor_matches_legacy_loop_across_dat_ranges (0 ms)
+[ RUN      ] IKDictionaryCacheTest.five_dat_overflow_matches_legacy_loop
+[       OK ] IKDictionaryCacheTest.five_dat_overflow_matches_legacy_loop (0 ms)
+[ RUN      ] IKDictionaryCacheTest.cjk_processor_reuses_code_for_active_prefixes
+[       OK ] IKDictionaryCacheTest.cjk_processor_reuses_code_for_active_prefixes (0 ms)
+[----------] 5 tests from IKDictionaryCacheTest (1 ms total)
+
+[----------] 9 tests from FTSWordRowBufferTest
+[ RUN      ] FTSWordRowBufferTest.batches_across_documents_and_keeps_pending_rows_stable
+[       OK ] FTSWordRowBufferTest.batches_across_documents_and_keeps_pending_rows_stable (0 ms)
+[ RUN      ] FTSWordRowBufferTest.copies_word_and_document_bytes_out_of_source_lifetime
+[       OK ] FTSWordRowBufferTest.copies_word_and_document_bytes_out_of_source_lifetime (0 ms)
+[ RUN      ] FTSWordRowBufferTest.empty_documents_are_skipped_without_rows
+[       OK ] FTSWordRowBufferTest.empty_documents_are_skipped_without_rows (0 ms)
+[ RUN      ] FTSWordRowBufferTest.supports_doc_word_column_order
+[       OK ] FTSWordRowBufferTest.supports_doc_word_column_order (0 ms)
+[ RUN      ] FTSWordRowBufferTest.one_document_can_span_multiple_output_batches
+[       OK ] FTSWordRowBufferTest.one_document_can_span_multiple_output_batches (0 ms)
+[ RUN      ] FTSWordRowBufferTest.empty_and_tiny_documents_share_a_batch
+[       OK ] FTSWordRowBufferTest.empty_and_tiny_documents_share_a_batch (0 ms)
+[ RUN      ] FTSWordRowBufferTest.nondivisible_documents_refill_only_from_an_empty_buffer
+[       OK ] FTSWordRowBufferTest.nondivisible_documents_refill_only_from_an_empty_buffer (0 ms)
+[ RUN      ] FTSWordRowBufferTest.matches_scalar_fulltext_row_fields
+[       OK ] FTSWordRowBufferTest.matches_scalar_fulltext_row_fields (0 ms)
+[ RUN      ] FTSWordRowBufferTest.large_tokenless_documents_release_parser_scratch
+[       OK ] FTSWordRowBufferTest.large_tokenless_documents_release_parser_scratch (55 ms)
+[----------] 9 tests from FTSWordRowBufferTest (55 ms total)
+
+[----------] Global test environment tear-down
+[==========] 40 tests from 6 test suites ran. (103 ms total)
+[  PASSED  ] 40 tests.
