@@ -766,3 +766,38 @@ PX COORDINATOR                                         (dop=5)
 官方评测在 `cbf79b791` 上报告的是**50 制相对分 31.832**，换成 100 制 raw score 为 **63.664/100**，即 `overall_improvement = 63.664/200 = 0.318`（不是 0.159）。目标 100 分对应 `overall_improvement = 0.50`，因此**当前缺口为 0.182**，等价于三个类别（build / tokenize / query）的平均值之和需从 0.955 提升到 1.50。
 
 这条数据同时确立了两点：(a) 官方环境**能**区分优化（未修改版本在该机为 0 档），(b) 本机 10 核配对测得的 0.258 与官方 0.318 同量级但**不可互相换算**，报告因此只把同机配对 delta 作为机制证据，把官方分数作为验收口径。
+
+## 12 当前 tip 的复核与剩余路径（10-28 晚）
+本节复核 `3096f68fd`（= 官方已评测的 `de75ced20` + 4 个未评测提交：`d46ec203e` 计数预取受 LIMIT 约束、`6d2019849` 预取自适应输出批次、`2023f1550` DaaT 缓冲延迟分配、`3096f68fd` 单测），结论是：**本轮没有改动内核代码**，只做了测量复核与瓶颈再定位。
+
+### 12.1 同机配对复核（完整官方脚本，`SKIP_LOAD=0`）
+
+| 指标 | competition `5bce9e06`（2 跑中位） | tip（4 跑中位） | 提升 |
+|---|---|---|---|
+| build_ik_all_sec | 3.984 | 3.293 | 17.3% |
+| build_ik_content_sec | 3.058 | 2.560 | 16.3% |
+| build_beng_en_sec | 1.646 | 1.298 | 21.2% |
+| tokenize_ik_avg_ms | 0.1285 | 0.1061 | 17.4% |
+| tokenize_beng_avg_ms | 0.0819 | 0.0886 | **-8.2%** |
+| query_cn_avg_ms | 1.5932 | 0.8990 | 43.6% |
+| query_beng_avg_ms | 2.3508 | 1.2354 | 47.5% |
+| query_mixed_avg_ms | 1.7813 | 0.9067 | 49.1% |
+| query_limit_avg_ms | 2.1123 | 0.2166 | 89.8% |
+
+三类均值：build 18.3%、tokenize 4.6%、query 57.5%，综合 26.8%（本机口径）；四个命中数 8001/11000/7332/20 与基线一致。
+两点必须记录：(1) `tokenize_beng` 的 4 次运行跨度是 0.0730–0.1093 ms，单次跑的噪声足以伪造 ±30% 的"回归/收益"，该指标不能用单跑判读；(2) 本机口径 26.8% 明显低于官方在**更差代码** `de75ced20` 上给出的 41.9%，说明本机（10 核、多实例共存、select1 0.058 ms vs 官方 0.0268 ms）会把内核收益显著**压缩**，本机配对只能作为机制证据，验收只看官方。
+
+### 12.2 P0（构建单线程尾段）复核结论
+`ObFtsIndexBuilderUtil::calc_fts_build_parallelism`（`src/sql/resolver/ddl/ob_fts_index_builder_util.cpp:1068`）已经把无 hint 的 FTS 构建 dop 提到 `cpu_count/2`（上限 8），注释里记录了实测：degree 8 比 degree 5、degree 2 更慢，因为"新写入 tablet 的 scan task 数由 tablet 大小决定且很小"。因此**再提 DOP 不是答案**；残余尾段来自 `SORT → EXCHANGE IN MERGE SORT` 之后向**单个 aux tablet 的有序 `INSERT`**（计划末端 `EXCHANGE OUT DISTR (dop=1)`）：索引组织表的行序必须全局有序，单 tablet 只能单流追加。两条能真正解锁的路：
+(a) FTS aux 表按 `word`（或 `doc_id`）range/hash 分区，让每个分区独立有序、并行 insert —— 需改 aux schema、DDL 与检索侧 tablet 路由；
+(b) 多 sstable 直接加载 + 合并（每个 PX worker 各建一个有序 sstable，再做一次有序合并）—— 需改 direct-load 写入路径。
+两者都是 schema/引擎级改动，不是参数调整；验收用 `build_ik_all_sec`（现 3.29 s，sort 37%、写 24%）。
+
+### 12.3 P1（COUNT-only 取数）复核结论
+`ObSRDaaTBatchIdMerger` 已是专用实现（mask 去重、1/2/3 维特化、bulk-last-id 复制），比较器也有 `CMP_MODE_UINT64/BINARY` 快路径，**比较本身不是瓶颈**。实测：空 token 查询 0.147 ms，单 token 6000 postings 0.42–0.47 ms ⇒ 单 posting ≈ 45 ns，而这条路径一次比较都没有；成本在 `ObDatum` 级取数 + `advance()`/`load_batch()` 的逐 id 调用与解码上。下一步应做"块级平坦 id 批量"：给 `ObISRDaaTDimIter` 增加返回定长 8 字节 id 平坦数组的批量接口，count 路径直接在平坦数组上归并，去掉每 id 一次的 `current_ids_->at(i)`、虚调用与 `bulk_last_id` 记账。预计 2–3 天，收益落在 query_cn/beng/mixed 的 per-posting 成本（当前 37–50 ns/posting）。
+
+### 12.4 P2（分词短生命周期对象）复核结论
+逐字成本实测（同机、单连接、每项 1500–4500 次语句）：自然中文 ≈ 475 ns/字，字典未命中的生僻字 ≈ 290 ns/字（纯逐字管线本身就贵），ASCII 字母 ≈ 215 ns/字，`tokenize(text,'ik')` 每次调用固定开销 ≈ 4–5 µs。字典查找已是"4 字节 key + 二分"（`ObFTRangeDict::find_first_char_range`），逐字解码也已缓存（`TokenizeContext::prepare_first_char`）。剩余最明确的短命对象在**结果组装**：`ObFTParseHelper::make_token_array_json`（`src/storage/fts/ob_fts_parser_helper.cpp:511`）对每个 token 做一次 `OB_NEWx(ObJsonString)` 再整树序列化，可改为直接向输出 buffer 写 JSON 文本（须严格复用现有转义规则）。按 35 token 估算省 2–4 µs，即 tokenize_ik 约 2–4%，属"能做但不解渴"。
+
+### 12.5 结论
+官方 41.924/50（`de75ced20`）→ 满分 50 需要综合提升率从 0.419 到 0.500（三类均值之和 +0.243）。按本次复核，能提供该量级的只有 12.2 的构建并行化与 12.3 的块级取数，二者都不是当日可验证的改动；12.4 是低风险小收益。建议下一轮按 12.3 → 12.2 推进，并保持"同机配对 + 官方验收"的双口径。
