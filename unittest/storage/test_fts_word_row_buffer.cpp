@@ -22,6 +22,7 @@
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
 #include "sql/das/ob_das_domain_utils.h"
+#include "data_plane/blocksstable/ob_datum_row.h"
 
 namespace oceanbase
 {
@@ -331,7 +332,7 @@ TEST_F(FTSWordRowBufferTest, matches_scalar_fulltext_row_fields)
   }
   const std::string id_value = "field-oracle-doc";
   ObDatum id = doc_id(id_value.c_str());
-  ObDASDomainUtils::ObDomainIndexRow oracle_rows;
+  ObDomainIndexRow oracle_rows;
   ASSERT_EQ(OB_SUCCESS,
             ObDASDomainUtils::generate_fulltext_word_rows(allocator_,
                                                            &helper_,
