@@ -25,6 +25,23 @@ import pymysql
 from bench_eval import lit, start_observer
 
 
+def load_vecs(path, limit=0):
+    """Read a .fvecs (float32) or .bvecs (uint8) file into float32 rows."""
+    dt = np.float32 if path.endswith(".fvecs") else np.uint8
+    itemsize = np.dtype(dt).itemsize
+    with open(path, "rb") as f:
+        d = int(np.frombuffer(f.read(4), dtype=np.int32)[0])
+        per = 4 + d * itemsize
+        n = os.path.getsize(path) // per
+        if limit and limit < n:
+            n = limit
+        out = np.empty((n, d), dtype=np.float32)
+        for i in range(n):
+            f.seek(i * per)
+            out[i] = np.frombuffer(f.read(per)[4:], dtype=dt)
+    return out
+
+
 def exact_topk(base_vecs, queries, k, chunk=256):
     """Exact L2 top-k (ids only).  Chunked so 250k x 4096 never materialises."""
     n = base_vecs.shape[0]
@@ -83,13 +100,25 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--norm", action="store_true",
                     help="unit-normalise rows (the official demo data is normalised)")
+    ap.add_argument("--data-file", default="",
+                    help="optional .fvecs/.bvecs base vectors (contest data instead of random)")
+    ap.add_argument("--query-file", default="",
+                    help="optional .fvecs/.bvecs query vectors")
     ap.add_argument("--gt-cache", default="")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    base_vecs = rng.standard_normal((args.n, args.dim)).astype(np.float32)
-    queries = rng.standard_normal((args.queries, args.dim)).astype(np.float32)
+    if args.data_file:
+        base_vecs = load_vecs(args.data_file, args.n)
+        args.n, args.dim = base_vecs.shape
+    else:
+        base_vecs = rng.standard_normal((args.n, args.dim)).astype(np.float32)
+    if args.query_file:
+        queries = load_vecs(args.query_file)
+        args.queries = queries.shape[0]
+    else:
+        queries = rng.standard_normal((args.queries, args.dim)).astype(np.float32)
     if args.norm:
         base_vecs /= np.linalg.norm(base_vecs, axis=1, keepdims=True)
         queries /= np.linalg.norm(queries, axis=1, keepdims=True)
