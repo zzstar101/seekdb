@@ -365,6 +365,8 @@ TEST_F(FTSWordRowBufferTest, matches_scalar_fulltext_row_fields)
               as_string(actual[1].get_string()));
     EXPECT_EQ(oracle.storage_datums_[2].get_uint(), actual[2].get_uint());
     EXPECT_EQ(oracle.storage_datums_[3].get_uint(), actual[3].get_uint());
+    EXPECT_EQ(1, actual[2].get_uint());
+    EXPECT_EQ(600, actual[3].get_uint());
   }
 }
 

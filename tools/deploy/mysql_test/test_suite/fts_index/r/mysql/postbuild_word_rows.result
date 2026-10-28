@@ -10,6 +10,9 @@ partition_count	large_doc_tokens	before_rows	after_rows
 small_document_score_oracle
 before_scores	after_scores	missing_scores	extra_scores	score_mismatches	frequency_sensitive	frequency_shape_matches
 9	9	0	0	0	1	1
+flat_score_membership
+before_rows	flat_rows	missing_flat	extra_flat
+9	9	0	0
 secondary_index_build_smoke
 bucket7_rows
 30

@@ -105,6 +105,31 @@ INSERT INTO scores_postbuild SELECT 'qqterm', id, MATCH(title, content) AGAINST(
 INSERT INTO scores_postbuild SELECT 'zx', id, MATCH(title, content) AGAINST('zx')
   FROM fts_postbuild WHERE MATCH(title, content) AGAINST('zx');
 
+CREATE TABLE fts_flat_postbuild (
+  id INT NOT NULL PRIMARY KEY,
+  title VARCHAR(200),
+  content TEXT
+);
+INSERT INTO fts_flat_postbuild SELECT * FROM source_docs ORDER BY id;
+CREATE FULLTEXT INDEX ft_flat_idx ON fts_flat_postbuild(title, content)
+  WITH PARSER space PARSER_PROPERTIES=(min_token_size=1, max_token_size=84);
+
+CREATE TABLE flat_scores (
+  term VARCHAR(20), id INT, score DOUBLE, PRIMARY KEY(term, id)
+);
+INSERT INTO flat_scores SELECT 'needle', id, MATCH(title, content) AGAINST('needle')
+  FROM fts_flat_postbuild WHERE MATCH(title, content) AGAINST('needle');
+INSERT INTO flat_scores SELECT 'rare', id, MATCH(title, content) AGAINST('rare')
+  FROM fts_flat_postbuild WHERE MATCH(title, content) AGAINST('rare');
+INSERT INTO flat_scores SELECT 'qaa', id, MATCH(title, content) AGAINST('qaa')
+  FROM fts_flat_postbuild WHERE MATCH(title, content) AGAINST('qaa');
+INSERT INTO flat_scores SELECT 'qbx', id, MATCH(title, content) AGAINST('qbx')
+  FROM fts_flat_postbuild WHERE MATCH(title, content) AGAINST('qbx');
+INSERT INTO flat_scores SELECT 'qqterm', id, MATCH(title, content) AGAINST('qqterm')
+  FROM fts_flat_postbuild WHERE MATCH(title, content) AGAINST('qqterm');
+INSERT INTO flat_scores SELECT 'zx', id, MATCH(title, content) AGAINST('zx')
+  FROM fts_flat_postbuild WHERE MATCH(title, content) AGAINST('zx');
+
 CREATE TABLE secondary_smoke (id INT PRIMARY KEY, bucket INT, note VARCHAR(20));
 INSERT INTO secondary_smoke
 SELECT n, MOD(n, 10), CONCAT('n', n) FROM numbers WHERE n < 300;
@@ -169,6 +194,15 @@ SELECT
   (SELECT COUNT(DISTINCT score) FROM scores_incremental WHERE term = 'needle') =
   (SELECT COUNT(DISTINCT score) FROM scores_postbuild WHERE term = 'needle')
     AS frequency_shape_matches;
+
+--echo flat_score_membership
+SELECT
+  (SELECT COUNT(*) FROM scores_incremental) AS before_rows,
+  (SELECT COUNT(*) FROM flat_scores) AS flat_rows,
+  (SELECT COUNT(*) FROM scores_incremental i LEFT JOIN flat_scores f
+     ON i.term = f.term AND i.id = f.id WHERE f.id IS NULL) AS missing_flat,
+  (SELECT COUNT(*) FROM flat_scores f LEFT JOIN scores_incremental i
+     ON i.term = f.term AND i.id = f.id WHERE i.id IS NULL) AS extra_flat;
 
 --echo secondary_index_build_smoke
 SELECT COUNT(*) AS bucket7_rows FROM secondary_smoke WHERE bucket = 7;
