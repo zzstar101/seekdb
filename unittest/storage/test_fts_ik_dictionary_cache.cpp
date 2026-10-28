@@ -752,8 +752,15 @@ TEST_F(IKDictionaryCacheTest, range_lookup_keeps_long_boundary_comparison)
 {
   ObFTDAT *dat_a = nullptr;
   ObFTDAT *dat_g = nullptr;
-  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"ABCDEA", "ABCDEZ"}, dat_a));
-  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"ABCDGA", "ABCDGZ"}, dat_g));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"A"}, dat_a));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"G"}, dat_g));
+  // build_dat derives range bounds from the trie's first characters. Override
+  // them with explicit five-byte custom bounds so this exercises the fallback
+  // chosen when boundaries do not fit the packed four-byte key.
+  ASSERT_EQ(OB_SUCCESS, dat_a->start_word_.set_word("ABCDE", 5));
+  ASSERT_EQ(OB_SUCCESS, dat_a->end_word_.set_word("ABCDZ", 5));
+  ASSERT_EQ(OB_SUCCESS, dat_g->start_word_.set_word("ABCGE", 5));
+  ASSERT_EQ(OB_SUCCESS, dat_g->end_word_.set_word("ABCGZ", 5));
 
   const std::vector<ObFTDAT *> dats = {dat_a, dat_g};
   ObFTRangeDict range(dat_allocator_,
@@ -770,7 +777,7 @@ TEST_F(IKDictionaryCacheTest, range_lookup_keeps_long_boundary_comparison)
   ASSERT_TRUE(range.uses_binary_range_search());
   EXPECT_FALSE(range.uses_packed_range_search());
   expect_range_lookup_matches_linear(
-      range, dats, {"ABCD", "ABCDE", "ABCDEA", "ABCDEM", "ABCDEZ", "ABCDG", "ABCDGA", "ABCDGM"});
+      range, dats, {"ABCD", "ABCDE", "ABCDM", "ABCDZ", "ABCE", "ABCGE", "ABCGM", "ABCGZ", "ABCGZZ"});
 }
 
 TEST_F(IKDictionaryCacheTest, range_lookup_preserves_first_match_for_overlapping_ranges)

@@ -247,16 +247,28 @@ TEST_F(WordAggregationTest, helper_reuse_clears_only_previous_document)
   EXPECT_EQ(1, document_length);
 }
 
-TEST_F(WordAggregationTest, beng_iterator_preserves_normalized_token_sequence)
+TEST_F(WordAggregationTest, beng_iterator_retains_tokens_through_drain_and_next_input)
 {
   const std::string text =
-      "The quick brown fox jumps over the lazy dog. "
-      "Full-text search indexing requires efficient tokenization on the hot path. "
+      "The quick Brown fox JUMPS over the Lazy dog. "
+      "Full-text SEARCH indexing requires Efficient tokenization on the HOT path. "
       "Token token TOKEN";
   const std::vector<std::string> expected = {
       "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
       "full", "text", "search", "indexing", "requires", "efficient",
       "tokenization", "on", "the", "hot", "path", "token", "token", "token"};
+  struct RetainedToken
+  {
+    const char *ptr_;
+    int64_t length_;
+  };
+  const auto as_strings = [](const std::vector<RetainedToken> &tokens) {
+    std::vector<std::string> result;
+    for (const RetainedToken &token : tokens) {
+      result.emplace_back(token.ptr_, static_cast<size_t>(token.length_));
+    }
+    return result;
+  };
 
   ObFTParserParam param;
   param.cs_ = common::ObCharset::get_charset(common::CS_TYPE_UTF8MB4_BIN);
@@ -269,7 +281,10 @@ TEST_F(WordAggregationTest, beng_iterator_preserves_normalized_token_sequence)
   ASSERT_EQ(OB_SUCCESS, desc.segment(&param, iter));
   ASSERT_NE(nullptr, iter);
 
-  std::vector<std::string> actual;
+  // Keep every pointer rather than copying each token while draining. A token
+  // left in the normalizer's reusable scratch buffer would be overwritten by a
+  // later mixed-case token before these checks run.
+  std::vector<RetainedToken> retained;
   int ret = OB_SUCCESS;
   while (OB_SUCC(ret)) {
     const char *word = nullptr;
@@ -278,13 +293,39 @@ TEST_F(WordAggregationTest, beng_iterator_preserves_normalized_token_sequence)
     int64_t word_freq = 0;
     ret = iter->get_next_token(word, word_len, char_len, word_freq);
     if (OB_SUCC(ret)) {
-      actual.emplace_back(word, static_cast<size_t>(word_len));
+      retained.push_back({word, word_len});
       EXPECT_EQ(word_len, char_len);
       EXPECT_EQ(1, word_freq);
     }
   }
   EXPECT_EQ(OB_ITER_END, ret);
-  EXPECT_EQ(expected, actual);
+  EXPECT_EQ(expected, as_strings(retained));
+  desc.free_token_iter(&param, iter);
+
+  const std::string next_text = "Beta beta BETA gamma Gamma GAMMA delta DELTA";
+  const std::vector<std::string> next_expected = {
+      "beta", "beta", "beta", "gamma", "gamma", "gamma", "delta", "delta"};
+  param.fulltext_ = next_text.data();
+  param.ft_length_ = static_cast<int64_t>(next_text.size());
+  iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, desc.segment(&param, iter));
+  ASSERT_NE(nullptr, iter);
+  std::vector<RetainedToken> next_retained;
+  ret = OB_SUCCESS;
+  while (OB_SUCC(ret)) {
+    const char *word = nullptr;
+    int64_t word_len = 0;
+    int64_t char_len = 0;
+    int64_t word_freq = 0;
+    ret = iter->get_next_token(word, word_len, char_len, word_freq);
+    if (OB_SUCC(ret)) {
+      next_retained.push_back({word, word_len});
+      EXPECT_EQ(word_len, char_len);
+      EXPECT_EQ(1, word_freq);
+    }
+  }
+  EXPECT_EQ(OB_ITER_END, ret);
+  EXPECT_EQ(next_expected, as_strings(next_retained));
   desc.free_token_iter(&param, iter);
 }
 
