@@ -51,7 +51,10 @@ private:
   ObObjMeta meta_;
 };
 
-typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+// A word map is document/query-local scratch state: a caller creates it, one synchronous
+// ObFTParseHelper::segment() call fills it, and the same thread consumes it before destruction.
+// Shared hash tables, including the stop-word set, keep their own thread-safety policy.
+typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
 
 class ObAddWordFlag final
 {
