@@ -264,6 +264,41 @@ TEST(CharClassificationTest, utf16_surrogate_pairs_and_prefixes_keep_existing_be
   EXPECT_TRUE(matches_legacy<CHARSET_UTF16LE>(nullptr, 2));
 }
 
+TEST(CharClassificationTest, unicode_cn_number_switch_matches_decoded_legacy_set)
+{
+  // This is the original UTF-8 literal set, including its duplicate 拾 entry.
+  // Decode it independently so the exhaustive comparison does not duplicate
+  // the production switch or a hand-written numeric table.
+  const char *legacy_utf8[] = {
+      "一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十", "零",
+      "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖", "拾", "百", "千",
+      "万", "亿", "拾", "佰", "仟", "萬", "億", "兆", "卅", "廿"};
+  ob_wc_t legacy_set[ARRAYSIZEOF(legacy_utf8)] = {};
+  for (int64_t i = 0; i < ARRAYSIZEOF(legacy_utf8); ++i) {
+    const unsigned char *begin = reinterpret_cast<const unsigned char *>(legacy_utf8[i]);
+    const int decoded_len = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(
+        begin, begin + STRLEN(legacy_utf8[i]), legacy_set[i]);
+    ASSERT_GT(decoded_len, 0) << "literal=" << legacy_utf8[i];
+  }
+
+  for (uint32_t unicode = 0; unicode <= 0x10ffffU; ++unicode) {
+    bool expected = false;
+    for (int64_t i = 0; !expected && i < ARRAYSIZEOF(legacy_utf8); ++i) {
+      expected = unicode == legacy_set[i];
+    }
+    ASSERT_EQ(expected, ObUnicodeBlockUtils::is_unicode_cn_number(unicode))
+        << "codepoint=" << unicode;
+  }
+
+  const ob_wc_t invalid_values[] = {
+      static_cast<ob_wc_t>(0x110000),
+      static_cast<ob_wc_t>(UINT32_MAX),
+      static_cast<ob_wc_t>(static_cast<uint64_t>(UINT32_MAX) + 1)};
+  for (const ob_wc_t value : invalid_values) {
+    EXPECT_FALSE(ObUnicodeBlockUtils::is_unicode_cn_number(value)) << "value=" << value;
+  }
+}
+
 } // namespace
 } // namespace storage
 } // namespace oceanbase
