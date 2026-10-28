@@ -919,7 +919,17 @@ int ObSRDaaTIterImpl::get_next_rows_count_only_batch(const int64_t capacity, int
 {
   int ret = OB_SUCCESS;
   if (!count_only_batch_started_) {
-    if (OB_FAIL(batch_id_merger_.init(*dim_iters_, *iter_allocator_, iter_param_->max_batch_size_,
+    int64_t fetch_capacity = iter_param_->max_batch_size_;
+    const common::ObLimitParam &limit = *iter_param_->limit_param_;
+    // A short LIMIT does not need a full posting batch from every token. Keep
+    // one lookahead ID so advancing the final result normally avoids a refill.
+    // Bound each operand before adding: OFFSET and LIMIT can approach INT64_MAX.
+    if (limit.is_valid() && limit.offset_ >= 0 && limit.limit_ >= 0
+        && limit.offset_ < fetch_capacity
+        && limit.limit_ < fetch_capacity - limit.offset_) {
+      fetch_capacity = limit.offset_ + limit.limit_ + 1;
+    }
+    if (OB_FAIL(batch_id_merger_.init(*dim_iters_, *iter_allocator_, fetch_capacity,
                                       merge_cmp_, merge_heap_, iter_domain_ids_))) {
       LOG_WARN("failed to initialize the count-only batch merger", K(ret));
     } else {
