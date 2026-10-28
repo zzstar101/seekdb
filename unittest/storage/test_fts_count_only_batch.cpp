@@ -253,8 +253,9 @@ TEST_F(CountOnlyBatchMergerTest, three_way_deduplicates_nulls_and_repeated_batch
 TEST_F(CountOnlyBatchMergerTest, three_way_equal_final_id_is_emitted_before_all_end)
 {
   ExpectedIds actual;
-  run_merge({{42}, {42}, {42}}, 1, actual, 1);
-  EXPECT_EQ(ExpectedIds({42}), actual);
+  const std::optional<uint64_t> final_id(42);
+  run_merge({{final_id}, {final_id}, {final_id}}, 1, actual, 1);
+  EXPECT_EQ(ExpectedIds{final_id}, actual);
 }
 
 TEST_F(CountOnlyBatchMergerTest, three_way_handles_empty_and_partial_exhaustion)
