@@ -137,7 +137,7 @@ SQL 侧单条查询还有约 4–5 ms 固定开销（解析 / 计划 / 结果组
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `SEEKDB_CUVS_NITER` | 按 N 分层（30/40/50/60/100） | NN-descent 轮数；`100` 完全复现基线图 |
+| `SEEKDB_CUVS_NITER` | 按 N 分层（≤40 万 → 30，≤100 万 → 60，以上 → 100） | NN-descent 轮数；`100` 完全复现基线图 |
 | `SEEKDB_CUVS_GRAPH_DEGREE` | `128` | 最终图度数（基线值） |
 | `SEEKDB_CUVS_INTER_DEGREE` | `256` | 中间图度数（基线值） |
 | `SEEKDB_CUVS_ITOPK` | `0` | `0` = 基线策略 `max(4*topk, 512)` |
@@ -355,3 +355,41 @@ CPU/GPU 建图对比。注意两类数字的采集层次不同，GPU 一侧含 s
 - GPU 侧的绝对时间随规模接近线性（25K 12.8 s → 100K 31.3 s → 250K 45.2 s →
   1M 126.6 s，niter=100），说明瓶颈在 NN-descent 的迭代轮数而不是固定开销；
   本方案正是压缩这部分（见 §3、§4）。
+
+
+## 12. 验证工具（一条命令给出结论）
+
+两个脚本把“还剩多少把握”变成可执行的判断，而不是叙述：
+
+```bash
+# 召回/加速 A/B：同一二进制、同一数据，只改 NN-descent 预算
+N=250000 DIM=128 SEEKDB_HOME=/path/to/cand_home \
+  tools/hipvs_bridge/bench/verify_niter_ab.sh
+# 256 维同理
+N=250000 DIM=256 SEEKDB_HOME=/path/to/cand_home \
+  tools/hipvs_bridge/bench/verify_niter_ab.sh
+
+# 单条查询的成本分解（客户端与解析 / 存储取行 / 索引检索）
+SEEKDB_HOME=/path/to/cand_home BASE=/root/work/run/eval \
+  tools/hipvs_bridge/bench/prof_query.sh
+```
+
+`verify_niter_ab.sh` 逐轮跑 `bench_official.py`（m=16、ef_construction=200、
+ef_search=64、4096 条查询、精确暴力 GT），再由 `summarize_niter.py` 按赛题口径
+输出加速比与相对 `niter=100` 的召回差，并按 0.005 门槛给出 PASS/FAIL。
+
+用本项目实测的 250K×128 数字（§10.6 表）喂进该工具，结论是：
+
+```
+niter 100  46.40s  1.00x  r@10 0.9890  PASS
+niter  50  25.92s  1.79x  r@10 0.9890  PASS
+niter  30  22.13s  2.10x  r@10 0.9820  FAIL(r10)   <- 当前默认档
+```
+
+也就是说：**默认档在单位化随机 250K 数据上是“2.10x 但召回差 0.007 不过线”**，
+安全档是 1.79x。这个选择被显式记录在 §10.6，工具只负责让它可复现、可反驳——
+换成 SIFT 类真实数据后跑同一条命令即可定论。
+
+`prof_query.sh` 把一次查询拆成四段：`SELECT 1` 往返、主键点查、索引 top-10、
+索引 top-100。本项目实测 SQL 端到端 p50 落在 6.6–7.7 ms，而单次 CAGRA 检索缓存后
+仅 0.386 ms，差额即客户端/解析/取行开销，这一层基线与候选逐字相同。
