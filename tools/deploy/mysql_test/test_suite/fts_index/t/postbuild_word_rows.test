@@ -1,0 +1,171 @@
+# description: post-build FTS word rows preserve membership, frequencies and scores.
+# The incremental table is the oracle: its index exists before the same source
+# rows are inserted.  The post-build table has no index until all rows exist.
+# The large row contains 601 distinct tokens, crossing the 512-row output span,
+# and the three partitions force checksum accounting across DAS scan tasks.
+
+--disable_query_log
+--disable_warnings
+DROP DATABASE IF EXISTS fts_postbuild_word_rows;
+--enable_warnings
+CREATE DATABASE fts_postbuild_word_rows;
+USE fts_postbuild_word_rows;
+SET NAMES utf8mb4;
+SET SESSION group_concat_max_len = 1000000;
+SET ob_query_timeout = 100000000;
+SET ob_trx_timeout = 100000000;
+
+CREATE TABLE digits (n INT PRIMARY KEY);
+INSERT INTO digits VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+CREATE TABLE numbers (n INT PRIMARY KEY);
+INSERT INTO numbers
+SELECT n FROM (
+  SELECT a.n + 10 * b.n + 100 * c.n AS n
+  FROM digits a CROSS JOIN digits b CROSS JOIN digits c
+) numbers_0_999 WHERE n <= 600;
+
+CREATE TABLE source_docs (
+  id INT PRIMARY KEY,
+  title VARCHAR(200),
+  content TEXT
+);
+INSERT INTO source_docs VALUES
+  (1, 'zx', ''),
+  (2, '', ''),
+  (3, NULL, NULL),
+  (4, 'needle rare', 'needle needle content'),
+  (6, 'rare', 'needle content'),
+  (7, '', 'tiny'),
+  (8, 'needle', 'qqterm');
+INSERT INTO source_docs
+SELECT 5, 'large',
+       GROUP_CONCAT(CONCAT(
+         'q',
+         SUBSTRING('abcdefghijklmnopqrstuvwxyz', MOD(n, 26) + 1, 1),
+         SUBSTRING('abcdefghijklmnopqrstuvwxyz', MOD(FLOOR(n / 26), 26) + 1, 1))
+         ORDER BY n SEPARATOR ' ')
+FROM numbers WHERE n < 600;
+
+CREATE TABLE fts_incremental (
+  id INT NOT NULL PRIMARY KEY,
+  title VARCHAR(200),
+  content TEXT,
+  FULLTEXT INDEX ft_idx(title, content)
+    WITH PARSER space PARSER_PROPERTIES=(min_token_size=1, max_token_size=84)
+) PARTITION BY RANGE(id) (
+  PARTITION p0 VALUES LESS THAN (3),
+  PARTITION p1 VALUES LESS THAN (6),
+  PARTITION p2 VALUES LESS THAN (10)
+);
+CREATE TABLE fts_postbuild (
+  id INT NOT NULL PRIMARY KEY,
+  title VARCHAR(200),
+  content TEXT
+) PARTITION BY RANGE(id) (
+  PARTITION p0 VALUES LESS THAN (3),
+  PARTITION p1 VALUES LESS THAN (6),
+  PARTITION p2 VALUES LESS THAN (10)
+);
+INSERT INTO fts_incremental SELECT * FROM source_docs ORDER BY id;
+INSERT INTO fts_postbuild SELECT * FROM source_docs ORDER BY id;
+CREATE FULLTEXT INDEX ft_idx ON fts_postbuild(title, content)
+  WITH PARSER space PARSER_PROPERTIES=(min_token_size=1, max_token_size=84);
+
+CREATE TABLE scores_incremental (
+  term VARCHAR(20), id INT, score DOUBLE, PRIMARY KEY(term, id)
+);
+CREATE TABLE scores_postbuild (
+  term VARCHAR(20), id INT, score DOUBLE, PRIMARY KEY(term, id)
+);
+INSERT INTO scores_incremental SELECT 'needle', id, MATCH(title, content) AGAINST('needle')
+  FROM fts_incremental WHERE MATCH(title, content) AGAINST('needle');
+INSERT INTO scores_incremental SELECT 'rare', id, MATCH(title, content) AGAINST('rare')
+  FROM fts_incremental WHERE MATCH(title, content) AGAINST('rare');
+INSERT INTO scores_incremental SELECT 'qaa', id, MATCH(title, content) AGAINST('qaa')
+  FROM fts_incremental WHERE MATCH(title, content) AGAINST('qaa');
+INSERT INTO scores_incremental SELECT 'qbx', id, MATCH(title, content) AGAINST('qbx')
+  FROM fts_incremental WHERE MATCH(title, content) AGAINST('qbx');
+INSERT INTO scores_incremental SELECT 'qqterm', id, MATCH(title, content) AGAINST('qqterm')
+  FROM fts_incremental WHERE MATCH(title, content) AGAINST('qqterm');
+INSERT INTO scores_incremental SELECT 'zx', id, MATCH(title, content) AGAINST('zx')
+  FROM fts_incremental WHERE MATCH(title, content) AGAINST('zx');
+INSERT INTO scores_postbuild SELECT 'needle', id, MATCH(title, content) AGAINST('needle')
+  FROM fts_postbuild WHERE MATCH(title, content) AGAINST('needle');
+INSERT INTO scores_postbuild SELECT 'rare', id, MATCH(title, content) AGAINST('rare')
+  FROM fts_postbuild WHERE MATCH(title, content) AGAINST('rare');
+INSERT INTO scores_postbuild SELECT 'qaa', id, MATCH(title, content) AGAINST('qaa')
+  FROM fts_postbuild WHERE MATCH(title, content) AGAINST('qaa');
+INSERT INTO scores_postbuild SELECT 'qbx', id, MATCH(title, content) AGAINST('qbx')
+  FROM fts_postbuild WHERE MATCH(title, content) AGAINST('qbx');
+INSERT INTO scores_postbuild SELECT 'qqterm', id, MATCH(title, content) AGAINST('qqterm')
+  FROM fts_postbuild WHERE MATCH(title, content) AGAINST('qqterm');
+INSERT INTO scores_postbuild SELECT 'zx', id, MATCH(title, content) AGAINST('zx')
+  FROM fts_postbuild WHERE MATCH(title, content) AGAINST('zx');
+
+CREATE TABLE secondary_smoke (id INT PRIMARY KEY, bucket INT, note VARCHAR(20));
+INSERT INTO secondary_smoke
+SELECT n, MOD(n, 10), CONCAT('n', n) FROM numbers WHERE n < 300;
+CREATE INDEX idx_secondary_smoke_bucket ON secondary_smoke(bucket);
+
+--echo membership_ids_before_vs_after
+SELECT
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_incremental
+   WHERE MATCH(title, content) AGAINST('needle')) =
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_postbuild
+   WHERE MATCH(title, content) AGAINST('needle')) AS needle_ids,
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_incremental
+   WHERE MATCH(title, content) AGAINST('rare')) =
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_postbuild
+   WHERE MATCH(title, content) AGAINST('rare')) AS rare_ids,
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_incremental
+   WHERE MATCH(title, content) AGAINST('qaa')) =
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_postbuild
+   WHERE MATCH(title, content) AGAINST('qaa')) AS qaa_ids,
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_incremental
+   WHERE MATCH(title, content) AGAINST('qbx')) =
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_postbuild
+   WHERE MATCH(title, content) AGAINST('qbx')) AS qbx_ids,
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_incremental
+   WHERE MATCH(title, content) AGAINST('qqterm')) =
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_postbuild
+   WHERE MATCH(title, content) AGAINST('qqterm')) AS qqterm_ids,
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_incremental
+   WHERE MATCH(title, content) AGAINST('zx')) =
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM fts_postbuild
+   WHERE MATCH(title, content) AGAINST('zx')) AS tiny_ids;
+
+--echo empty_and_null_documents
+SELECT
+  (SELECT COUNT(*) FROM fts_incremental WHERE id IN (2, 3)
+   AND MATCH(title, content) AGAINST('zx')) AS empty_null_before,
+  (SELECT COUNT(*) FROM fts_postbuild WHERE id IN (2, 3)
+   AND MATCH(title, content) AGAINST('zx')) AS empty_null_after;
+
+--echo partition_task_coverage
+SELECT
+  (SELECT COUNT(*) FROM information_schema.partitions
+   WHERE table_schema = DATABASE() AND table_name = 'fts_postbuild'
+     AND partition_name IS NOT NULL) AS partition_count,
+  (SELECT COUNT(*) FROM numbers WHERE n < 600) AS large_doc_tokens,
+  (SELECT COUNT(*) FROM fts_incremental) AS before_rows,
+  (SELECT COUNT(*) FROM fts_postbuild) AS after_rows;
+
+--echo frequency_and_score_oracle
+SELECT
+  (SELECT COUNT(*) FROM scores_incremental) AS before_scores,
+  (SELECT COUNT(*) FROM scores_postbuild) AS after_scores,
+  (SELECT COUNT(*) FROM scores_incremental i LEFT JOIN scores_postbuild p
+     ON i.term = p.term AND i.id = p.id WHERE p.id IS NULL) AS missing_scores,
+  (SELECT COUNT(*) FROM scores_postbuild p LEFT JOIN scores_incremental i
+     ON i.term = p.term AND i.id = p.id WHERE i.id IS NULL) AS extra_scores,
+  (SELECT COUNT(*) FROM scores_incremental i JOIN scores_postbuild p
+     ON i.term = p.term AND i.id = p.id
+     WHERE ABS(i.score - p.score) > 1e-12) AS score_mismatches,
+  (SELECT COUNT(DISTINCT score) > 1 FROM scores_incremental
+     WHERE term = 'needle') AS frequency_sensitive,
+  (SELECT COUNT(DISTINCT score) FROM scores_incremental WHERE term = 'needle') =
+  (SELECT COUNT(DISTINCT score) FROM scores_postbuild WHERE term = 'needle')
+    AS frequency_shape_matches;
+
+--echo secondary_index_build_smoke
+SELECT COUNT(*) AS bucket7_rows FROM secondary_smoke WHERE bucket = 7;

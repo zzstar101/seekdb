@@ -612,7 +612,8 @@ protected:
   int ensure_ddl_column_checksum_array();
   int get_ddl_checksum_task_idx(int64_t &task_idx) const;
   int add_ddl_column_checksum();
-  int add_ddl_column_checksum_batch(const int64_t row_count);
+  int add_ddl_column_checksum_batch(const int64_t row_count,
+                                    const int64_t task_idx_override = OB_INVALID_INDEX);
   int check_has_invalid_outrow_lob(const bool is_batch);
   int report_ddl_column_checksum();
   int get_next_batch_with_das(int64_t &count, int64_t capacity);
@@ -702,8 +703,12 @@ private:
   int inner_rescan_for_tsc();
 
   int inner_get_next_fts_index_row();
+  int inner_get_next_fts_index_batch(const int64_t capacity);
   int fetch_next_fts_index_rows();
-  int fill_generated_fts_cols(blocksstable::ObDatumRow *row);
+  int init_fts_output_exprs();
+  int fill_generated_fts_cols(const blocksstable::ObStorageDatum *row);
+  int fill_generated_fts_batch_cols(const blocksstable::ObStorageDatum *rows,
+                                    const int64_t row_count);
   int get_output_fts_col_expr_by_type(const ObExprOperatorType &type, ObExpr *&expr);
   bool is_resume_point_saved();
 protected:
@@ -735,6 +740,9 @@ protected:
   bool in_rescan_;
   ObDomainIndexCache domain_index_;
   ObFTIndexRowCache fts_index_;
+  ObExpr *fts_output_exprs_[4];
+  bool fts_source_end_;
+  int64_t fts_batch_task_idx_;
 
   // output_ is used to output data, TSC operator directly invokes output_::get_next_row(s),
   // it points to fold_iter_ in group rescan and iter_tree_ in normal scan.

@@ -23,6 +23,7 @@
 #include "ob_das_domain_utils.h"
 #include "data_plane/blocksstable/ob_datum_row.h"
 #include "data_plane/access/ob_datum_reshape.h"
+#include "data_plane/transaction/ob_tx_desc_access.h"
 #include "share/geo/ob_geo_utils.h"
 #include "sql/das/ob_das_dml_vec_iter.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
@@ -36,16 +37,188 @@ namespace sql
 {
 using storage::ObFTWordMap;
 
-
 ObObjDatumMapType ObFTIndexRowCache::FTS_INDEX_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
 ObObjDatumMapType ObFTIndexRowCache::FTS_DOC_WORD_TYPES[] = {OBJ_DATUM_STRING, OBJ_DATUM_STRING, OBJ_DATUM_8BYTE_DATA, OBJ_DATUM_8BYTE_DATA};
 
 ObExprOperatorType ObFTIndexRowCache::FTS_INDEX_EXPR_TYPE[] = {T_FUN_SYS_WORD_SEGMENT, T_FUN_SYS_DOC_ID, T_FUN_SYS_WORD_COUNT, T_FUN_SYS_DOC_LENGTH};
 ObExprOperatorType ObFTIndexRowCache::FTS_DOC_WORD_EXPR_TYPE[] = {T_FUN_SYS_DOC_ID, T_FUN_SYS_WORD_SEGMENT, T_FUN_SYS_WORD_COUNT, T_FUN_SYS_DOC_LENGTH};
 
+FTSWordRowBuffer::FTSWordRowBuffer()
+  : datums_(nullptr),
+    source_task_idxs_(nullptr),
+    capacity_(0),
+    row_count_(0),
+    row_idx_(0)
+{
+}
+
+int FTSWordRowBuffer::reserve_rows(common::ObIAllocator &allocator, const int64_t need_rows)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(need_rows < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (need_rows <= capacity_) {
+  } else {
+    const int64_t new_capacity = MAX(need_rows, MAX(static_cast<int64_t>(8), capacity_ * 2));
+    const int64_t datum_count = new_capacity * COLUMN_COUNT;
+    void *buf = nullptr;
+    void *task_buf = nullptr;
+    if (OB_ISNULL(buf = allocator.alloc(sizeof(blocksstable::ObStorageDatum) * datum_count))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(task_buf = allocator.alloc(sizeof(int64_t) * new_capacity))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      blocksstable::ObStorageDatum *new_datums = new (buf) blocksstable::ObStorageDatum[datum_count];
+      int64_t *new_source_task_idxs = static_cast<int64_t *>(task_buf);
+      for (int64_t i = 0; i < row_count_ * COLUMN_COUNT; ++i) {
+        new_datums[i] = datums_[i];
+      }
+      for (int64_t i = 0; i < row_count_; ++i) {
+        new_source_task_idxs[i] = source_task_idxs_[i];
+      }
+      datums_ = new_datums;
+      source_task_idxs_ = new_source_task_idxs;
+      capacity_ = new_capacity;
+    }
+  }
+  return ret;
+}
+
+int FTSWordRowBuffer::copy_string_datum(common::ObIAllocator &allocator,
+                                        const ObDatum &src,
+                                        blocksstable::ObStorageDatum &dst)
+{
+  int ret = OB_SUCCESS;
+  blocksstable::ObStorageDatum tmp;
+  if (OB_UNLIKELY(!src.is_null() && src.len_ > 0 && OB_ISNULL(src.ptr_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    tmp.shallow_copy_from_datum(src);
+    ret = dst.deep_copy(tmp, allocator);
+  }
+  return ret;
+}
+
+int FTSWordRowBuffer::append(common::ObIAllocator &allocator,
+                             storage::ObFTParseHelper *helper,
+                             const common::ObObjMeta &ft_obj_meta,
+                             const ObDatum &doc_id_datum,
+                             const common::ObString &fulltext,
+                             const bool is_fts_index_aux,
+                             const int64_t source_task_idx)
+{
+  int ret = OB_SUCCESS;
+  static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
+  const int64_t original_row_count = row_count_;
+  ObFTWordMap ft_word_map;
+  int64_t doc_length = 0;
+  char *stable_fulltext_buf = nullptr;
+  ObString stable_fulltext;
+  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
+  if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (0 == fulltext.length()) {
+    ret = OB_ITER_END;
+  } else if (OB_UNLIKELY(OB_ISNULL(fulltext.ptr()))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(stable_fulltext_buf = static_cast<char *>(allocator.alloc(fulltext.length())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (FALSE_IT(MEMCPY(stable_fulltext_buf, fulltext.ptr(), fulltext.length()))) {
+  } else if (FALSE_IT(stable_fulltext.assign_ptr(stable_fulltext_buf, fulltext.length()))) {
+  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (OB_FAIL(ObDASDomainUtils::segment_and_calc_word_count(allocator,
+                                                                   helper,
+                                                                   ft_obj_meta,
+                                                                   stable_fulltext,
+                                                                   doc_length,
+                                                                   ft_word_map))) {
+  } else if (0 == ft_word_map.size()) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(reserve_rows(allocator, row_count_ + ft_word_map.size()))) {
+  } else {
+    const int64_t word_idx = is_fts_index_aux ? 0 : 1;
+    const int64_t doc_id_idx = is_fts_index_aux ? 1 : 0;
+    const int64_t word_cnt_idx = 2;
+    const int64_t doc_len_idx = 3;
+    blocksstable::ObStorageDatum copied_doc_id;
+    if (OB_FAIL(copy_string_datum(allocator, doc_id_datum, copied_doc_id))) {
+    }
+    for (ObFTWordMap::const_iterator iter = ft_word_map.begin();
+         OB_SUCC(ret) && iter != ft_word_map.end();
+         ++iter) {
+      blocksstable::ObStorageDatum *row = datums_ + row_count_ * COLUMN_COUNT;
+      for (int64_t i = 0; i < COLUMN_COUNT; ++i) {
+        row[i].reuse();
+      }
+      row[word_idx].shallow_copy_from_datum(iter->first.get_word());
+      row[doc_id_idx] = copied_doc_id;
+      row[word_cnt_idx].set_uint(iter->second);
+      row[doc_len_idx].set_uint(doc_length);
+      source_task_idxs_[row_count_] = source_task_idx;
+      ++row_count_;
+    }
+  }
+  if (OB_FAIL(ret) && OB_ITER_END != ret) {
+    row_count_ = original_row_count;
+  }
+  return ret;
+}
+
+int FTSWordRowBuffer::get_next_row(const blocksstable::ObStorageDatum *&row)
+{
+  int ret = OB_SUCCESS;
+  row = nullptr;
+  if (row_idx_ >= row_count_) {
+    ret = OB_ITER_END;
+  } else {
+    row = datums_ + row_idx_ * COLUMN_COUNT;
+    ++row_idx_;
+  }
+  return ret;
+}
+
+int FTSWordRowBuffer::get_next_batch(const blocksstable::ObStorageDatum *&rows,
+                                     int64_t &row_count,
+                                     const int64_t max_row_count,
+                                     int64_t *source_task_idx)
+{
+  int ret = OB_SUCCESS;
+  rows = nullptr;
+  row_count = 0;
+  if (OB_NOT_NULL(source_task_idx)) {
+    *source_task_idx = OB_INVALID_INDEX;
+  }
+  if (OB_UNLIKELY(max_row_count <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (row_idx_ >= row_count_) {
+    ret = OB_ITER_END;
+  } else {
+    const int64_t task_idx = source_task_idxs_[row_idx_];
+    while (row_count < max_row_count
+           && row_idx_ + row_count < row_count_
+           && source_task_idxs_[row_idx_ + row_count] == task_idx) {
+      ++row_count;
+    }
+    rows = datums_ + row_idx_ * COLUMN_COUNT;
+    row_idx_ += row_count;
+    if (OB_NOT_NULL(source_task_idx)) {
+      *source_task_idx = task_idx;
+    }
+  }
+  return ret;
+}
+
+void FTSWordRowBuffer::reuse()
+{
+  datums_ = nullptr;
+  source_task_idxs_ = nullptr;
+  capacity_ = 0;
+  row_count_ = 0;
+  row_idx_ = 0;
+}
+
 ObFTIndexRowCache::ObFTIndexRowCache()
-  : rows_(),
-    row_idx_(0),
+  : words_(),
     is_fts_index_aux_(true),
     helper_(),
     is_inited_(false)
@@ -70,7 +243,6 @@ int ObFTIndexRowCache::init(
   } else if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(merge_memctx_, param))) {
   } else if (OB_FAIL(helper_.init(&(merge_memctx_->get_arena_allocator()), parser_name, parser_properties))) {
   } else {
-    row_idx_ = 0;
     is_fts_index_aux_ = is_fts_index_aux;
     is_inited_ = true;
   }
@@ -80,47 +252,52 @@ int ObFTIndexRowCache::init(
   return ret;
 }
 
-int ObFTIndexRowCache::segment(const common::ObObjMeta &ft_obj_meta,
-                               const ObDatum &doc_id_datum,
-                               const ObString &fulltext)
+int ObFTIndexRowCache::append(const common::ObObjMeta &ft_obj_meta,
+                              const ObDatum &doc_id_datum,
+                              const ObString &fulltext,
+                              const int64_t source_task_idx)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-  } else if (FALSE_IT(reuse())) {
-  } else if (OB_FAIL(ObDASDomainUtils::generate_fulltext_word_rows(merge_memctx_->get_arena_allocator(),
-                                                                   &helper_,
-                                                                   ft_obj_meta,
-                                                                   doc_id_datum,
-                                                                   fulltext,
-                                                                   is_fts_index_aux_,
-                                                                   rows_))) {
-  } else {
-    row_idx_ = 0;
+  } else if (OB_FAIL(words_.append(merge_memctx_->get_arena_allocator(),
+                                   &helper_,
+                                   ft_obj_meta,
+                                   doc_id_datum,
+                                   fulltext,
+                                   is_fts_index_aux_,
+                                   source_task_idx))) {
   }
-  LOG_TRACE("word segment", K(ret), K(row_idx_), K(rows_.count()), K(doc_id_datum), K(fulltext));
+  LOG_TRACE("append word rows", K(ret), K(words_.get_row_count()), K(doc_id_datum), K(fulltext));
   return ret;
 }
 
-int ObFTIndexRowCache::get_next_row(blocksstable::ObDatumRow *&row)
+int ObFTIndexRowCache::get_next_row(const blocksstable::ObStorageDatum *&row)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-  } else if (row_idx_ >= rows_.count()) {
-    ret = OB_ITER_END;
-  } else {
-    row = (rows_[row_idx_]);
-    ++row_idx_;
+  } else if (OB_FAIL(words_.get_next_row(row))) {
   }
-  LOG_TRACE("get next row", K(ret), KPC(row), K(row_idx_), K(rows_.count()));
+  return ret;
+}
+
+int ObFTIndexRowCache::get_next_batch(const blocksstable::ObStorageDatum *&rows,
+                                      int64_t &row_count,
+                                      const int64_t max_row_count,
+                                      int64_t *source_task_idx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(words_.get_next_batch(rows, row_count, max_row_count, source_task_idx))) {
+  }
   return ret;
 }
 
 void ObFTIndexRowCache::reset()
 {
-  rows_.reset();
-  row_idx_ = 0;
+  words_.reuse();
   is_fts_index_aux_ = true;
   helper_.reset();
   if (OB_NOT_NULL(merge_memctx_)) {
@@ -132,8 +309,7 @@ void ObFTIndexRowCache::reset()
 
 void ObFTIndexRowCache::reuse()
 {
-  rows_.reuse();
-  row_idx_ = 0;
+  words_.reuse();
   if (OB_NOT_NULL(merge_memctx_)) {
     merge_memctx_->reset_remain_one_page();
   }
@@ -314,7 +490,7 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
          ++iter) {
       if (OB_FAIL(rows[i].init(allocator, FT_WORD_DOC_COL_CNT))) {
       } else {
-        const ObFTWord &ft_word = iter->first;
+        const storage::ObFTWord &ft_word = iter->first;
         const int64_t word_cnt = iter->second;
         // index row format
         //  -    FTS_INDEX: [WORD], [DOC_ID], [WORD_COUNT], [DOC_LENGTH]
