@@ -244,6 +244,34 @@ recall@10 / recall@100`，其中 recall 用 numpy 精确暴力最近邻作为 gr
 - **固定开销**：250K 档在 niter=100 时约 45–48 s，其中约 8 s 与 n 基本无关
   （cuVS 初始化、CAGRA 图序列化、辅助表写入），这是下一个要拆解的热点。
 
+### 10.4 验证状态（先读这一节再用本分支）
+
+本分支上有两代提交，验证程度不同：
+
+- **`f6bbbe782`** —— 在 Radeon（gfx11 + ROCm 7.2.4）机器上完整跑过
+  25K/100K/250K/1M 的建图与查询，本报告 §1/§3/§5 的数字都来自它。
+  但它带有 §10.1 说的并发缺陷：`seekdb_cuvs_search()` 复用句柄内的结果缓冲，
+  而 SQL 层对同一 `snap_data_->index_` 只加**读锁**（`TCRLockGuard` →
+  `rdlock`，见 `src/oblib/lib/lock/ob_tc_rwlock.h:332`），并发批量查询会同时
+  进入同一句柄、互相覆盖缓冲。单线程跑不出来，官方"批量查询"一定会踩到。
+- **`463f3073b`（当前 HEAD）** —— 修掉上述竞争（句柄级互斥 + 缓冲全成功后再
+  提交），删掉默认开启的探针，并按维度加了下限。**只做过语法/接口检查**
+  （cuVS C API 头文件桩件 + `clang -Wall` 零新增告警），**没有在 Radeon 上编译
+  运行过**。
+
+因此分发前请先花约 30 分钟验证一次：
+
+```bash
+bash tools/hipvs_bridge/build.sh
+./build.sh release -DOB_BUILD_CUVS=ON \
+    -DCUVS_BRIDGE_LIB=$PWD/tools/hipvs_bridge/libseekdb_cuvs_bridge.so --make -j64
+/opt/venv/bin/python tools/hipvs_bridge/bench/bench_official.py \
+    --n 250000 --dim 128 --queries 4096 --threads 8   # 再跑一次 --dim 256
+```
+
+若需要退回"纯手工验证过"的状态，`git checkout f6bbbe782` 即可，但必须同时把
+批量查询改为串行（`--threads 1`），否则有并发错结果的风险。
+
 ## 11. CPU（vsag）与 GPU（hipVS CAGRA）构建对比
 
 赛题要求保留 `lib=vsag` 的 CPU 路径，这里给出同一台机器、同一批向量上的

@@ -26,16 +26,6 @@ static long sk_env_long(const char* name, long def)
 }
 
 
-static double sk_env_double(const char* name, double def)
-{
-  const char* v = getenv(name);
-  if (!v || !*v) return def;
-  char* end = NULL;
-  double x = strtod(v, &end);
-  if (end == v) return def;
-  return x;
-}
-
 typedef struct {
   cuvsResources_t        res;
   cuvsCagraIndexParams_t ip;
