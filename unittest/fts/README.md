@@ -63,9 +63,11 @@ The focused cases are in the existing `fts_index` mysqltest suite:
   and incrementally maintained indexes, updates/deletes, transaction visibility,
   rollback, and an independently materialized scored result.
 
-- `postbuild_word_rows`: partitioned post-build versus incremental membership,
+- `postbuild_word_rows`: partitioned and nonpartitioned post-build versus incremental membership,
   documents crossing output-batch boundaries, empty/NULL input, frequency-sensitive
-  scores on small documents, and a secondary-index smoke check. The large document
+  scores on small documents, and a secondary-index smoke check. Partitioned builds
+  use the existing scalar path to preserve per-source partition metadata. The large
+  document
   occupies its own partition because the existing average-length estimator differs
   between SSTables and memtables; its full row fields are checked by the native test.
 - `tokenize_function`: accent-, case-, and emoji-equivalent spellings plus n-gram
