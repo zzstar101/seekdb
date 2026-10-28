@@ -25,6 +25,12 @@ Omit `--execute` to validate the build metadata and show the intended outputs wi
 compiling. The output directory must be outside the source and build trees. The
 executed compiler and linker commands are saved in `build-plan.json` there.
 
+Both Makefiles and Ninja builds are supported. For a Google Test installation
+outside the production dependency directories, pass its prefix (for example,
+`--gtest-prefix /opt/homebrew/opt/googletest` on Apple Silicon). Add further
+production-linked regression sources with repeated `--test-source` arguments;
+paths are relative to the repository root.
+
 The 12 tests cover:
 
 - Word aggregation: first-occurrence frequency, repeated words, collation equality,

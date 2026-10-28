@@ -90,8 +90,8 @@ def compile_template(build):
     return cwd, cleaned
 
 
-def find_gtest_libraries(link_argv, link_cwd, repo):
-    search_dirs = []
+def find_gtest_libraries(link_argv, link_cwd, repo, gtest_prefix=None):
+    search_dirs = [gtest_prefix / "lib", gtest_prefix / "lib64"] if gtest_prefix else []
     for index, arg in enumerate(link_argv):
         if arg == "-L" and index + 1 < len(link_argv):
             search_dirs.append(Path(link_argv[index + 1]))
@@ -107,11 +107,41 @@ def find_gtest_libraries(link_argv, link_cwd, repo):
     raise BuildError("Cannot find libgtest_main.a and libgtest.a in the production -L directories or repository dependencies")
 
 
-def make_plan(repo, build, out):
+def read_link_command(build):
+    link_cwd = build / "src/observer"
+    link_file = link_cwd / "CMakeFiles/seekdb.dir/link.txt"
+    if link_file.is_file():
+        return link_cwd, shlex.split(read_text(link_file))
+    if not (build / "build.ninja").is_file():
+        raise BuildError("Cannot find a Makefiles or Ninja seekdb link command in {}".format(build))
+    try:
+        commands = subprocess.check_output(
+            ["ninja", "-C", str(build), "-t", "commands", "src/observer/seekdb"], text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise BuildError("Cannot inspect Ninja link command: {}".format(error)) from error
+    candidates = []
+    for command in commands.splitlines():
+        argv = shlex.split(command)
+        if "-o" in argv and argv[argv.index("-o") + 1] == "src/observer/seekdb":
+            # CMake wraps Ninja link steps with no-op shell commands. Execute
+            # only the compiler argv; never pass the generated string to a shell.
+            if argv[:2] == [":", "&&"]:
+                argv = argv[2:]
+            if argv[-2:] == ["&&", ":"]:
+                argv = argv[:-2]
+            if any(arg in ("&&", ";", "||", "|") for arg in argv):
+                raise BuildError("Unsupported compound Ninja link command")
+            candidates.append(argv)
+    if len(candidates) != 1:
+        raise BuildError("Expected one Ninja seekdb link command; found {}".format(len(candidates)))
+    return build, candidates[0]
+
+
+def make_plan(repo, build, out, gtest_prefix=None, extra_sources=()):
     for tree in (repo, build):
         if out == tree or tree in out.parents:
             raise BuildError("--out must be outside both the repository and build trees: {}".format(out))
-    sources = [repo / relative for relative in TEST_SOURCES]
+    sources = [repo / relative for relative in (*TEST_SOURCES, *extra_sources)]
     for source in sources:
         if not source.is_file():
             raise BuildError("Missing native regression source: {}".format(source))
@@ -120,20 +150,20 @@ def make_plan(repo, build, out):
     compiles = []
     for source, obj in zip(sources, objects):
         argv = list(template)
+        if gtest_prefix:
+            argv.extend(["-isystem", str(gtest_prefix / "include")])
         argv[option_value_index(argv, "-c", "the compilation command")] = str(source)
         argv[option_value_index(argv, "-o", "the compilation command")] = str(obj)
         compiles.append({"source": str(source), "object": str(obj), "cwd": str(compile_cwd), "argv": argv})
 
-    link_cwd = build / "src/observer"
-    link_file = link_cwd / "CMakeFiles/seekdb.dir/link.txt"
-    link_argv = shlex.split(read_text(link_file))
+    link_cwd, link_argv = read_link_command(build)
     main_suffix = "CMakeFiles/ob_main.dir/main.cpp.o"
     command_line_suffix = "CMakeFiles/ob_main.dir/ob_command_line_parser.cpp.o"
     main_args = [arg for arg in link_argv if arg.endswith(main_suffix)]
     command_line_args = [arg for arg in link_argv if arg.endswith(command_line_suffix)]
     if len(main_args) != 1 or len(command_line_args) != 1:
-        raise BuildError("Expected one main.cpp.o and one ob_command_line_parser.cpp.o from ob_main in {}".format(link_file))
-    libraries = find_gtest_libraries(link_argv, link_cwd, repo)
+        raise BuildError("Expected one main.cpp.o and one ob_command_line_parser.cpp.o in the seekdb link command")
+    libraries = find_gtest_libraries(link_argv, link_cwd, repo, gtest_prefix)
     replacement = [str(obj) for obj in objects] + [str(library) for library in libraries]
     linked = []
     for arg in link_argv:
@@ -165,12 +195,15 @@ def main():
     parser.add_argument("--build", type=Path, help="existing build directory (default: REPO/build_release)")
     parser.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "seekdb-fts-regressions", help="output directory outside the repository and build trees")
     parser.add_argument("--execute", action="store_true", help="compile and link; otherwise only check and show the plan")
+    parser.add_argument("--gtest-prefix", type=Path, help="Google Test installation prefix, if outside production dependency paths")
+    parser.add_argument("--test-source", action="append", default=[], help="additional native test source relative to the repository (repeatable)")
     args = parser.parse_args()
     repo = args.repo.resolve()
     build = (args.build or repo / "build_release").resolve()
     out = args.out.resolve()
     try:
-        plan = make_plan(repo, build, out)
+        gtest_prefix = args.gtest_prefix.resolve() if args.gtest_prefix else None
+        plan = make_plan(repo, build, out, gtest_prefix, args.test_source)
         print(json.dumps({
             "mode": "execute" if args.execute else "dry-run",
             "repository": str(repo), "build": str(build), "binary": plan["binary"],
