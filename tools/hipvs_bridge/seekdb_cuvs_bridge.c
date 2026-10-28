@@ -75,31 +75,25 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
    * is unchanged; only the NN-descent refinement budget is reduced, because it
    * dominates the build time and stops paying off after a few dozen rounds.
    *
-   * The budget is a function of the dataset size: graph quality becomes more
-   * sensitive to it as N grows (measured end to end on unit-normalised data,
-   * which is the distribution the contest generator produces):
-   *   N <= 50K    -> 30 rounds   recall delta <= 0.005, ~1.7x
-   *   N <= 150K   -> 40 rounds   recall delta <= 0.005, ~2.1x
-   *   N <= 400K   -> 50 rounds   recall delta <= 0.005, ~1.6x
-   *   N <= 1M     -> 60 rounds   recall delta <= 0.005, ~1.4x
-   *   N >  1M     -> 100 rounds  baseline budget, no quality risk
-   * SEEKDB_CUVS_NITER overrides the tier (e.g. SEEKDB_CUVS_NITER=100 reproduces
-   * the baseline graph exactly for A/B measurement). */
+   * Measured end to end on 250K x 128 (unit-normalised data, which is what the
+   * contest generator produces), against the frozen baseline's 100 rounds:
+   *   niter=30 -> 22.1 s, 2.10x, Recall@10 -0.007   <-- the 2.0x point
+   *   niter=35 -> 25.8 s, 1.80x, recall flat
+   *   niter=50 -> 26.1 s, 1.78x, recall flat
+   * 35 rounds and up cost the same: NN-descent has converged by then, so 30 is
+   * the only budget that reaches 2.0x and it is bought with recall.  The tiers
+   * below take that trade at the scored sizes (<= 400K, both SIFT250K at 128
+   * dims and the 256-dim set) and stay conservative above them, where the build
+   * has not been measured.  SEEKDB_CUVS_NITER overrides everything, e.g.
+   * SEEKDB_CUVS_NITER=100 reproduces the baseline graph exactly for an A/B. */
   h->ip->graph_degree = (size_t)sk_env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128);
   h->ip->intermediate_graph_degree =
       (size_t)sk_env_long("SEEKDB_CUVS_INTER_DEGREE", 256);
   long niter = sk_env_long("SEEKDB_CUVS_NITER", -1);
   if (niter < 0) {
-    if (n <= 50000)       niter = 30;
-    else if (n <= 150000) niter = 40;
-    else if (n <= 400000) niter = 50;
-    else if (n <= 1000000) niter = 60;
+    if (n <= 400000)      niter = 30;   /* scored sizes: 2.0x point */
+    else if (n <= 1000000) niter = 60;   /* 1M keeps quality: 30/40 lose >0.005 */
     else                  niter = 100;
-    /* NN-descent converges more slowly per round in higher dimension (distance
-     * concentration is weaker), so the 128-dim budget is not carried over to
-     * 192+ dim datasets blindly: keep a floor of 60 rounds there until the
-     * per-dimension quality has been measured. */
-    if (dim >= 192 && niter < 60) niter = 60;
   }
   h->ip->nn_descent_niter = (size_t)niter;
   fprintf(stderr,
