@@ -197,3 +197,44 @@ recall@10 / recall@100`，其中 recall 用 numpy 精确暴力最近邻作为 gr
   单纯调 `cuvsCagraBuild` 参数在 1M 规模已到边界。
 - 查询侧的瓶颈是 seekdb SQL 层 4–5 ms 的固定开销，需要把表达式解析与计划缓存
   纳入优化范围。
+
+## 10. 对评审意见的响应（v6 工作分支）
+
+评审确认了两条关键信息，本报告据此校准：
+
+1. **正式计分的数据集是两个 250K 规模的数据集**（SIFT250K 128 维、Hidden250K 256 维）。
+   因此 §2 表里 25K / 100K / 1M 的数字只用于说明标度规律，计分路径上生效的
+   分层参数是**n=250K → `nn_descent_niter=50`**。
+2. 256 维数据集的召回尚未实测（本地无 AMD Radeon 环境时无法验证）。
+
+### 10.1 已修复
+
+| 评审项 | 处理 |
+| --- | --- |
+| P1 查询工作区并发竞争 | 句柄内新增 `pthread_mutex_t`，`seekdb_cuvs_search()` 全程持锁。GPU 检索本来就在同一条 cuVS stream 上串行，因此不损失吞吐；基线每次调用重新分配工作区本身是线程安全的，本次把这一点恢复。 |
+| P1 工作区部分分配失败后的状态 | `sk_ensure_buffers()` 改为先分配到局部变量、全部成功后才提交句柄；任一失败即回滚已分配部分，不再出现"指针已更新但容量为 0"。 |
+| P2 Recall probe 计算口径 | 删除该可选探针（默认关闭，且自查询不能代表评测查询集）。 |
+
+### 10.2 评测口径对齐
+
+新增 `tools/hipvs_bridge/bench/bench_official.py`：
+
+- 建索引使用官方参数 `create vector index ... with (distance=l2, type=hnsw, lib=cuvs, m=16, ef_construction=200)`；
+- 查询会话执行 `set session ob_hnsw_ef_search=64`；
+- 默认 4096 条查询，**top-10 与 top-100 分别统计**（单流 p50/p95 + 多线程批量 QPS）；
+- 逐条校验结果（恰好 k 个、无重复、ID 落在 `[0,n)`）；
+- `--dim 256` 可直接跑第二个官方数据集形状；
+- 召回对比同一数据的分块精确 GT（`exact_topk`，可缓存）。
+
+### 10.3 仍未验证 / 下一步
+
+- **250K × 256 的召回**：需要在 AMD Radeon 机器上跑 `bench_official.py --dim 256`
+  并与同轮基线对比。若 Recall@10 或 Recall@100 下降超过 0.005，把 250K 档的
+  `niter` 回调到 60/80（`SEEKDB_CUVS_NITER` 可现场 A/B，无需重编译）。
+- **构建侧继续提分**：`cuvsCagraBuild` 的参数调节在 250K 档已接近边界（1.6x）。
+  下一批候选是 hipVS 可能提供的其它 CAGRA 构建算法（`build_algo` 的
+  iterative CAGRA search / ACE 等）：已加 `SEEKDB_CUVS_BUILD_ALGO` 开关（默认不变），
+  有机器时可一次跑完 A/B；若该版本 hipVS 不支持对应枚举值，构建会报错，
+  默认路径不受影响。
+- **固定开销**：250K 档在 niter=100 时约 45–48 s，其中约 8 s 与 n 基本无关
+  （cuVS 初始化、CAGRA 图序列化、辅助表写入），这是下一个要拆解的热点。
