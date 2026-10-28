@@ -254,7 +254,7 @@ recall@10 / recall@100`，其中 recall 用 numpy 精确暴力最近邻作为 gr
   而 SQL 层对同一 `snap_data_->index_` 只加**读锁**（`TCRLockGuard` →
   `rdlock`，见 `src/oblib/lib/lock/ob_tc_rwlock.h:332`），并发批量查询会同时
   进入同一句柄、互相覆盖缓冲。单线程跑不出来，官方"批量查询"一定会踩到。
-- **`463f3073b`（当前 HEAD）** —— 修掉上述竞争（句柄级互斥 + 缓冲全成功后再
+- **`93dd1ff41`（当前 HEAD）** —— 修掉上述竞争（句柄级互斥 + 缓冲全成功后再
   提交），删掉默认开启的探针，并按维度加了下限。**只做过语法/接口检查**
   （cuVS C API 头文件桩件 + `clang -Wall` 零新增告警），**没有在 Radeon 上编译
   运行过**。
