@@ -52,6 +52,16 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  // Validate the first UTF-8 character and classify it in one decode. The
+  // charset type is passed by the caller because tokenizer loops already know
+  // the collation and should not resolve it again for every character.
+  static int prepare_first_char(ObCharsetType cs_type,
+                                ObCollationType coll_type,
+                                const char *input,
+                                const int64_t input_len,
+                                uint8_t &char_len,
+                                CharType &type);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -76,6 +86,8 @@ public:
 private:
   template <ObCharsetType CS_TYPE>
   static int do_classify(const char *input, const uint8_t char_len, CharType &type);
+
+  static void classify_unicode(ob_wc_t unicode, CharType &type);
 
 private:
   /*************************  Alpha: english letter abc *********************/
@@ -451,7 +463,25 @@ inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, 
   // All predicates classify the same code point. Preserve their precedence
   // while decoding the input only once.
   if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
-  } else if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+  } else {
+    classify_unicode(unicode, type);
+  }
+  if (OB_SUCC(ret) && CharType::USELESS == type) {
+    if ((CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE)
+        && ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
+      type = CharType::SURROGATE_HIGH;
+    } else if ((CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE)
+               && ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
+      type = CharType::SURROGATE_LOW;
+    }
+  }
+  return ret;
+}
+
+inline void ObFTCharUtil::classify_unicode(const ob_wc_t unicode, CharType &type)
+{
+  type = CharType::USELESS;
+  if (ObUnicodeBlockUtils::is_alpha(unicode)) {
     type = CharType::ENGLISH_LETTER;
   } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
     type = CharType::ARABIC_LETTER;
@@ -459,12 +489,43 @@ inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, 
     type = CharType::CHINESE;
   } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
     type = CharType::OTHER_CJK;
-  } else if ((CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE)
-             && ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
-    type = CharType::SURROGATE_HIGH;
-  } else if ((CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE)
-             && ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
-    type = CharType::SURROGATE_LOW;
+  }
+}
+
+inline int ObFTCharUtil::prepare_first_char(ObCharsetType cs_type,
+                                            ObCollationType coll_type,
+                                            const char *input,
+                                            const int64_t input_len,
+                                            uint8_t &char_len,
+                                            CharType &type)
+{
+  int ret = OB_SUCCESS;
+  char_len = 0;
+  type = CharType::USELESS;
+
+  if (CHARSET_UTF8MB4 == cs_type && OB_NOT_NULL(input) && input_len > 0) {
+    ob_wc_t unicode = 0;
+    const unsigned char *start = reinterpret_cast<const unsigned char *>(input);
+    const int code_size = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(
+        start, start + input_len, unicode);
+    if (OB_LIKELY(code_size > 0)) {
+      char_len = static_cast<uint8_t>(code_size);
+      classify_unicode(unicode, type);
+      return ret;
+    }
+  }
+
+  // Keep the original validator/classifier sequence on malformed UTF-8 and on
+  // every non-UTF-8 supported charset. In particular, the old UTF-8 validator
+  // accepts surrogate encodings that the decoder rejects, so the fallback also
+  // preserves which error code such input produces.
+  int64_t fallback_len = 0;
+  if (OB_FAIL(ObCharset::first_valid_char(coll_type, input, input_len, fallback_len))) {
+  } else if (OB_UNLIKELY(fallback_len > UINT8_MAX)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    char_len = static_cast<uint8_t>(fallback_len);
+    ret = classify_first_char(coll_type, input, char_len, type);
   }
   return ret;
 }

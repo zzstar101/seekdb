@@ -419,6 +419,27 @@ OB_INLINE int range_bound_cmp(const ObString &bound, const ObString &single_word
   }
   return cmp;
 }
+
+OB_INLINE uint32_t range_bound_key(const char *ptr, const int64_t len)
+{
+  uint32_t key = 0;
+  const int64_t prefix_len = len <= 0 ? 0 : MIN(len, 4L);
+  for (int64_t i = 0; i < prefix_len; ++i) {
+    key = (key << 8) | static_cast<uint8_t>(ptr[i]);
+  }
+  return prefix_len > 0 ? key << ((4 - prefix_len) * 8) : 0;
+}
+
+OB_INLINE int range_bound_key_cmp(const uint32_t bound_key,
+                                  const uint8_t bound_len,
+                                  const uint32_t word_key,
+                                  const int64_t word_len)
+{
+  if (bound_key != word_key) {
+    return bound_key < word_key ? -1 : 1;
+  }
+  return bound_len == word_len ? 0 : (bound_len < word_len ? -1 : 1);
+}
 } // namespace
 
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
@@ -426,11 +447,21 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   int ret = OB_SUCCESS;
   bool found = false;
   if (use_range_binary_search_) {
+    const uint32_t word_key = use_range_key_search_
+        ? range_bound_key(single_word.ptr(), single_word.length())
+        : 0;
     int64_t left = 0;
     int64_t right = range_dicts_.size();
     while (left < right) {
       const int64_t mid = left + (right - left) / 2;
-      if (range_bound_cmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+      const ObFTRange &range = range_dicts_[mid];
+      const int cmp = use_range_key_search_
+          ? range_bound_key_cmp(range.start_key_,
+                                range.start_.word_len,
+                                word_key,
+                                single_word.length())
+          : range_bound_cmp(range.start_.get_word(), single_word);
+      if (cmp <= 0) {
         left = mid + 1;
       } else {
         right = mid;
@@ -438,7 +469,14 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
     }
     if (left > 0) {
       const int64_t range_idx = left - 1;
-      if (range_bound_cmp(range_dicts_[range_idx].end_.get_word(), single_word) >= 0) {
+      const ObFTRange &range = range_dicts_[range_idx];
+      const int cmp = use_range_key_search_
+          ? range_bound_key_cmp(range.end_key_,
+                                range.end_.word_len,
+                                word_key,
+                                single_word.length())
+          : range_bound_cmp(range.end_.get_word(), single_word);
+      if (cmp >= 0) {
         dict = range_dicts_[range_idx].dict_;
         found = true;
       }
@@ -465,6 +503,7 @@ void ObFTRangeDict::update_range_search_index()
   // ranges are disjoint. Otherwise retain the original order and linear lookup,
   // which defines the first-match behavior for custom or overlapping ranges.
   use_range_binary_search_ = range_dicts_.size() > 0;
+  use_range_key_search_ = use_range_binary_search_;
   for (int64_t i = 0; use_range_binary_search_ && i < range_dicts_.size(); ++i) {
     const ObString start = range_dicts_[i].start_.get_word();
     const ObString end = range_dicts_[i].end_.get_word();
@@ -477,7 +516,16 @@ void ObFTRangeDict::update_range_search_index()
         use_range_binary_search_ = false;
       }
     }
+    if (start.length() > 4 || end.length() > 4) {
+      // The packed key is exact for one UTF-8 character. Keep binary search with
+      // the full comparator for any custom range with longer boundaries.
+      use_range_key_search_ = false;
+    } else {
+      range_dicts_[i].start_key_ = range_bound_key(start.ptr(), start.length());
+      range_dicts_[i].end_key_ = range_bound_key(end.ptr(), end.length());
+    }
   }
+  use_range_key_search_ = use_range_key_search_ && use_range_binary_search_;
 }
 
 int ObFTRangeDict::build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> &dat_blocks)
@@ -488,6 +536,7 @@ int ObFTRangeDict::build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> 
   }
   if (OB_SUCC(ret)) {
     use_range_binary_search_ = false;
+    use_range_key_search_ = false;
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < dat_blocks.count(); ++i) {
     ObFTCacheDict *dict = nullptr;
@@ -522,6 +571,7 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
 {
   int ret = OB_SUCCESS;
   use_range_binary_search_ = false;
+  use_range_key_search_ = false;
   for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
        OB_SUCC(ret) && iter != range_container.get_handles().end();
        iter++) {

@@ -19,6 +19,8 @@
 #include "storage/fts/ob_beng_ft_parser.h"
 #include "data_plane/fts/ob_fts_struct.h"
 
+#include <cstdint>
+
 using namespace oceanbase::common;
 
 namespace oceanbase
@@ -49,11 +51,25 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    MEMCPY(buf, token.ptr_, token.len_);
-    word = buf;
+    const uintptr_t doc_start = reinterpret_cast<uintptr_t>(doc_.ptr_);
+    const uintptr_t token_start = reinterpret_cast<uintptr_t>(token.ptr_);
+    const uintptr_t doc_end = doc_start + static_cast<uintptr_t>(doc_.len_);
+    // Lowercase ASCII tokens are views into the input document and remain valid
+    // for the entire segment() call. Tokens normalized into the analyzer's
+    // scratch allocator still need their own copy because that storage is reused
+    // by a later get_next().
+    if (token_start >= doc_start && token_start < doc_end
+        && static_cast<uintptr_t>(token.len_) <= doc_end - token_start) {
+      word = token.ptr_;
+    } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(buf, token.ptr_, token.len_);
+      word = buf;
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(word)) {
     word_len = token.len_;
     char_len = token.len_;
     word_freq = token_freq;

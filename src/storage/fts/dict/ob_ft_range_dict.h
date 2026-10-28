@@ -40,7 +40,7 @@ public:
   ObFTRangeDict(ObIAllocator &alloc,
                 ObFTCacheRangeContainer *range_container,
                 const ObFTDictDesc &desc)
-      : is_inited_(false), use_range_binary_search_(false), desc_(desc),
+      : is_inited_(false), use_range_binary_search_(false), use_range_key_search_(false), desc_(desc),
         range_alloc_(lib::ObMemAttr("Range Dict")), range_dicts_(&range_alloc_),
         range_container_(range_container)
   {
@@ -53,6 +53,10 @@ public:
     ObFTSingleWord start_;
     ObFTSingleWord end_;
     ObIFTDict *dict_; // a cache dict
+    // Big-endian byte prefix used only when both boundaries are at most one
+    // UTF-8 character. It avoids repeated memcmp calls in binary lookup.
+    uint32_t start_key_ = 0;
+    uint32_t end_key_ = 0;
   };
 
 public:
@@ -79,6 +83,7 @@ public:
   int build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> &dat_blocks);
 
   bool uses_binary_range_search() const { return use_range_binary_search_; }
+  bool uses_packed_range_search() const { return use_range_key_search_; }
 
   static int try_load_cache(const ObFTDictDesc &desc,
                             const uint32_t range_count,
@@ -121,6 +126,7 @@ private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
   bool is_inited_;
   bool use_range_binary_search_;
+  bool use_range_key_search_;
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;

@@ -714,11 +714,13 @@ TEST_F(IKDictionaryCacheTest, range_lookup_matches_linear_for_bounds_gaps_and_pr
       "", "A", "AA", "AB", "B", "BA", "C", "D", "DA", "E", "F", "FA",
       "G", "一", "一乙", "乙", "乙乙", "丙"};
   ASSERT_TRUE(range.uses_binary_range_search());
+  EXPECT_TRUE(range.uses_packed_range_search());
   expect_range_lookup_matches_linear(range, dats, probes);
 
   // A rejected rebuild must leave both the ranges and their search index untouched.
   EXPECT_EQ(OB_INIT_TWICE, range.build_dict_from_dat_blocks(dat_blocks));
   EXPECT_TRUE(range.uses_binary_range_search());
+  EXPECT_TRUE(range.uses_packed_range_search());
   expect_range_lookup_matches_linear(range, dats, probes);
 }
 
@@ -744,6 +746,31 @@ TEST_F(IKDictionaryCacheTest, range_lookup_falls_back_for_unsorted_ranges)
 
   EXPECT_FALSE(range.uses_binary_range_search());
   expect_range_lookup_matches_linear(range, dats, {"A", "AB", "B", "C", "D", "DA", "F", "G"});
+}
+
+TEST_F(IKDictionaryCacheTest, range_lookup_keeps_long_boundary_comparison)
+{
+  ObFTDAT *dat_a = nullptr;
+  ObFTDAT *dat_g = nullptr;
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"ABCDEA", "ABCDEZ"}, dat_a));
+  ASSERT_EQ(OB_SUCCESS, build_dat(dat_allocator_, {"ABCDGA", "ABCDGZ"}, dat_g));
+
+  const std::vector<ObFTDAT *> dats = {dat_a, dat_g};
+  ObFTRangeDict range(dat_allocator_,
+                      nullptr,
+                      ObFTDictDesc(ObString::make_string("ik-range-long-boundary-test"),
+                                   ObFTDictType::DICT_IK_MAIN,
+                                   ObCharsetType::CHARSET_UTF8MB4,
+                                   ObCollationType::CS_TYPE_UTF8MB4_BIN));
+  ObSEArray<ObFTDAT *, 2> dat_blocks;
+  for (ObFTDAT *dat : dats) {
+    ASSERT_EQ(OB_SUCCESS, dat_blocks.push_back(dat));
+  }
+  ASSERT_EQ(OB_SUCCESS, range.build_dict_from_dat_blocks(dat_blocks));
+  ASSERT_TRUE(range.uses_binary_range_search());
+  EXPECT_FALSE(range.uses_packed_range_search());
+  expect_range_lookup_matches_linear(
+      range, dats, {"ABCD", "ABCDE", "ABCDEA", "ABCDEM", "ABCDEZ", "ABCDG", "ABCDGA", "ABCDGM"});
 }
 
 TEST_F(IKDictionaryCacheTest, range_lookup_preserves_first_match_for_overlapping_ranges)

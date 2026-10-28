@@ -18,6 +18,7 @@
 
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
+#include "storage/fts/ob_beng_ft_parser.h"
 #include "storage/fts/ob_fts_stop_word.h"
 
 namespace oceanbase
@@ -244,6 +245,47 @@ TEST_F(WordAggregationTest, helper_reuse_clears_only_previous_document)
   ASSERT_EQ(OB_SUCCESS, helper.segment(meta_, "xy", 2, document_length, words_));
   EXPECT_EQ(Entries({{"xy", 1}}), entries(words_));
   EXPECT_EQ(1, document_length);
+}
+
+TEST_F(WordAggregationTest, beng_iterator_preserves_normalized_token_sequence)
+{
+  const std::string text =
+      "The quick brown fox jumps over the lazy dog. "
+      "Full-text search indexing requires efficient tokenization on the hot path. "
+      "Token token TOKEN";
+  const std::vector<std::string> expected = {
+      "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
+      "full", "text", "search", "indexing", "requires", "efficient",
+      "tokenization", "on", "the", "hot", "path", "token", "token", "token"};
+
+  ObFTParserParam param;
+  param.cs_ = common::ObCharset::get_charset(common::CS_TYPE_UTF8MB4_BIN);
+  param.fulltext_ = text.data();
+  param.ft_length_ = static_cast<int64_t>(text.size());
+  param.parser_version_ = 1;
+  param.allocator_ = &allocator_;
+  ObBasicEnglishFTParserDesc desc;
+  ObITokenIterator *iter = nullptr;
+  ASSERT_EQ(OB_SUCCESS, desc.segment(&param, iter));
+  ASSERT_NE(nullptr, iter);
+
+  std::vector<std::string> actual;
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret)) {
+    const char *word = nullptr;
+    int64_t word_len = 0;
+    int64_t char_len = 0;
+    int64_t word_freq = 0;
+    ret = iter->get_next_token(word, word_len, char_len, word_freq);
+    if (OB_SUCC(ret)) {
+      actual.emplace_back(word, static_cast<size_t>(word_len));
+      EXPECT_EQ(word_len, char_len);
+      EXPECT_EQ(1, word_freq);
+    }
+  }
+  EXPECT_EQ(OB_ITER_END, ret);
+  EXPECT_EQ(expected, actual);
+  desc.free_token_iter(&param, iter);
 }
 
 } // namespace

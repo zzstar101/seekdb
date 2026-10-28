@@ -93,6 +93,37 @@ template <ObCharsetType CS_TYPE>
       << " actual ret/type=" << actual_ret << '/' << static_cast<int>(actual_type);
 }
 
+::testing::AssertionResult prepare_matches_legacy(const ObCharsetType cs_type,
+                                                   const ObCollationType coll_type,
+                                                   const char *input,
+                                                   const int64_t input_len)
+{
+  uint8_t expected_len = 0;
+  uint8_t actual_len = 0;
+  CharType expected_type = static_cast<CharType>(-1);
+  CharType actual_type = static_cast<CharType>(-1);
+  int64_t first_valid_len = 0;
+  int expected_ret = ObCharset::first_valid_char(coll_type, input, input_len, first_valid_len);
+  if (OB_SUCC(expected_ret)) {
+    expected_len = static_cast<uint8_t>(first_valid_len);
+    expected_ret = ObFTCharUtil::classify_first_char(
+        coll_type, input, expected_len, expected_type);
+  }
+  const int actual_ret = ObFTCharUtil::prepare_first_char(
+      cs_type, coll_type, input, input_len, actual_len, actual_type);
+  if (expected_ret == actual_ret
+      && (OB_SUCCESS != expected_ret
+          || (expected_len == actual_len && expected_type == actual_type))) {
+    return ::testing::AssertionSuccess();
+  }
+  return ::testing::AssertionFailure()
+      << "length=" << input_len
+      << " expected ret/len/type=" << expected_ret << '/'
+      << static_cast<int>(expected_len) << '/' << static_cast<int>(expected_type)
+      << " actual ret/len/type=" << actual_ret << '/'
+      << static_cast<int>(actual_len) << '/' << static_cast<int>(actual_type);
+}
+
 TEST(CharClassificationTest, every_valid_utf8_scalar_matches_legacy)
 {
   for (uint32_t codepoint = 0; codepoint <= 0x10ffff; ++codepoint) {
@@ -139,6 +170,53 @@ TEST(CharClassificationTest, utf8_invalid_and_truncated_inputs_keep_errors_and_t
   }
   EXPECT_TRUE(matches_legacy<CHARSET_UTF8MB4>(nullptr, 0));
   EXPECT_TRUE(matches_legacy<CHARSET_UTF8MB4>(nullptr, 1));
+}
+
+TEST(CharClassificationTest, utf8_single_decode_preserves_validation_and_classification)
+{
+  const uint32_t boundary_codepoints[] = {
+      0x0000, 0x007f, 0x0080, 0x07ff, 0x0800, 0x4e00, 0xffff,
+      0x10000, 0x1f600, 0x10ffff};
+  for (const uint32_t codepoint : boundary_codepoints) {
+    unsigned char bytes[4] = {};
+    const int length = common::ob_charset_encode_unicode<CHARSET_UTF8MB4>(
+        codepoint, bytes, bytes + sizeof(bytes));
+    ASSERT_GT(length, 0) << "codepoint=" << codepoint;
+    ASSERT_TRUE(prepare_matches_legacy(
+        CHARSET_UTF8MB4,
+        CS_TYPE_UTF8MB4_BIN,
+        reinterpret_cast<const char *>(bytes),
+        length)) << "codepoint=" << codepoint;
+    for (int64_t truncated = 0; truncated < length; ++truncated) {
+      ASSERT_TRUE(prepare_matches_legacy(
+          CHARSET_UTF8MB4,
+          CS_TYPE_UTF8MB4_BIN,
+          reinterpret_cast<const char *>(bytes),
+          truncated)) << "codepoint=" << codepoint << " truncated=" << truncated;
+    }
+  }
+
+  struct InvalidInput
+  {
+    const char *bytes;
+    int64_t length;
+  };
+  const InvalidInput invalid_inputs[] = {
+      {nullptr, 0},
+      {"", 0},
+      {"\x80", 1},
+      {"\xc0\x80", 2},
+      {"\xc2" "A", 2},
+      {"\xe0\x80\x80", 3},
+      {"\xed\xa0\x80", 3},
+      {"\xf0\x80\x80\x80", 4},
+      {"\xf4\x90\x80\x80", 4},
+      {"\xff", 1},
+  };
+  for (const InvalidInput &input : invalid_inputs) {
+    ASSERT_TRUE(prepare_matches_legacy(
+        CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, input.bytes, input.length));
+  }
 }
 
 TEST(CharClassificationTest, every_utf16_code_unit_keeps_existing_behavior)
