@@ -1282,7 +1282,6 @@ TEST(ProductionTokenIterBatchTest, shared_frame_payload_is_copied_per_iterator)
 TEST(ProductionTokenIterBatchTest, shared_frame_long_payload_grows_owned_buffer)
 {
   common::ObArenaAllocator allocator;
-  CountingAllocator counting(allocator);
   ObTextRetrievalDaaTTokenIter first;
   ObTextRetrievalDaaTTokenIter second;
   const std::vector<std::string> expected = {
@@ -1299,9 +1298,9 @@ TEST(ProductionTokenIterBatchTest, shared_frame_long_payload_grows_owned_buffer)
   shared_source.datums_ = shared_datums.data();
 
   auto init_iterator = [&](ObTextRetrievalDaaTTokenIter &iter) {
-    iter.allocator_ = &counting;
+    iter.allocator_ = &allocator;
     iter.max_batch_size_ = batch_count;
-    iter.owned_batch_datums_.set_allocator(&counting);
+    iter.owned_batch_datums_.set_allocator(&allocator);
     ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.init(batch_count));
     ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_count));
   };
@@ -1316,10 +1315,12 @@ TEST(ProductionTokenIterBatchTest, shared_frame_long_payload_grows_owned_buffer)
       shared_source, nullptr, nullptr, batch_count, second_count));
   ASSERT_EQ(batch_count, first_count);
   ASSERT_EQ(batch_count, second_count);
-  const int64_t alloc_calls = counting.alloc_calls();
+  const int64_t retained_capacity = first.owned_payload_capacity_;
+  char *retained_buffer = first.owned_payload_buf_;
   ASSERT_EQ(OB_SUCCESS, first.build_owned_doc_id_batch(
       shared_source, nullptr, nullptr, batch_count, first_count));
-  EXPECT_EQ(alloc_calls, counting.alloc_calls());
+  EXPECT_EQ(retained_capacity, first.owned_payload_capacity_);
+  EXPECT_EQ(retained_buffer, first.owned_payload_buf_);
 
   for (std::string &value : shared_payload) {
     std::fill(value.begin(), value.end(), 'z');
