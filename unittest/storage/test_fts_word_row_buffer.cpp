@@ -504,8 +504,10 @@ TEST_F(FTSWordRowBufferTest, scratch_map_reuses_exact_bucket_layout_and_preserve
     int64_t row_count = 0;
     ASSERT_EQ(OB_SUCCESS, buffer.get_next_batch(rows, row_count, oracle_rows.count()));
     ASSERT_EQ(oracle_rows.count(), row_count);
-    int64_t aaa_count = 0;
-    int64_t bbb_count = 0;
+    int64_t aaa_row_count = 0;
+    int64_t bbb_row_count = 0;
+    int64_t aaa_frequency = 0;
+    int64_t bbb_frequency = 0;
     for (int64_t i = 0; i < row_count; ++i) {
       const blocksstable::ObDatumRow &oracle = *oracle_rows.at(i);
       const blocksstable::ObStorageDatum *actual =
@@ -518,14 +520,23 @@ TEST_F(FTSWordRowBufferTest, scratch_map_reuses_exact_bucket_layout_and_preserve
       EXPECT_EQ(oracle.storage_datums_[3].get_uint(), actual[3].get_uint());
       if (0 == doc_idx) {
         const std::string word = as_string(actual[0].get_string());
-        aaa_count += "aaa" == word ? 1 : 0;
-        bbb_count += "bbb" == word ? 1 : 0;
+        if ("aaa" == word) {
+          ++aaa_row_count;
+          aaa_frequency = actual[2].get_uint();
+        } else if ("bbb" == word) {
+          ++bbb_row_count;
+          bbb_frequency = actual[2].get_uint();
+        }
         EXPECT_EQ(6, actual[3].get_uint());
       }
     }
     if (0 == doc_idx) {
-      EXPECT_EQ(3, aaa_count);
-      EXPECT_EQ(2, bbb_count);
+      // Duplicate tokens are represented by one row whose third column is the
+      // aggregate frequency, so each word should appear exactly once.
+      EXPECT_EQ(1, aaa_row_count);
+      EXPECT_EQ(1, bbb_row_count);
+      EXPECT_EQ(3, aaa_frequency);
+      EXPECT_EQ(2, bbb_frequency);
     }
     EXPECT_EQ(0, buffer.get_pending_row_count());
     buffer.reuse();

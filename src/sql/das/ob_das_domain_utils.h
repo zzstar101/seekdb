@@ -65,7 +65,7 @@ public:
 
   TO_STRING_KV(K_(capacity), K_(row_count), K_(row_idx), KP_(datums),
                "word_map_bucket_count", get_scratch_word_map_bucket_count(),
-               "word_map_create_count", K_(word_map_create_count));
+               K_(word_map_create_count));
 private:
   int reserve_rows(common::ObIAllocator &allocator, const int64_t need_rows);
   int prepare_word_map(const int64_t bucket_count);
@@ -80,8 +80,9 @@ private:
   int64_t row_count_;
   int64_t row_idx_;
   int64_t retained_bytes_;
-  // Document-local parser workspace. The bucket array is retained only while
-  // the next document requests the same exact prime bucket count.
+  // Document-local parser workspace. SimpleAllocer has a zero spare-block
+  // limit here, so clear/destroy release node blocks; only the bounded bucket
+  // array survives reuse, and it is retained only for the same prime count.
   storage::ObFTWordMap word_map_;
   int64_t word_map_create_count_;
 
