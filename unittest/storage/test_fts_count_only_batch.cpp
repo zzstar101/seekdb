@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -38,31 +39,60 @@ class CountingAllocator final : public ObIAllocator
 {
 public:
   explicit CountingAllocator(ObIAllocator &delegate)
-    : delegate_(&delegate), alloc_calls_(0)
+    : delegate_(&delegate),
+      alloc_calls_(0),
+      free_calls_(0),
+      invalid_free_calls_(0),
+      live_allocations_()
   {
   }
 
   virtual void *alloc(const int64_t size) override
   {
     ++alloc_calls_;
-    return delegate_->alloc(size);
+    void *ptr = delegate_->alloc(size);
+    if (OB_NOT_NULL(ptr)) {
+      live_allocations_.insert(ptr);
+    }
+    return ptr;
   }
 
   virtual void *alloc(const int64_t size, const common::ObMemAttr &attr) override
   {
     ++alloc_calls_;
-    return delegate_->alloc(size, attr);
+    void *ptr = delegate_->alloc(size, attr);
+    if (OB_NOT_NULL(ptr)) {
+      live_allocations_.insert(ptr);
+    }
+    return ptr;
   }
 
-  virtual void free(void *ptr) override { delegate_->free(ptr); }
+  virtual void free(void *ptr) override
+  {
+    if (OB_NOT_NULL(ptr)) {
+      if (0 == live_allocations_.erase(ptr)) {
+        ++invalid_free_calls_;
+      } else {
+        ++free_calls_;
+        delegate_->free(ptr);
+      }
+    }
+  }
+
   virtual int64_t total() const override { return delegate_->total(); }
   virtual int64_t used() const override { return delegate_->used(); }
 
   int64_t alloc_calls() const { return alloc_calls_; }
+  int64_t free_calls() const { return free_calls_; }
+  int64_t invalid_free_calls() const { return invalid_free_calls_; }
+  int64_t live_allocations() const { return static_cast<int64_t>(live_allocations_.size()); }
 
 private:
   ObIAllocator *delegate_;
   int64_t alloc_calls_;
+  int64_t free_calls_;
+  int64_t invalid_free_calls_;
+  std::set<void *> live_allocations_;
 };
 
 class FakeBatchDimIter final : public ObISRDaaTDimIter
@@ -218,6 +248,80 @@ private:
   int64_t batch_size_;
   int64_t batch_calls_;
   int64_t fail_on_call_;
+};
+
+class OverwritingBinaryBatchDimIter final : public ObISRDaaTDimIter
+{
+public:
+  OverwritingBinaryBatchDimIter(
+      const std::vector<std::optional<std::string>> &ids,
+      const int64_t batch_size)
+    : ids_(ids),
+      datums_(batch_size),
+      payload_(),
+      views_(batch_size),
+      next_idx_(0),
+      batch_size_(batch_size)
+  {
+    int64_t max_length = 1;
+    for (const std::optional<std::string> &id : ids_) {
+      if (id.has_value()) {
+        max_length = MAX(max_length, static_cast<int64_t>(id->size()));
+      }
+    }
+    payload_.resize(max_length * batch_size_);
+  }
+
+  virtual int get_next_row() override { return OB_NOT_IMPLEMENT; }
+  virtual int get_next_batch(const int64_t, int64_t &) override { return OB_NOT_IMPLEMENT; }
+  virtual int get_curr_score(double &) const override { return OB_NOT_IMPLEMENT; }
+  virtual int get_curr_id(const ObDatum *&) const override { return OB_NOT_IMPLEMENT; }
+  virtual bool support_batch_doc_ids() const override { return true; }
+  void reuse() { next_idx_ = 0; }
+  virtual int get_next_doc_id_batch(
+      const int64_t capacity,
+      const ObDatum **&doc_ids,
+      int64_t &count) override
+  {
+    int ret = OB_SUCCESS;
+    doc_ids = nullptr;
+    count = 0;
+    // Every refill overwrites the same datum objects and raw payload buffer.
+    for (int64_t i = 0; i < batch_size_; ++i) {
+      datums_[i].set_null();
+      views_[i] = nullptr;
+    }
+    const int64_t remaining = static_cast<int64_t>(ids_.size()) - next_idx_;
+    if (remaining <= 0) {
+      ret = OB_ITER_END;
+    } else {
+      count = MIN(capacity, MIN(batch_size_, remaining));
+      int64_t payload_offset = 0;
+      for (int64_t i = 0; i < count; ++i) {
+        const std::optional<std::string> &id = ids_[next_idx_ + i];
+        if (id.has_value()) {
+          char *payload = payload_.data() + payload_offset;
+          if (!id->empty()) {
+            MEMCPY(payload, id->data(), id->size());
+          }
+          datums_[i].set_string(payload, static_cast<uint32_t>(id->size()));
+          payload_offset += static_cast<int64_t>(id->size());
+          views_[i] = &datums_[i];
+        }
+      }
+      next_idx_ += count;
+      doc_ids = views_.data();
+    }
+    return ret;
+  }
+
+private:
+  std::vector<std::optional<std::string>> ids_;
+  std::vector<ObDatum> datums_;
+  std::vector<char> payload_;
+  std::vector<const ObDatum *> views_;
+  int64_t next_idx_;
+  int64_t batch_size_;
 };
 
 using IdList = std::vector<std::optional<uint64_t>>;
@@ -384,6 +488,77 @@ protected:
         chunks.push_back(batch_count);
         total += batch_count;
       }
+    }
+    ASSERT_TRUE(ended);
+    int64_t terminal_count = -1;
+    EXPECT_EQ(OB_ITER_END, merger.get_next_distinct_count(capacity, terminal_count));
+    EXPECT_EQ(0, terminal_count);
+  }
+
+  void scan_bulk_count(
+      ObSRDaaTBatchIdMerger &merger,
+      const int64_t capacity,
+      int64_t &total)
+  {
+    total = 0;
+    bool ended = false;
+    for (int64_t call = 0; !ended && call < 1000000; ++call) {
+      int64_t count = 0;
+      const int ret = merger.get_next_distinct_count(capacity, count);
+      ASSERT_TRUE(OB_SUCCESS == ret || OB_ITER_END == ret);
+      ASSERT_GE(count, 0);
+      ASSERT_LE(count, capacity);
+      if (OB_SUCCESS == ret) {
+        ASSERT_EQ(capacity, count);
+      }
+      total += count;
+      ended = OB_ITER_END == ret;
+    }
+    ASSERT_TRUE(ended);
+    int64_t terminal_count = -1;
+    EXPECT_EQ(OB_ITER_END, merger.get_next_distinct_count(capacity, terminal_count));
+    EXPECT_EQ(0, terminal_count);
+  }
+
+  void run_overwriting_binary_bulk_count(
+      const std::vector<StringIdList> &inputs,
+      const int64_t batch_size,
+      const int64_t capacity,
+      int64_t &total)
+  {
+    common::ObArenaAllocator allocator;
+    common::ObSEArray<ObISRDaaTDimIter *, 4> dim_iters;
+    common::ObFixedArray<const ObDatum *, ObIAllocator> current_ids;
+    std::vector<std::unique_ptr<OverwritingBinaryBatchDimIter>> owned_iters;
+    owned_iters.reserve(inputs.size());
+    for (const StringIdList &ids : inputs) {
+      owned_iters.emplace_back(new OverwritingBinaryBatchDimIter(ids, batch_size));
+      ASSERT_EQ(OB_SUCCESS, dim_iters.push_back(owned_iters.back().get()));
+    }
+    current_ids.set_allocator(&allocator);
+    ASSERT_EQ(OB_SUCCESS, current_ids.init(dim_iters.count()));
+    ASSERT_EQ(OB_SUCCESS, current_ids.prepare_allocate(dim_iters.count()));
+    ObSRMergeCmp cmp;
+    sql::ObDatumMeta id_meta;
+    id_meta.type_ = ObVarcharType;
+    id_meta.cs_type_ = common::CS_TYPE_BINARY;
+    ASSERT_EQ(OB_SUCCESS, cmp.init(id_meta, &current_ids));
+    ObSRDaaTBatchIdMerger merger;
+    ASSERT_EQ(OB_SUCCESS, merger.init(dim_iters, allocator, batch_size, cmp, nullptr, current_ids));
+
+    total = 0;
+    bool ended = false;
+    for (int64_t call = 0; !ended && call < 1000000; ++call) {
+      int64_t count = 0;
+      const int ret = merger.get_next_distinct_count(capacity, count);
+      ASSERT_TRUE(OB_SUCCESS == ret || OB_ITER_END == ret);
+      ASSERT_GE(count, 0);
+      ASSERT_LE(count, capacity);
+      if (OB_SUCCESS == ret) {
+        ASSERT_EQ(capacity, count);
+      }
+      total += count;
+      ended = OB_ITER_END == ret;
     }
     ASSERT_TRUE(ended);
     int64_t terminal_count = -1;
@@ -604,6 +779,95 @@ TEST_F(CountOnlyBatchMergerTest, bulk_count_exact_capacity_and_final_partial_bat
   run_bulk_count({{1, 2, 3}}, 1, 2, partial_chunks, partial_count);
   EXPECT_EQ(3, partial_count);
   EXPECT_EQ(std::vector<int64_t>({2, 1}), partial_chunks);
+}
+
+TEST_F(CountOnlyBatchMergerTest, bulk_count_survives_reused_binary_batch_storage)
+{
+  // Duplicate "c" crosses refill boundaries in every dimension. At capacity 4, the final
+  // distinct id "d" comes only from the third dimension.
+  const std::vector<StringIdList> inputs = {
+      {std::string("a"), std::string("c"), std::string("c"), std::string("f")},
+      {std::string("a"), std::string("b"), std::string("c"), std::string("e")},
+      {std::string("b"), std::string("c"), std::string("d"), std::string("f")}};
+  for (const int64_t batch_size : {1, 2, 3, 4}) {
+    SCOPED_TRACE(batch_size);
+    for (const int64_t capacity : {1, 2, 4, 6}) {
+      SCOPED_TRACE(capacity);
+      int64_t total = 0;
+      run_overwriting_binary_bulk_count(inputs, batch_size, capacity, total);
+      EXPECT_EQ(6, total);
+    }
+  }
+}
+
+TEST_F(CountOnlyBatchMergerTest, bulk_boundary_buffer_tracks_allocator_ownership)
+{
+  const std::string long_a = std::string("a-") + std::string(158, 'x');
+  const std::string long_b = std::string("b-") + std::string(158, 'y');
+  common::ObArenaAllocator first_arena;
+  common::ObArenaAllocator second_arena;
+  CountingAllocator first_allocator(first_arena);
+  CountingAllocator second_allocator(second_arena);
+  common::ObFixedArray<const ObDatum *, ObIAllocator> current_ids;
+  current_ids.set_allocator(&first_allocator);
+  ASSERT_EQ(OB_SUCCESS, current_ids.init(2));
+  ASSERT_EQ(OB_SUCCESS, current_ids.prepare_allocate(2));
+
+  std::vector<StringIdList> inputs = {
+      {long_a, long_a, long_b},
+      {long_a, long_b, long_b}};
+  std::unique_ptr<OverwritingBinaryBatchDimIter> first(
+      new OverwritingBinaryBatchDimIter(inputs[0], 1));
+  std::unique_ptr<OverwritingBinaryBatchDimIter> second(
+      new OverwritingBinaryBatchDimIter(inputs[1], 1));
+  common::ObSEArray<ObISRDaaTDimIter *, 2> dim_iters;
+  ASSERT_EQ(OB_SUCCESS, dim_iters.push_back(first.get()));
+  ASSERT_EQ(OB_SUCCESS, dim_iters.push_back(second.get()));
+  ObSRMergeCmp cmp;
+  sql::ObDatumMeta id_meta;
+  id_meta.type_ = ObVarcharType;
+  id_meta.cs_type_ = common::CS_TYPE_BINARY;
+  ASSERT_EQ(OB_SUCCESS, cmp.init(id_meta, &current_ids));
+  ObSRDaaTBatchIdMerger merger;
+
+  ASSERT_EQ(OB_SUCCESS, merger.init(dim_iters, first_allocator, 1, cmp, nullptr, current_ids));
+  const int64_t allocs_before_first_scan = first_allocator.alloc_calls();
+  int64_t total = 0;
+  scan_bulk_count(merger, 1, total);
+  EXPECT_EQ(2, total);
+  EXPECT_EQ(allocs_before_first_scan + 1, first_allocator.alloc_calls());
+
+  first->reuse();
+  second->reuse();
+  merger.reuse();
+  const int64_t allocs_after_first_scan = first_allocator.alloc_calls();
+  ASSERT_EQ(OB_SUCCESS, merger.init(dim_iters, first_allocator, 1, cmp, nullptr, current_ids));
+  scan_bulk_count(merger, 1, total);
+  EXPECT_EQ(2, total);
+  EXPECT_EQ(allocs_after_first_scan, first_allocator.alloc_calls());
+
+  first->reuse();
+  second->reuse();
+  merger.reuse();
+  const int64_t live_before_switch = first_allocator.live_allocations();
+  ASSERT_EQ(OB_SUCCESS, merger.init(dim_iters, second_allocator, 1, cmp, nullptr, current_ids));
+  EXPECT_EQ(live_before_switch - 1, first_allocator.live_allocations());
+  EXPECT_EQ(0, second_allocator.alloc_calls());
+  scan_bulk_count(merger, 1, total);
+  EXPECT_EQ(2, total);
+  EXPECT_EQ(1, second_allocator.alloc_calls());
+  EXPECT_EQ(1, second_allocator.live_allocations());
+
+  merger.reset();
+  EXPECT_EQ(0, second_allocator.live_allocations());
+  EXPECT_EQ(1, second_allocator.free_calls());
+  EXPECT_EQ(1, first_allocator.live_allocations());
+  current_ids.reset();
+  EXPECT_EQ(0, first_allocator.live_allocations());
+  EXPECT_EQ(first_allocator.alloc_calls(), first_allocator.free_calls());
+  EXPECT_EQ(second_allocator.alloc_calls(), second_allocator.free_calls());
+  EXPECT_EQ(0, first_allocator.invalid_free_calls());
+  EXPECT_EQ(0, second_allocator.invalid_free_calls());
 }
 
 TEST_F(CountOnlyBatchMergerTest, outer_count_extreme_offset_is_not_an_overflow)
