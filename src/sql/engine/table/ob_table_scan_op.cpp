@@ -2220,7 +2220,12 @@ int ObTableScanOp::inner_get_next_batch(const int64_t max_row_cnt)
 int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
 {
   int ret = OB_SUCCESS;
-  const bool is_fts_expansion = MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_;
+  // The inverted index is ordered by token, so sample its generated word rows
+  // as well. Splitting on the unparsed document text gives unrelated range
+  // boundaries and sends most words to the same PX receiver. The doc-word
+  // auxiliary keeps source sampling because its leading key is the document ID.
+  const bool is_fts_expansion = MY_SPEC.is_fts_ddl_
+      && (nullptr == tsc_rtdef_.scan_rtdef_.sample_info_ || MY_SPEC.is_fts_index_aux_);
   clear_evaluated_flag();
   int64_t batch_size = min(max_row_cnt, MY_SPEC.max_batch_size_);
   if (OB_UNLIKELY(0 == limit_param_.limit_)) {
@@ -2242,7 +2247,7 @@ int ObTableScanOp::inner_get_next_batch_for_tsc(const int64_t max_row_cnt)
     brs_.end_ = false;
     if (0 == batch_size) {
       brs_.end_ = true;
-    } else if (MY_SPEC.is_fts_ddl_ && nullptr == tsc_rtdef_.scan_rtdef_.sample_info_) {
+    } else if (is_fts_expansion) {
       ret = inner_get_next_fts_index_batch(batch_size);
     } else if (MY_SPEC.is_fts_ddl_) {
       // Sampling precedes expansion and rescans the same scalar source. Expose

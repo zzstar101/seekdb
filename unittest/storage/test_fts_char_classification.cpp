@@ -104,7 +104,7 @@ template <ObCharsetType CS_TYPE>
   CharType actual_type = static_cast<CharType>(-1);
   int64_t first_valid_len = 0;
   int expected_ret = ObCharset::first_valid_char(coll_type, input, input_len, first_valid_len);
-  if (OB_SUCC(expected_ret)) {
+  if (OB_SUCCESS == expected_ret) {
     expected_len = static_cast<uint8_t>(first_valid_len);
     expected_ret = ObFTCharUtil::classify_first_char(
         coll_type, input, expected_len, expected_type);
@@ -138,6 +138,8 @@ TEST(CharClassificationTest, every_valid_utf8_scalar_matches_legacy)
     ASSERT_TRUE(matches_legacy<CHARSET_UTF8MB4>(
         reinterpret_cast<const char *>(bytes), static_cast<uint8_t>(length)))
         << "codepoint=" << codepoint;
+    ASSERT_TRUE(prepare_matches_legacy(CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN,
+        reinterpret_cast<const char *>(bytes), length)) << "codepoint=" << codepoint;
   }
 }
 
