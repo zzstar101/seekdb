@@ -2795,13 +2795,13 @@ int ObTableScanOp::add_ddl_column_checksum_batch(const int64_t row_count)
     if (OB_FAIL(ensure_ddl_column_checksum_array())) {
     } else if (row_count > 0 && OB_FAIL(get_ddl_checksum_task_idx(task_idx))) {
       LOG_WARN("get ddl checksum task index failed", K(ret));
-    } else if (row_count > 0 && OB_UNLIKELY(col_need_reshape_.count() != cnt)) {
+    } else if (OB_UNLIKELY(col_need_reshape_.count() != cnt)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("error unexpected, column cnt mismatch", K(ret), K(cnt), K(col_need_reshape_.count()));
     }
 
     ObDatum store_datum;
-    for (int64_t i = 0; OB_SUCC(ret) && row_count > 0 && i < MY_SPEC.output_.count(); ++i) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.output_.count(); ++i) {
       const ObExpr *e = MY_SPEC.output_[i];
       if (OB_ISNULL(e)) {
         ret = OB_ERR_UNEXPECTED;
@@ -2824,8 +2824,8 @@ int ObTableScanOp::add_ddl_column_checksum_batch(const int64_t row_count)
         }
       }
     }
-    if (OB_SUCC(ret) && row_count > 0) {
-      ddl_checksum_accumulated_ = true;
+    if (OB_SUCC(ret)) {
+      ddl_checksum_accumulated_ = ddl_checksum_accumulated_ || row_count > 0;
       LOG_DEBUG("add ddl column checksum",
                 K(MY_CTDEF.get_das_output_exprs()),
                 K(MY_CTDEF.get_full_acccess_cids()),
