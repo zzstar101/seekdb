@@ -1031,3 +1031,47 @@ JSON 树序列化成二进制 JSON。本轮增加了进程内结果缓存（`src
 完整基准两轮（`SKIP_LOAD=0`，命中数 8001/11000/7332/20 全部不变）：
 tokenize ik 0.0753-0.1119 ms、beng 0.0664-0.0753 ms（此前 0.1498 / 0.1057）。
 按三类等权推算，分词类改善率从约 10% 提升到约 24%，综合提升率约 49.9%-50.1%，处于压线区间。
+
+---
+
+## 16 对照上游 4.6.0 的 FTS Token Map / RLE 实现
+
+### 16.1 对照结论：行缓存架构本分支已经具备
+
+上游 `v4.6.0_CE src/sql/das/ob_das_domain_utils.cpp` 的 `ObFTIndexRowCache` 与我们的
+`ObFTIndexRowCache` + `FTSWordRowBuffer`（`src/sql/das/ob_das_domain_utils.h:39-76`）逐项对比：
+
+| 能力 | 上游 4.6.0 | 本分支 |
+|---|---|---|
+| 解析器实例复用 | `helper_` 常驻，`prepare_parser` 仅换 text | 已有（`ObFTIndexRowCache::helper_` 常驻，逐文档 reset scratch） |
+| 每个文档的行容器 | 常驻 `datum_row_` + 行池 | 已有（`datums_` 批量池，`reserve_rows` 扩容） |
+| token 容器 | 常驻 `token_arr_` 并 `reserve` | 已有（`FTSWordRowBuffer` 直接写 datum 池，无中间 token 数组） |
+| token 映射表 | `ft_token_map_` 常驻，逐文档 `reuse()` | **缺**：每文档 `ObFTWordMap::create()` 新建（`ob_das_domain_utils.cpp:98-140`） |
+| 文档内 token 排序 | `ft_doc_token_need_sort_` | 无 |
+| 每行编码 | CONST/RLE 编码 + 5 列（含 POS_LIST） | 4 列、无编码层改写 |
+
+### 16.2 已实现并实测的可复用热路径：常驻 token 映射表
+
+把 `FTSWordRowBuffer` 的 `ObFTWordMap` 提升为成员：一次 `create(997)`，之后每文档 `reuse()`，
+消除每文档的哈希桶分配与重哈希。改动 21 行，语义等价（每文档开始前清空）。
+
+实测（20,000 行 `ALTER TABLE ... ADD FULLTEXT INDEX (content) WITH PARSER ik`，
+同机交替 6 轮 / 每个二进制 3+3 轮）：
+
+| 二进制 | 各轮耗时 (s) | 中位数 |
+|---|---|---|
+| 基线 `037587ffe` 前 | 2.83 / 3.17 / 2.09 / 2.51 / 2.19 / 2.49 | **2.50** |
+| 常驻映射表 | 2.32 / 2.39 / 2.29 / 3.03 / 2.50 / 3.01 | **2.45** |
+
+差异 ≤2%，落在本机 DDL 构建的噪声带（同二进制极差 2.09–3.17 s，±25%）之内，**不构成收益**。
+每轮 `MATCH(content) AGAINST('数据库')` 命中数均为 3333，与基线一致。
+
+### 16.3 结论
+
+行生成层（分词结果 → datum 行）在本分支已经不是构建热点：上一轮全链路采样显示
+`MATERIAL` 43%、单流写入 33%、排序 7%、分词 4%。上游与本分支的真正差距不在 token map，
+而在 ①每行 CONST/RLE 编码（消除 35 行/文档里重复的 doc_id/doc_len 字节）与 ②单流有序写入
+（`SORT → EXCHANGE IN MERGE SORT → MATERIAL → INSERT`，见 §15）。两者都需要存储编码器或
+计划层改造，无法以“可复用热路径”的方式低风险移植。
+
+因此本节记录的改动已回滚，**不提交**；保留 §15 与本节作为“这条路已排除”的证据。
