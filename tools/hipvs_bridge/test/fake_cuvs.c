@@ -56,6 +56,8 @@ cuvsError_t cuvsCagraSearchParamsCreate(cuvsCagraSearchParams_t* p) {
 cuvsError_t cuvsCagraSearchParamsDestroy(cuvsCagraSearchParams_t p) { free(p); return CUVS_SUCCESS; }
 
 static struct fake_index g_last;
+static long g_sp_itopk;
+static long g_sp_width;
 
 cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
                            DLManagedTensor* ds, cuvsCagraIndex_t idx) {
@@ -71,6 +73,8 @@ cuvsError_t cuvsCagraBuild(cuvsResources_t r, cuvsCagraIndexParams_t p,
 }
 
 long fake_last_niter(void) { return (long)g_last.niter; }
+long fake_last_itopk(void) { return g_sp_itopk; }
+long fake_last_width(void) { return g_sp_width; }
 long fake_last_degree(void) { return (long)g_last.graph_degree; }
 long fake_last_inter_degree(void) { return (long)g_last.inter_degree; }
 
@@ -84,7 +88,9 @@ cuvsError_t cuvsCagraSearch(cuvsResources_t r, cuvsCagraSearchParams_t sp,
   long nq = (long)qt->dl_tensor.shape[0];
   long topk = (long)nt->dl_tensor.shape[1];
   long i, j;
-  (void)r; (void)sp; (void)f;
+  (void)r; (void)f;
+  g_sp_itopk = (long)sp->itopk_size;
+  g_sp_width = (long)sp->search_width;
 
   usleep(200); /* stand-in for device work: widens the overwrite window */
 

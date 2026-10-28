@@ -24,6 +24,7 @@
 #include <memory>
 #include <limits>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <istream>
 #include <ostream>
 #include <algorithm>
@@ -321,8 +322,25 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 }
 
 static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
+// The serialized graph is handed to cuVS as a file path, written once and read
+// back immediately.  Backing that temporary with memory instead of /tmp matters
+// on the build path: the snapshot is hundreds of MB at 250K x 128 (the graph
+// plus the ids and vectors), and the DDL clock covers the write and the read.
+static FILE *ob_cuvs_snapshot_open() {
+#if defined(__linux__) && defined(SYS_memfd_create)
+  const int fd = static_cast<int>(::syscall(SYS_memfd_create, "obcuvs_snapshot",
+                                            static_cast<unsigned>(1) /* MFD_CLOEXEC */));
+  if (fd >= 0) {
+    FILE *file = ::fdopen(fd, "w+b");
+    if (file != nullptr) { return file; }
+    ::close(fd);
+  }
+#endif
+  return ::tmpfile();
+}
+
 struct ObCuvsSnapshotFile {
-  FILE *file_ = ::tmpfile();
+  FILE *file_ = ob_cuvs_snapshot_open();
   char path_[64] = {};
   ObCuvsSnapshotFile() {
     if (file_ != nullptr) {

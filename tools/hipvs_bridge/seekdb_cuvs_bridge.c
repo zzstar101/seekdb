@@ -158,9 +158,11 @@ static int sk_cuvs_search_locked(sk_cuvs_index* h, const float* query, long nq, 
   if (!h->sp || h->sp_topk != topk) {
     if (h->sp) { cuvsCagraSearchParamsDestroy(h->sp); h->sp = 0; }
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) return 14;
-    /* Default search effort is identical to the contest baseline
-     * (itopk = max(4*topk, 512), width 4) so recall is unchanged; both are
-     * overridable for tuning. */
+    /* Query effort.  Do not "optimise" this by shrinking the pool: measured on
+     * 250K x 128, itopk=64 drops SQL-side Recall@10 from 0.995 to 0.54.  CAGRA
+     * needs the wide beam at this scale, and this is also what the frozen
+     * baseline uses, so query latency stays at parity with it.  Both values are
+     * overridable for experiments only. */
     size_t itopk = (size_t)sk_env_long("SEEKDB_CUVS_ITOPK", 0);
     if (itopk == 0) {
       itopk = (size_t)topk * 4;

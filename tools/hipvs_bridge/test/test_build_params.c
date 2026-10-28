@@ -18,6 +18,8 @@
 #include <unistd.h>
 
 long fake_last_niter(void);
+long fake_last_itopk(void);
+long fake_last_width(void);
 long fake_last_degree(void);
 long fake_last_inter_degree(void);
 
@@ -125,10 +127,42 @@ static int check_serialize(void) {
   return bad == 0 ? 0 : 1;
 }
 
+/* the query effort must stay a function of topk, not a constant: the pool has
+ * to be deep enough for the requested k with margin, and no deeper */
+/* The pool size is a recall decision, not a speed knob: itopk=64 was measured to
+ * take SQL-side Recall@10 from 0.995 to 0.54 at 250K, so the baseline's
+ * max(4*topk, 512) / width 4 is pinned here.  Changing it needs a recall run. */
+static int check_query_effort(long topk, long want_itopk, long want_width) {
+  float base[64 * 4];
+  float q[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+  unsigned ids[256];
+  float dist[256];
+  void* h;
+  long i;
+  int bad = 0;
+  for (i = 0; i < 64 * 4; i++) base[i] = (float)(i % 31) * 0.01f;
+  h = seekdb_cuvs_build(base, 64, 4);
+  if (h == NULL) return 1;
+  if (seekdb_cuvs_search(h, q, 1, topk, ids, dist) != 0) {
+    fprintf(stderr, "  FAIL search topk=%ld\n", topk);
+    bad++;
+  } else if (fake_last_itopk() != want_itopk || fake_last_width() != want_width) {
+    fprintf(stderr, "  FAIL topk=%ld want itopk=%ld/width=%ld got itopk=%ld/width=%ld\n",
+            topk, want_itopk, want_width, fake_last_itopk(), fake_last_width());
+    bad++;
+  }
+  seekdb_cuvs_free(h);
+  return bad;
+}
+
 int main(void) {
   int rc = 0;
   printf("== build parameter policy\n");
   rc |= check_tiers();
+  printf("== query effort policy\n");
+  rc |= check_query_effort(10, 512, 4);   /* the reported-QPS case */
+  rc |= check_query_effort(100, 512, 4);  /* recall@100 case */
+  rc |= check_query_effort(200, 800, 4);  /* 4x topk once topk is large */
   printf("== serialise round trip\n");
   rc |= check_serialize();
   return rc;
