@@ -97,6 +97,11 @@ public:
   // The returned pointer refers to storage owned by this merger and stays valid until the next
   // call to get_next_distinct_id().
   int get_next_distinct_id(const ObDatum *&id_datum);
+  // Counts up to capacity distinct ids in one call. This entry point is only used for the
+  // one-, two-, and three-way merges; wider merges keep using get_next_distinct_id(). A scan
+  // selects one of the two entry points. The count is meaningful only on OB_SUCCESS and
+  // OB_ITER_END; the latter may carry a non-zero count for the final partial batch.
+  int get_next_distinct_count(const int64_t capacity, int64_t &count);
 private:
   int load_batch(const int64_t iter_idx);
   int advance(const int64_t iter_idx);
@@ -104,6 +109,7 @@ private:
   int get_next_from_two(const ObDatum *&id_datum);
   int get_next_from_three(const ObDatum *&id_datum);
   int get_next_from_heap(const ObDatum *&id_datum);
+  int preserve_bulk_last_id();
 private:
   ObIArray<ObISRDaaTDimIter *> *dim_iters_;
   ObSRMergeCmp *merge_cmp_;
@@ -113,6 +119,13 @@ private:
   ObFixedArray<int64_t, ObIAllocator> batch_counts_;
   ObFixedArray<int64_t, ObIAllocator> batch_positions_;
   ObDocIdExt last_id_;
+  ObIAllocator *allocator_;
+  const ObDatum *bulk_last_id_;
+  ObDatum bulk_last_id_copy_;
+  char *bulk_last_id_buf_;
+  int64_t bulk_last_id_buf_capacity_;
+  int64_t bulk_last_id_source_dim_;
+  bool has_bulk_last_id_;
   int64_t dim_cnt_;
   int64_t active_cnt_;
   int64_t batch_capacity_;
