@@ -27,6 +27,8 @@
 #include "data_plane/api/data_plane/access/ob_tablet_scan.h"
 #include "lib/container/ob_se_array.h"
 #include "query/engine/expr/ob_expr.h"
+#include "sql/das/iter/ob_das_scan_iter.h"
+#include "sql/engine/ob_exec_context.h"
 #include "storage/retrieval/ob_block_max_iter.h"
 #include "storage/retrieval/ob_sparse_daat_iter.h"
 #if defined(__clang__)
@@ -318,6 +320,66 @@ private:
   std::vector<char> payload_;
   int64_t next_idx_;
   int64_t batch_size_;
+};
+
+// Minimal DAS scan source for exercising the public DaaT batch path. It owns the values it
+// publishes and writes their descriptors into the shared expression frame on each refill.
+class FakeDASScanIter final : public sql::ObDASScanIter
+{
+public:
+  FakeDASScanIter(
+      std::vector<uint64_t> &values,
+      const int64_t batch_size,
+      sql::ObEvalCtx &eval_ctx,
+      sql::ObExpr &doc_id_expr)
+    : values_(values),
+      batch_size_(batch_size),
+      doc_id_expr_(&doc_id_expr),
+      cursor_(0),
+      fail_next_(false)
+  {
+    eval_ctx_ = &eval_ctx;
+  }
+
+  void mark_inited() { inited_ = true; }
+  void reset_source() { cursor_ = 0; }
+  void fail_next() { fail_next_ = true; }
+
+protected:
+  virtual int inner_init(sql::ObDASIterParam &) override { return OB_SUCCESS; }
+  virtual int inner_reuse() override { return OB_SUCCESS; }
+  virtual int inner_release() override { return OB_SUCCESS; }
+  virtual int inner_get_next_row() override { return OB_NOT_IMPLEMENT; }
+  virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override
+  {
+    int ret = OB_SUCCESS;
+    count = 0;
+    if (fail_next_) {
+      fail_next_ = false;
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const int64_t remaining = static_cast<int64_t>(values_.size()) - cursor_;
+      if (remaining <= 0) {
+        ret = OB_ITER_END;
+      } else {
+        count = MIN(capacity, MIN(batch_size_, remaining));
+        ObDatum *datums = doc_id_expr_->locate_batch_datums(*eval_ctx_);
+        for (int64_t i = 0; i < count; ++i) {
+          datums[i].ptr_ = reinterpret_cast<const char *>(&values_[cursor_ + i]);
+          datums[i].pack_ = sizeof(uint64_t);
+        }
+        cursor_ += count;
+      }
+    }
+    return ret;
+  }
+
+private:
+  std::vector<uint64_t> &values_;
+  int64_t batch_size_;
+  sql::ObExpr *doc_id_expr_;
+  int64_t cursor_;
+  bool fail_next_;
 };
 
 using IdList = std::vector<std::optional<uint64_t>>;
@@ -1331,6 +1393,120 @@ TEST(ProductionTokenIterBatchTest, shared_frame_long_payload_grows_owned_buffer)
     EXPECT_EQ(expected[i], std::string(first_id.ptr_, first_id.len_));
     EXPECT_EQ(expected[i], std::string(second_id.ptr_, second_id.len_));
   }
+}
+
+TEST(ProductionTokenIterBatchTest, public_batches_copy_shared_source_and_mix_with_row_api)
+{
+  constexpr int64_t batch_size = 3;
+  common::ObArenaAllocator allocator;
+  sql::ObExecContext exec_ctx(allocator);
+  sql::ObEvalCtx eval_ctx(exec_ctx, &allocator);
+  char *frame_memory = static_cast<char *>(allocator.alloc(sizeof(ObDatum) * batch_size));
+  ASSERT_NE(nullptr, frame_memory);
+  char *frames[1] = {frame_memory};
+  eval_ctx.frames_ = frames;
+  eval_ctx.set_max_batch_size(batch_size);
+  eval_ctx.reuse(batch_size);
+
+  sql::ObExpr doc_id_expr;
+  doc_id_expr.datum_meta_.type_ = ObUInt64Type;
+  doc_id_expr.datum_meta_.cs_type_ = CS_TYPE_BINARY;
+  doc_id_expr.frame_idx_ = 0;
+  doc_id_expr.datum_off_ = 0;
+  doc_id_expr.batch_result_ = 1;
+  doc_id_expr.batch_idx_mask_ = UINT64_MAX;
+
+  std::vector<uint64_t> first_values = {10, 20, 30, 40, 50};
+  std::vector<uint64_t> second_values = {70, 80, 90};
+  FakeDASScanIter first_scan(first_values, 2, eval_ctx, doc_id_expr);
+  FakeDASScanIter second_scan(second_values, 3, eval_ctx, doc_id_expr);
+  ObTextRetrievalTokenIter first_token;
+  ObTextRetrievalTokenIter second_token;
+  ObTextRetrievalDaaTTokenIter first_iter;
+  ObTextRetrievalDaaTTokenIter second_iter;
+  common::ObDatumBasicFuncs *basic_funcs =
+      ObDatumFuncs::get_basic_func(ObUInt64Type, CS_TYPE_BINARY);
+  ASSERT_NE(nullptr, basic_funcs);
+
+  auto init_iter = [&](ObTextRetrievalDaaTTokenIter &iter,
+                       ObTextRetrievalTokenIter &token_iter,
+                       FakeDASScanIter &scan) {
+    scan.mark_inited();
+    token_iter.allocator_ = &allocator;
+    token_iter.inv_idx_scan_iter_ = &scan;
+    token_iter.eval_ctx_ = &eval_ctx;
+    token_iter.inv_scan_domain_id_col_ = &doc_id_expr;
+    token_iter.max_batch_size_ = batch_size;
+    token_iter.is_inited_ = true;
+    iter.allocator_ = &allocator;
+    iter.token_iter_ = &token_iter;
+    iter.eval_ctx_ = &eval_ctx;
+    iter.inv_scan_domain_id_col_ = &doc_id_expr;
+    iter.max_batch_size_ = batch_size;
+    iter.cmp_func_ = basic_funcs->null_first_cmp_;
+    iter.owned_batch_datums_.set_allocator(&allocator);
+    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.init(batch_size));
+    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_size));
+    iter.is_inited_ = true;
+  };
+  init_iter(first_iter, first_token, first_scan);
+  init_iter(second_iter, second_token, second_scan);
+
+  const ObDatum *first_ids = nullptr;
+  int64_t first_count = 0;
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_doc_id_batch(batch_size, first_ids, first_count));
+  ASSERT_EQ(2, first_count);
+  ASSERT_NE(nullptr, first_ids);
+  EXPECT_EQ(10, first_ids[0].get_uint64());
+  EXPECT_EQ(20, first_ids[1].get_uint64());
+
+  // The second token iterator writes the same shared expression frame and payload. The first
+  // iterator's public batch must remain its private copy.
+  first_values[0] = 99;
+  const ObDatum *second_ids = nullptr;
+  int64_t second_count = 0;
+  ASSERT_EQ(OB_SUCCESS, second_iter.get_next_doc_id_batch(batch_size, second_ids, second_count));
+  ASSERT_EQ(3, second_count);
+  EXPECT_EQ(10, first_ids[0].get_uint64());
+  EXPECT_EQ(20, first_ids[1].get_uint64());
+  EXPECT_EQ(70, second_ids[0].get_uint64());
+  EXPECT_EQ(80, second_ids[1].get_uint64());
+  EXPECT_EQ(90, second_ids[2].get_uint64());
+
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_row());
+  const ObDatum *current = nullptr;
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
+  EXPECT_EQ(10, current->get_uint64());
+  uint64_t target_20 = 20;
+  ObDatum target;
+  target.ptr_ = reinterpret_cast<const char *>(&target_20);
+  target.pack_ = sizeof(uint64_t);
+  ASSERT_EQ(OB_SUCCESS, first_iter.advance_to(target));
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_curr_id(current));
+  EXPECT_EQ(20, current->get_uint64());
+
+  // Refill the first iterator from its second source batch, then prove reuse keeps the owned
+  // storage usable after the shared frame has moved on.
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_doc_id_batch(batch_size, first_ids, first_count));
+  ASSERT_EQ(2, first_count);
+  EXPECT_EQ(30, first_ids[0].get_uint64());
+  EXPECT_EQ(40, first_ids[1].get_uint64());
+  first_values[0] = 10;
+  first_iter.reuse();
+  first_scan.reset_source();
+  ASSERT_EQ(OB_SUCCESS, first_iter.get_next_doc_id_batch(batch_size, first_ids, first_count));
+  ASSERT_EQ(2, first_count);
+  EXPECT_EQ(10, first_ids[0].get_uint64());
+  EXPECT_EQ(20, first_ids[1].get_uint64());
+
+  second_scan.fail_next();
+  ASSERT_EQ(OB_ERR_UNEXPECTED,
+            second_iter.get_next_doc_id_batch(batch_size, second_ids, second_count));
+
+  first_iter.reset();
+  EXPECT_EQ(nullptr, first_iter.batch_doc_ids_);
+  EXPECT_EQ(nullptr, first_iter.owned_payload_buf_);
+  EXPECT_EQ(0, first_iter.owned_payload_capacity_);
 }
 
 } // namespace
