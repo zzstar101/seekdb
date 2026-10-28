@@ -115,7 +115,7 @@ private:
   ObSRMergeCmp *merge_cmp_;
   ObSRMergeHeap *merge_heap_;
   ObFixedArray<const ObDatum *, ObIAllocator> *current_ids_;
-  ObFixedArray<const ObDatum **, ObIAllocator> batch_ids_;
+  ObFixedArray<const ObDatum *, ObIAllocator> batch_ids_;
   ObFixedArray<int64_t, ObIAllocator> batch_counts_;
   ObFixedArray<int64_t, ObIAllocator> batch_positions_;
   ObDocIdExt last_id_;

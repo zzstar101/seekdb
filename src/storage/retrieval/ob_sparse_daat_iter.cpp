@@ -177,7 +177,7 @@ void ObSRDaaTBatchIdMerger::reset()
 int ObSRDaaTBatchIdMerger::load_batch(const int64_t iter_idx)
 {
   int ret = OB_SUCCESS;
-  const ObDatum **doc_ids = nullptr;
+  const ObDatum *doc_ids = nullptr;
   int64_t count = 0;
   if (OB_UNLIKELY(iter_idx < 0 || iter_idx >= dim_cnt_)) {
     ret = OB_INVALID_ARGUMENT;
@@ -206,7 +206,7 @@ int ObSRDaaTBatchIdMerger::load_batch(const int64_t iter_idx)
       batch_ids_[iter_idx] = doc_ids;
       batch_counts_[iter_idx] = count;
       batch_positions_[iter_idx] = 0;
-      current_ids_->at(iter_idx) = doc_ids[0];
+      current_ids_->at(iter_idx) = doc_ids;
     }
   }
   return ret;
@@ -220,7 +220,7 @@ int ObSRDaaTBatchIdMerger::advance(const int64_t iter_idx)
   } else if (OB_UNLIKELY(batch_positions_[iter_idx] >= batch_counts_[iter_idx])) {
     ret = OB_ERR_UNEXPECTED;
   } else if (++batch_positions_[iter_idx] < batch_counts_[iter_idx]) {
-    current_ids_->at(iter_idx) = batch_ids_[iter_idx][batch_positions_[iter_idx]];
+    current_ids_->at(iter_idx) = batch_ids_[iter_idx] + batch_positions_[iter_idx];
   } else if (OB_FAIL(load_batch(iter_idx))) {
   }
   return ret;

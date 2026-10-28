@@ -76,13 +76,13 @@ public:
   // interface for daat processing
   virtual int get_curr_score(double &score) const = 0;
   virtual int get_curr_id(const ObDatum *&datum) const = 0;
-  // A document-id batch is a sorted, bounded view that stays valid until the next call on the
-  // same iterator. It lets a count-only merge consume a whole inverted-index batch without
-  // materializing one datum at a time through the generic row interface.
+  // A document-id batch is a sorted, contiguous, iterator-owned view that stays valid until the
+  // next call on the same iterator. It lets a count-only merge consume a whole inverted-index
+  // batch without materializing one datum at a time through the generic row interface.
   virtual bool support_batch_doc_ids() const { return false; }
   virtual int get_next_doc_id_batch(
       const int64_t capacity,
-      const ObDatum **&doc_ids,
+      const ObDatum *&doc_ids,
       int64_t &count)
   {
     UNUSEDx(capacity, doc_ids, count);

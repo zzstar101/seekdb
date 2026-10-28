@@ -132,7 +132,7 @@ public:
   virtual bool support_batch_doc_ids() const override { return true; }
   virtual int get_next_doc_id_batch(
       const int64_t capacity,
-      const ObDatum **&doc_ids,
+      const ObDatum *&doc_ids,
       int64_t &count) override;
   virtual int advance_to(const ObDatum &id_datum) override;
   virtual int get_curr_score(double &score) const override;
@@ -150,6 +150,18 @@ public:
 private:
   int save_relevances_and_docids();
   int save_docids();
+  int build_owned_doc_id_batch(
+      const sql::ObDatumVector &source_ids,
+      const sql::ObDatumVector *source_relevances,
+      const sql::ObBitVector *skip,
+      const int64_t source_count,
+      int64_t &count);
+  int append_owned_doc_id(const ObDatum &source, const int64_t index, const int64_t copied_count);
+  int ensure_owned_payload_capacity(const int64_t required, const int64_t copied_count);
+  inline const ObDatum &get_current_id_datum() const
+  {
+    return OB_NOT_NULL(batch_doc_ids_) ? batch_doc_ids_[cur_idx_] : doc_id_[cur_idx_].get_datum();
+  }
   ObArenaAllocator *allocator_;
   ObTextRetrievalTokenIter *token_iter_;
   sql::ObEvalCtx *eval_ctx_;
@@ -160,7 +172,11 @@ private:
   int64_t count_;
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
-  ObFixedArray<const ObDatum *, ObIAllocator> batch_doc_ids_;
+  ObFixedArray<ObDatum, ObIAllocator> owned_batch_datums_;
+  const ObDatum *batch_doc_ids_; // contiguous owned view returned by the batch API
+  char *owned_payload_buf_;
+  int64_t owned_payload_capacity_;
+  int64_t owned_payload_used_;
   common::ObDatumCmpFuncType cmp_func_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);

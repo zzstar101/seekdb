@@ -26,7 +26,21 @@
 
 #include "data_plane/api/data_plane/access/ob_tablet_scan.h"
 #include "lib/container/ob_se_array.h"
+#include "query/engine/expr/ob_expr.h"
+#include "storage/retrieval/ob_block_max_iter.h"
 #include "storage/retrieval/ob_sparse_daat_iter.h"
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
+// The production token iterator intentionally keeps its batch state private. Drive that state
+// directly here so the mixed batch-row interface is covered without a live tablet scan.
+#define private public
+#include "storage/retrieval/ob_text_retrieval_token_iter.h"
+#undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 namespace oceanbase
 {
@@ -102,7 +116,7 @@ public:
       const std::vector<std::optional<uint64_t>> &ids,
       const int64_t batch_size,
       const int64_t fail_on_call = 0)
-    : values_(), ids_(), views_(), next_idx_(0), batch_size_(batch_size),
+    : values_(), ids_(), next_idx_(0), batch_size_(batch_size),
       batch_calls_(0), fail_on_call_(fail_on_call)
   {
     // ObDatum::set_int() writes through ptr_; a default-constructed ObDatum has a null data
@@ -132,12 +146,11 @@ public:
   void reuse()
   {
     next_idx_ = 0;
-    views_.clear();
     batch_calls_ = 0;
   }
   virtual int get_next_doc_id_batch(
       const int64_t capacity,
-      const ObDatum **&doc_ids,
+      const ObDatum *&doc_ids,
       int64_t &count) override
   {
     int ret = OB_SUCCESS;
@@ -152,13 +165,8 @@ public:
         ret = OB_ITER_END;
       } else {
         count = MIN(capacity, MIN(batch_size_, remaining));
-        views_.clear();
-        views_.reserve(count);
-        for (int64_t i = 0; i < count; ++i) {
-          views_.push_back(&ids_[next_idx_ + i]);
-        }
+        doc_ids = ids_.data() + next_idx_;
         next_idx_ += count;
-        doc_ids = views_.data();
       }
     }
     return ret;
@@ -167,7 +175,6 @@ public:
 private:
   std::vector<int64_t> values_;
   std::vector<ObDatum> ids_;
-  std::vector<const ObDatum *> views_;
   int64_t next_idx_;
   int64_t batch_size_;
   int64_t batch_calls_;
@@ -181,7 +188,7 @@ public:
       const std::vector<std::optional<std::string>> &ids,
       const int64_t batch_size,
       const int64_t fail_on_call = 0)
-    : values_(), ids_(), views_(), next_idx_(0), batch_size_(batch_size),
+    : values_(), ids_(), next_idx_(0), batch_size_(batch_size),
       batch_calls_(0), fail_on_call_(fail_on_call)
   {
     values_.reserve(ids.size());
@@ -208,12 +215,11 @@ public:
   void reuse()
   {
     next_idx_ = 0;
-    views_.clear();
     batch_calls_ = 0;
   }
   virtual int get_next_doc_id_batch(
       const int64_t capacity,
-      const ObDatum **&doc_ids,
+      const ObDatum *&doc_ids,
       int64_t &count) override
   {
     int ret = OB_SUCCESS;
@@ -228,13 +234,8 @@ public:
         ret = OB_ITER_END;
       } else {
         count = MIN(capacity, MIN(batch_size_, remaining));
-        views_.clear();
-        views_.reserve(count);
-        for (int64_t i = 0; i < count; ++i) {
-          views_.push_back(&ids_[next_idx_ + i]);
-        }
+        doc_ids = ids_.data() + next_idx_;
         next_idx_ += count;
-        doc_ids = views_.data();
       }
     }
     return ret;
@@ -243,7 +244,6 @@ public:
 private:
   std::vector<std::string> values_;
   std::vector<ObDatum> ids_;
-  std::vector<const ObDatum *> views_;
   int64_t next_idx_;
   int64_t batch_size_;
   int64_t batch_calls_;
@@ -259,7 +259,6 @@ public:
     : ids_(ids),
       datums_(batch_size),
       payload_(),
-      views_(batch_size),
       next_idx_(0),
       batch_size_(batch_size)
   {
@@ -280,7 +279,7 @@ public:
   void reuse() { next_idx_ = 0; }
   virtual int get_next_doc_id_batch(
       const int64_t capacity,
-      const ObDatum **&doc_ids,
+      const ObDatum *&doc_ids,
       int64_t &count) override
   {
     int ret = OB_SUCCESS;
@@ -289,7 +288,6 @@ public:
     // Every refill overwrites the same datum objects and raw payload buffer.
     for (int64_t i = 0; i < batch_size_; ++i) {
       datums_[i].set_null();
-      views_[i] = nullptr;
     }
     const int64_t remaining = static_cast<int64_t>(ids_.size()) - next_idx_;
     if (remaining <= 0) {
@@ -307,10 +305,9 @@ public:
           datums_[i].set_string(payload, static_cast<uint32_t>(id->size()));
           payload_offset += static_cast<int64_t>(id->size());
         }
-        views_[i] = &datums_[i];
       }
       next_idx_ += count;
-      doc_ids = views_.data();
+      doc_ids = datums_.data();
     }
     return ret;
   }
@@ -319,7 +316,6 @@ private:
   std::vector<std::optional<std::string>> ids_;
   std::vector<ObDatum> datums_;
   std::vector<char> payload_;
-  std::vector<const ObDatum *> views_;
   int64_t next_idx_;
   int64_t batch_size_;
 };
@@ -1156,6 +1152,184 @@ TEST_F(CountOnlyBatchMergerTest, union_capability_requires_at_most_one_match)
   EXPECT_TRUE(collector.support_count_only_union());
   ASSERT_EQ(OB_SUCCESS, collector.init(2));
   EXPECT_FALSE(collector.support_count_only_union());
+}
+
+TEST(ProductionTokenIterBatchTest, advance_uses_active_batch_view)
+{
+  common::ObArenaAllocator allocator;
+  ObTextRetrievalDaaTTokenIter iter;
+  std::vector<uint64_t> batch_values = {10, 20, 30};
+  std::vector<uint64_t> stale_values = {91, 92, 93};
+  std::vector<ObDatum> source_datums(batch_values.size());
+  const int64_t batch_count = static_cast<int64_t>(source_datums.size());
+  for (int64_t i = 0; i < batch_count; ++i) {
+    source_datums[i].ptr_ = reinterpret_cast<const char *>(&batch_values[i]);
+    source_datums[i].pack_ = sizeof(uint64_t);
+  }
+  sql::ObDatumVector source;
+  source.set_batch(true);
+  source.datums_ = source_datums.data();
+
+  iter.allocator_ = &allocator;
+  iter.max_batch_size_ = batch_count;
+  iter.owned_batch_datums_.set_allocator(&allocator);
+  ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.init(batch_count));
+  ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_count));
+  iter.doc_id_.set_allocator(&allocator);
+  ASSERT_EQ(OB_SUCCESS, iter.doc_id_.init(batch_count));
+  ASSERT_EQ(OB_SUCCESS, iter.doc_id_.prepare_allocate(batch_count));
+  for (int64_t i = 0; i < static_cast<int64_t>(stale_values.size()); ++i) {
+    ObDatum stale;
+    stale.ptr_ = reinterpret_cast<const char *>(&stale_values[i]);
+    stale.pack_ = sizeof(uint64_t);
+    ASSERT_EQ(OB_SUCCESS, iter.doc_id_[i].set_datum_fast(stale));
+  }
+
+  common::ObDatumBasicFuncs *basic_funcs =
+      ObDatumFuncs::get_basic_func(ObUInt64Type, CS_TYPE_BINARY);
+  ASSERT_NE(nullptr, basic_funcs);
+  iter.cmp_func_ = basic_funcs->null_first_cmp_;
+  int64_t built_count = 0;
+  ASSERT_EQ(OB_SUCCESS, iter.build_owned_doc_id_batch(
+      source, nullptr, nullptr, batch_count, built_count));
+  ASSERT_EQ(batch_count, built_count);
+  iter.count_ = batch_count;
+  iter.cur_idx_ = -1;
+
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_row());
+  const ObDatum *current = nullptr;
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(10, current->get_uint64());
+
+  auto make_target = [](uint64_t &value) {
+    ObDatum target;
+    target.ptr_ = reinterpret_cast<const char *>(&value);
+    target.pack_ = sizeof(uint64_t);
+    return target;
+  };
+  uint64_t target_20 = 20;
+  ASSERT_EQ(OB_SUCCESS, iter.advance_to(make_target(target_20)));
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(20, current->get_uint64());
+
+  uint64_t target_30 = 30;
+  ASSERT_EQ(OB_SUCCESS, iter.advance_to(make_target(target_30)));
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(30, current->get_uint64());
+
+  uint64_t target_25 = 25;
+  ASSERT_EQ(OB_SUCCESS, iter.advance_to(make_target(target_25)));
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(30, current->get_uint64());
+
+  iter.cur_idx_ = -1;
+  EXPECT_EQ(OB_ARRAY_OUT_OF_RANGE, iter.get_curr_id(current));
+  double score = 0.0;
+  EXPECT_EQ(OB_ARRAY_OUT_OF_RANGE, iter.get_curr_score(score));
+}
+
+TEST(ProductionTokenIterBatchTest, shared_frame_payload_is_copied_per_iterator)
+{
+  common::ObArenaAllocator allocator;
+  ObTextRetrievalDaaTTokenIter first;
+  ObTextRetrievalDaaTTokenIter second;
+  const std::vector<uint64_t> expected_values = {10, 20, 30};
+  std::vector<uint64_t> shared_values = expected_values;
+  std::vector<ObDatum> shared_datums(shared_values.size());
+  const int64_t batch_count = static_cast<int64_t>(shared_datums.size());
+  for (int64_t i = 0; i < batch_count; ++i) {
+    shared_datums[i].ptr_ = reinterpret_cast<const char *>(&shared_values[i]);
+    shared_datums[i].pack_ = sizeof(uint64_t);
+  }
+  sql::ObDatumVector shared_source;
+  shared_source.set_batch(true);
+  shared_source.datums_ = shared_datums.data();
+
+  auto init_iterator = [&](ObTextRetrievalDaaTTokenIter &iter) {
+    iter.allocator_ = &allocator;
+    iter.max_batch_size_ = batch_count;
+    iter.owned_batch_datums_.set_allocator(&allocator);
+    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.init(batch_count));
+    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_count));
+  };
+  init_iterator(first);
+  init_iterator(second);
+
+  int64_t first_count = 0;
+  int64_t second_count = 0;
+  ASSERT_EQ(OB_SUCCESS, first.build_owned_doc_id_batch(
+      shared_source, nullptr, nullptr, batch_count, first_count));
+  ASSERT_EQ(OB_SUCCESS, second.build_owned_doc_id_batch(
+      shared_source, nullptr, nullptr, batch_count, second_count));
+  ASSERT_EQ(batch_count, first_count);
+  ASSERT_EQ(batch_count, second_count);
+
+  // Loading the next token iterator overwrites both the shared datum structs and their payload.
+  shared_values = {99, 98, 97};
+  std::vector<ObDatum> overwritten(shared_datums.size());
+  for (int64_t i = 0; i < batch_count; ++i) {
+    overwritten[i].ptr_ = reinterpret_cast<const char *>(&shared_values[i]);
+    overwritten[i].pack_ = sizeof(uint64_t);
+  }
+  MEMCPY(shared_datums.data(), overwritten.data(), sizeof(ObDatum) * batch_count);
+
+  for (int64_t i = 0; i < batch_count; ++i) {
+    EXPECT_EQ(expected_values[i], first.batch_doc_ids_[i].get_uint64());
+    EXPECT_EQ(expected_values[i], second.batch_doc_ids_[i].get_uint64());
+  }
+}
+
+TEST(ProductionTokenIterBatchTest, shared_frame_long_payload_grows_owned_buffer)
+{
+  common::ObArenaAllocator allocator;
+  CountingAllocator counting(allocator);
+  ObTextRetrievalDaaTTokenIter first;
+  ObTextRetrievalDaaTTokenIter second;
+  const std::vector<std::string> expected = {
+      std::string(8, 'a'), std::string(8, 'b'), std::string(40, 'c')};
+  std::vector<std::string> shared_payload = expected;
+  std::vector<ObDatum> shared_datums(shared_payload.size());
+  const int64_t batch_count = static_cast<int64_t>(shared_datums.size());
+  for (int64_t i = 0; i < batch_count; ++i) {
+    shared_datums[i].set_string(
+        shared_payload[i].data(), static_cast<uint32_t>(shared_payload[i].size()));
+  }
+  sql::ObDatumVector shared_source;
+  shared_source.set_batch(true);
+  shared_source.datums_ = shared_datums.data();
+
+  auto init_iterator = [&](ObTextRetrievalDaaTTokenIter &iter) {
+    iter.allocator_ = &counting;
+    iter.max_batch_size_ = batch_count;
+    iter.owned_batch_datums_.set_allocator(&counting);
+    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.init(batch_count));
+    ASSERT_EQ(OB_SUCCESS, iter.owned_batch_datums_.prepare_allocate(batch_count));
+  };
+  init_iterator(first);
+  init_iterator(second);
+
+  int64_t first_count = 0;
+  int64_t second_count = 0;
+  ASSERT_EQ(OB_SUCCESS, first.build_owned_doc_id_batch(
+      shared_source, nullptr, nullptr, batch_count, first_count));
+  ASSERT_EQ(OB_SUCCESS, second.build_owned_doc_id_batch(
+      shared_source, nullptr, nullptr, batch_count, second_count));
+  ASSERT_EQ(batch_count, first_count);
+  ASSERT_EQ(batch_count, second_count);
+  const int64_t alloc_calls = counting.alloc_calls();
+  ASSERT_EQ(OB_SUCCESS, first.build_owned_doc_id_batch(
+      shared_source, nullptr, nullptr, batch_count, first_count));
+  EXPECT_EQ(alloc_calls, counting.alloc_calls());
+
+  for (std::string &value : shared_payload) {
+    std::fill(value.begin(), value.end(), 'z');
+  }
+  for (int64_t i = 0; i < batch_count; ++i) {
+    const ObDatum &first_id = first.batch_doc_ids_[i];
+    const ObDatum &second_id = second.batch_doc_ids_[i];
+    EXPECT_EQ(expected[i], std::string(first_id.ptr_, first_id.len_));
+    EXPECT_EQ(expected[i], std::string(second_id.ptr_, second_id.len_));
+  }
 }
 
 } // namespace
