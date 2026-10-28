@@ -21,6 +21,7 @@
 
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
+#include "lib/hash/ob_hashutils.h"
 #include "sql/das/ob_das_domain_utils.h"
 #include "data_plane/blocksstable/ob_datum_row.h"
 
@@ -30,6 +31,69 @@ namespace sql
 {
 namespace
 {
+
+class AllocationFailpointAllocator final : public ObIAllocator
+{
+public:
+  explicit AllocationFailpointAllocator(ObIAllocator &delegate)
+    : delegate_(&delegate), remaining_allocs_(-1)
+  {
+  }
+
+  void fail_after(const int64_t successful_allocs)
+  {
+    remaining_allocs_ = successful_allocs;
+  }
+
+  void disable()
+  {
+    remaining_allocs_ = -1;
+  }
+
+  virtual void *alloc(const int64_t size) override
+  {
+    return alloc_with_limit([this, size]() { return delegate_->alloc(size); });
+  }
+
+  virtual void *alloc(const int64_t size, const common::ObMemAttr &attr) override
+  {
+    return alloc_with_limit([this, size, &attr]() { return delegate_->alloc(size, attr); });
+  }
+
+  virtual void free(void *ptr) override
+  {
+    delegate_->free(ptr);
+  }
+
+  virtual int64_t total() const override
+  {
+    return delegate_->total();
+  }
+
+  virtual int64_t used() const override
+  {
+    return delegate_->used();
+  }
+
+private:
+  template <typename AllocFn>
+  void *alloc_with_limit(AllocFn alloc_fn)
+  {
+    void *ptr = nullptr;
+    if (0 == remaining_allocs_) {
+    } else {
+      if (remaining_allocs_ > 0) {
+        --remaining_allocs_;
+      }
+      ptr = alloc_fn();
+    }
+    return ptr;
+  }
+
+private:
+  ObIAllocator *delegate_;
+  int64_t remaining_allocs_;
+};
 
 class FTSWordRowBufferTest : public ::testing::Test
 {
@@ -53,6 +117,13 @@ protected:
   static ObString as_ob_string(const std::string &value)
   {
     return ObString(static_cast<int32_t>(value.size()), value.data());
+  }
+
+  static int64_t expected_word_map_bucket_count(const std::string &value)
+  {
+    const int64_t requested = std::min<int64_t>(
+        std::max<int64_t>(static_cast<int64_t>(value.size()) / 10, 2), 997);
+    return common::hash::cal_next_prime(requested);
   }
 
   static std::string word_at(const blocksstable::ObStorageDatum *rows,
@@ -370,6 +441,152 @@ TEST_F(FTSWordRowBufferTest, matches_scalar_fulltext_row_fields)
   }
 }
 
+TEST_F(FTSWordRowBufferTest, scratch_map_reuses_exact_bucket_layout_and_preserves_oracle_order)
+{
+  FTSWordRowBuffer buffer;
+  EXPECT_EQ(0, buffer.get_scratch_word_map_bucket_count());
+  EXPECT_EQ(0, buffer.get_scratch_word_map_create_count());
+
+  std::string long_text;
+  for (int64_t i = 0; i < 600; ++i) {
+    if (!long_text.empty()) {
+      long_text.push_back(' ');
+    }
+    const char token[] = {
+      static_cast<char>('a' + i % 26),
+      static_cast<char>('a' + (i / 26) % 26),
+      static_cast<char>('a' + (i / (26 * 26)) % 26)};
+    long_text.append(token, sizeof(token));
+  }
+
+  struct Document
+  {
+    std::string id;
+    std::string text;
+  };
+  const Document documents[] = {
+    {"scratch-0", "aaa bbb aaa ccc aaa bbb"},
+    {"scratch-1", "ddd eee ddd fff ddd eee"},
+    {"scratch-2", long_text},
+    {"scratch-3", "ggg hhh ggg"}};
+  const int64_t expected_create_counts[] = {1, 1, 2, 3};
+  auto as_string = [](const ObString &value) {
+    return std::string(value.ptr(), value.length());
+  };
+
+  const int64_t document_count = static_cast<int64_t>(sizeof(documents) / sizeof(documents[0]));
+  for (int64_t doc_idx = 0; doc_idx < document_count; ++doc_idx) {
+    ObDomainIndexRow oracle_rows;
+    ObDatum id = doc_id(documents[doc_idx].id.c_str());
+    ASSERT_EQ(OB_SUCCESS,
+              ObDASDomainUtils::generate_fulltext_word_rows(
+                  allocator_,
+                  &helper_,
+                  meta_,
+                  id,
+                  as_ob_string(documents[doc_idx].text),
+                  true,
+                  oracle_rows));
+    ASSERT_EQ(OB_SUCCESS,
+              buffer.append(allocator_,
+                            &helper_,
+                            meta_,
+                            id,
+                            as_ob_string(documents[doc_idx].text),
+                            true));
+    EXPECT_EQ(expected_word_map_bucket_count(documents[doc_idx].text),
+              buffer.get_scratch_word_map_bucket_count());
+    EXPECT_EQ(expected_create_counts[doc_idx], buffer.get_scratch_word_map_create_count());
+    EXPECT_EQ(0, buffer.get_scratch_word_map_entry_count());
+    ASSERT_EQ(oracle_rows.count(), buffer.get_row_count());
+
+    const blocksstable::ObStorageDatum *rows = nullptr;
+    int64_t row_count = 0;
+    ASSERT_EQ(OB_SUCCESS, buffer.get_next_batch(rows, row_count, oracle_rows.count()));
+    ASSERT_EQ(oracle_rows.count(), row_count);
+    int64_t aaa_count = 0;
+    int64_t bbb_count = 0;
+    for (int64_t i = 0; i < row_count; ++i) {
+      const blocksstable::ObDatumRow &oracle = *oracle_rows.at(i);
+      const blocksstable::ObStorageDatum *actual =
+          rows + i * FTSWordRowBuffer::COLUMN_COUNT;
+      EXPECT_EQ(as_string(oracle.storage_datums_[0].get_string()),
+                as_string(actual[0].get_string()));
+      EXPECT_EQ(as_string(oracle.storage_datums_[1].get_string()),
+                as_string(actual[1].get_string()));
+      EXPECT_EQ(oracle.storage_datums_[2].get_uint(), actual[2].get_uint());
+      EXPECT_EQ(oracle.storage_datums_[3].get_uint(), actual[3].get_uint());
+      if (0 == doc_idx) {
+        const std::string word = as_string(actual[0].get_string());
+        aaa_count += "aaa" == word ? 1 : 0;
+        bbb_count += "bbb" == word ? 1 : 0;
+        EXPECT_EQ(6, actual[3].get_uint());
+      }
+    }
+    if (0 == doc_idx) {
+      EXPECT_EQ(3, aaa_count);
+      EXPECT_EQ(2, bbb_count);
+    }
+    EXPECT_EQ(0, buffer.get_pending_row_count());
+    buffer.reuse();
+    EXPECT_EQ(0, buffer.get_scratch_word_map_entry_count());
+  }
+
+  buffer.reset();
+  EXPECT_EQ(0, buffer.get_scratch_word_map_bucket_count());
+  EXPECT_EQ(0, buffer.get_scratch_word_map_create_count());
+}
+
+TEST_F(FTSWordRowBufferTest, append_failure_clears_scratch_map_before_retry)
+{
+  FTSWordRowBuffer buffer;
+  ASSERT_EQ(OB_SUCCESS,
+            buffer.append(allocator_,
+                          &helper_,
+                          meta_,
+                          doc_id("warm-map"),
+                          ObString::make_string("aaa bbb"),
+                          true));
+  const int64_t bucket_count = buffer.get_scratch_word_map_bucket_count();
+  const int64_t create_count = buffer.get_scratch_word_map_create_count();
+  buffer.reuse();
+
+  AllocationFailpointAllocator failing_allocator(allocator_);
+  failing_allocator.fail_after(1);
+  const std::string oversized_id(256, 'f');
+  ObDatum failing_id = doc_id(oversized_id.c_str());
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED,
+            buffer.append(failing_allocator,
+                          &helper_,
+                          meta_,
+                          failing_id,
+                          ObString::make_string("aaa bbb"),
+                          true));
+  EXPECT_EQ(0, buffer.get_row_count());
+  EXPECT_EQ(0, buffer.get_scratch_word_map_entry_count());
+  EXPECT_EQ(bucket_count, buffer.get_scratch_word_map_bucket_count());
+  EXPECT_EQ(create_count, buffer.get_scratch_word_map_create_count());
+
+  failing_allocator.disable();
+  ASSERT_EQ(OB_SUCCESS,
+            buffer.append(failing_allocator,
+                          &helper_,
+                          meta_,
+                          doc_id("retry-map"),
+                          ObString::make_string("aaa bbb"),
+                          true));
+  const blocksstable::ObStorageDatum *rows = nullptr;
+  int64_t row_count = 0;
+  ASSERT_EQ(OB_SUCCESS, buffer.get_next_batch(rows, row_count, 2));
+  ASSERT_EQ(2, row_count);
+  for (int64_t i = 0; i < row_count; ++i) {
+    EXPECT_EQ("retry-map", document_at(rows, i, true));
+    EXPECT_EQ(1, rows[i * FTSWordRowBuffer::COLUMN_COUNT + 2].get_uint());
+    EXPECT_EQ(2, rows[i * FTSWordRowBuffer::COLUMN_COUNT + 3].get_uint());
+  }
+  EXPECT_EQ(0, buffer.get_scratch_word_map_entry_count());
+}
+
 TEST_F(FTSWordRowBufferTest, large_tokenless_documents_release_parser_scratch)
 {
   ObFTIndexRowCache cache;
@@ -379,14 +596,25 @@ TEST_F(FTSWordRowBufferTest, large_tokenless_documents_release_parser_scratch)
   const std::string id_value = "tokenless-doc";
   ObDatum id = doc_id(id_value.c_str());
   const std::string spaces(256L * 1024L, ' ');
+  const int64_t expected_bucket_count = common::hash::cal_next_prime(997);
   for (int64_t i = 0; i < 32; ++i) {
     EXPECT_EQ(OB_ITER_END, cache.append(meta_, id, as_ob_string(spaces)));
     EXPECT_EQ(0, cache.get_row_count());
     EXPECT_EQ(0, cache.get_retained_bytes());
     EXPECT_EQ(0, cache.get_parse_scratch_used_bytes());
+    EXPECT_EQ(expected_bucket_count, cache.get_scratch_word_map_bucket_count());
+    EXPECT_EQ(1, cache.get_scratch_word_map_create_count());
+    EXPECT_EQ(0, cache.get_scratch_word_map_entry_count());
   }
   cache.reuse();
   EXPECT_EQ(0, cache.get_parse_scratch_used_bytes());
+  EXPECT_EQ(expected_bucket_count, cache.get_scratch_word_map_bucket_count());
+  EXPECT_EQ(1, cache.get_scratch_word_map_create_count());
+  EXPECT_EQ(0, cache.get_scratch_word_map_entry_count());
+  cache.reset();
+  EXPECT_EQ(0, cache.get_scratch_word_map_bucket_count());
+  EXPECT_EQ(0, cache.get_scratch_word_map_create_count());
+  EXPECT_EQ(0, cache.get_scratch_word_map_entry_count());
 }
 
 } // namespace

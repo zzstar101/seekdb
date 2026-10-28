@@ -42,7 +42,7 @@ public:
   static constexpr int64_t COLUMN_COUNT = 4;
 
   FTSWordRowBuffer();
-  ~FTSWordRowBuffer() = default;
+  ~FTSWordRowBuffer();
 
   int append(common::ObIAllocator &allocator,
              storage::ObFTParseHelper *helper,
@@ -57,11 +57,20 @@ public:
   int64_t get_pending_row_count() const { return row_count_ - row_idx_; }
   int64_t get_row_count() const { return row_count_; }
   int64_t get_retained_bytes() const { return retained_bytes_; }
+  int64_t get_scratch_word_map_bucket_count() const { return word_map_.bucket_count(); }
+  int64_t get_scratch_word_map_create_count() const { return word_map_create_count_; }
+  int64_t get_scratch_word_map_entry_count() const { return word_map_.size(); }
+  void reset();
   void reuse();
 
-  TO_STRING_KV(K_(capacity), K_(row_count), K_(row_idx), KP_(datums));
+  TO_STRING_KV(K_(capacity), K_(row_count), K_(row_idx), KP_(datums),
+               "word_map_bucket_count", get_scratch_word_map_bucket_count(),
+               "word_map_create_count", K_(word_map_create_count));
 private:
   int reserve_rows(common::ObIAllocator &allocator, const int64_t need_rows);
+  int prepare_word_map(const int64_t bucket_count);
+  int clear_word_map();
+  void destroy_word_map();
   int copy_string_datum(common::ObIAllocator &allocator,
                         const ObDatum &src,
                         blocksstable::ObStorageDatum &dst);
@@ -71,6 +80,10 @@ private:
   int64_t row_count_;
   int64_t row_idx_;
   int64_t retained_bytes_;
+  // Document-local parser workspace. The bucket array is retained only while
+  // the next document requests the same exact prime bucket count.
+  storage::ObFTWordMap word_map_;
+  int64_t word_map_create_count_;
 
   DISALLOW_COPY_AND_ASSIGN(FTSWordRowBuffer);
 };
@@ -101,6 +114,9 @@ public:
   int64_t get_row_count() const { return words_.get_row_count(); }
   int64_t get_retained_bytes() const { return words_.get_retained_bytes(); }
   int64_t get_parse_scratch_used_bytes() const { return parse_allocator_.used(); }
+  int64_t get_scratch_word_map_bucket_count() const { return words_.get_scratch_word_map_bucket_count(); }
+  int64_t get_scratch_word_map_create_count() const { return words_.get_scratch_word_map_create_count(); }
+  int64_t get_scratch_word_map_entry_count() const { return words_.get_scratch_word_map_entry_count(); }
   void reset();
   void reuse();
   TO_STRING_KV(K_(is_fts_index_aux), K_(helper), K_(is_inited),
