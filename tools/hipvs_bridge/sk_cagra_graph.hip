@@ -791,6 +791,34 @@ out:
 
 
 
+namespace {
+// Replace the last `nrand` slots of every row with pseudo-random long-range
+// edges (distinct, not self, not already in the row). An exact kNN graph of
+// clustered data has (almost) no inter-cluster edges, which leaves CAGRA's
+// randomly seeded greedy search unable to reach other clusters; NN-descent
+// graphs keep such edges from their random initialisation. A few random links
+// per node restore global navigability at negligible local cost.
+__global__ void cagra_random_edges_kernel(uint32_t* __restrict__ graph, uint32_t n, int deg, int nrand)
+{
+  const uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v >= n) return;
+  uint32_t* row = graph + (int64_t)v * deg;
+  uint64_t h = ((uint64_t)v + 1) * 0x9E3779B97F4A7C15ull;
+  for (int s = deg - nrand; s < deg; s++) {
+    for (int tries = 0; tries < 16; tries++) {
+      h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+      const uint32_t c = (uint32_t)((h >> 32) % n);
+      if (c == v) continue;
+      bool dup = false;
+      for (int j = 0; j < deg && !dup; j++) dup = (j != s && row[j] == c);
+      if (dup) continue;
+      row[s] = c;
+      break;
+    }
+  }
+}
+}  // namespace
+
 extern "C" int sk_cagra_optimize(cuvsResources_t res,
                                  uint32_t* d_knn,
                                  int64_t n,
@@ -827,6 +855,14 @@ extern "C" int sk_cagra_optimize(cuvsResources_t res,
   hipLaunchKernelGGL((cagra_merge_kernel<256>), dim3((unsigned)n), dim3(out_degree <= 64 ? 64 : (out_degree <= 128 ? 128 : 256)),
                      0, stream, d_graph, (const uint32_t*)d_rev, (const uint32_t*)d_count, (uint32_t)n,
                      out_degree);
+  {
+    const char* ev = getenv("SK_CAGRA_RANDOM_EDGES");
+    int nrand = ev ? atoi(ev) : out_degree / 16;  // 8 of 128
+    if (nrand > out_degree / 4) nrand = out_degree / 4;
+    if (nrand > 0 && n > out_degree + 1)
+      hipLaunchKernelGGL(cagra_random_edges_kernel, dim3(blocks), dim3(256), 0, stream, d_graph, (uint32_t)n,
+                         out_degree, nrand);
+  }
   hipError_t e = hipStreamSynchronize(stream);
   if (own_count) cuvsRMMFree(res, d_count, sizeof(uint32_t) * n);
   if (e != hipSuccess) {
