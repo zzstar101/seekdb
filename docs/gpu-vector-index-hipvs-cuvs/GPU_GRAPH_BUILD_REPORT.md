@@ -82,6 +82,10 @@ rocBLAS 依赖；rocBLAS 会额外常驻约 196 MB。
   | SIFT R@10/@100 | 1.0 / 1.0 | — | 1.0 / 1.0 | 1.0 / 1.0 |
   | nq=1 kernel 时间 | 3.0–3.4 ms | 0.58 ms | 0.65 ms | 0.73–0.82 ms |
 
+  每条查询返回后，bridge 在主机上检查是否是 k 个互不重复、在范围内的 ID（k≤100 时只要几微秒）。
+  不满足的行用基线的 SINGLE_CTA 参数重新搜一次（不行再把 itopk 翻倍搜一次），仍是 GPU 上的 hipVS
+  CAGRA。三个数据集各 4096×2 条查询实测从未触发；用 `SEEKDB_CUVS_DEBUG_REPAIR_EVERY=7` 强制每 7 条触发一次，
+  结果仍然完整、召回不变。
   大批量（nq > 16）仍用基线的 SINGLE_CTA、itopk=max(4·k,512)，那里吞吐更优。
   可用 `SEEKDB_CUVS_SEARCH_ALGO`、`SEEKDB_CUVS_MULTI_CTA_ITOPK`、`SEEKDB_CUVS_MULTI_CTA_MAX_NQ` 覆盖。
 - `ob_vsag_adaptor.cpp`：原来每次查询或构建都新建一个 32 MB 栈的 pthread，现改为

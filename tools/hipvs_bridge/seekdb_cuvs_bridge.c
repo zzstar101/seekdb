@@ -483,6 +483,52 @@ static int sk_ensure_buffers(sk_cuvs_index* h, long nq, long topk)
   return 0;
 }
 
+static int sk_row_ok(const unsigned* ids, long k, long n)
+{
+  /* k distinct in-range ids. k <= a few hundred, so an insertion sort on a copy
+   * is a handful of microseconds. */
+  unsigned buf[1024];
+  if (k > 1024) return 1;
+  for (long i = 0; i < k; ++i) {
+    unsigned v = ids[i];
+    if ((long)v >= n) return 0;
+    long j = i;
+    while (j > 0 && buf[j - 1] > v) { buf[j] = buf[j - 1]; --j; }
+    if (j > 0 && buf[j - 1] == v) return 0;
+    buf[j] = v;
+  }
+  return 1;
+}
+
+/* Re-run one query row with the conservative baseline plan (SINGLE_CTA,
+ * itopk=max(4k,512)), escalating itopk once more if needed. Still hipVS CAGRA
+ * on the GPU; only used for the (so far never observed) rows where the fast
+ * plan returned a duplicate or an invalid id. */
+static int sk_repair_row(sk_cuvs_index* h, long row, long topk, unsigned* out_ids, float* out_dist)
+{
+  int ok = 0;
+  for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+    cuvsCagraSearchParams_t sp = 0;
+    if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) return 0;
+    size_t itopk = (size_t)topk * 4; if (itopk < 512) itopk = 512;
+    sp->itopk_size = itopk << attempt;
+    sp->search_width = 4;
+    sp->algo = (enum cuvsCagraSearchAlgo)0;
+    DLManagedTensor qt, nt, dt; long qs[2]={1,h->dim}, nsh[2]={1,topk};
+    sk_mk_dev_tensor(&qt, h->qd + row*h->dim, kDLFloat, 32, qs);
+    sk_mk_dev_tensor(&nt, h->nd + row*topk, kDLUInt, 32, nsh);
+    sk_mk_dev_tensor(&dt, h->dd + row*topk, kDLFloat, 32, nsh);
+    cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
+    if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) == CUVS_SUCCESS &&
+        cudaMemcpy(out_ids + row*topk, h->nd + row*topk, sizeof(unsigned)*topk, cudaMemcpyDefault) == cudaSuccess) {
+      if (out_dist) cudaMemcpy(out_dist + row*topk, h->dd + row*topk, sizeof(float)*topk, cudaMemcpyDefault);
+      ok = sk_row_ok(out_ids + row*topk, topk, h->n);
+    }
+    cuvsCagraSearchParamsDestroy(sp);
+  }
+  return ok;
+}
+
 int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                        unsigned int* out_ids, float* out_dist)
 {
@@ -543,6 +589,21 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     if (tim) t_search = sk_now_ms();
     if (cudaMemcpy(out_ids, h->nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) return 16;
     if (out_dist) cudaMemcpy(out_dist, h->dd, sizeof(float)*nq*topk, cudaMemcpyDefault);
+    /* Result integrity: every query must return topk distinct valid ids. */
+    if (topk <= h->n) {
+      /* SEEKDB_CUVS_DEBUG_REPAIR_EVERY=N exercises the repair path on every Nth call (testing only). */
+      static long sk_dbg_every = -1;
+      if (sk_dbg_every < 0) sk_dbg_every = sk_env_long("SEEKDB_CUVS_DEBUG_REPAIR_EVERY", 0);
+      for (long r = 0; r < nq; ++r) {
+        int force = sk_dbg_every > 0 && (call_no % sk_dbg_every) == 0;
+        if (!force && sk_row_ok(out_ids + r*topk, topk, h->n)) continue;
+        static long sk_repairs = 0;
+        int fixed = sk_repair_row(h, r, topk, out_ids, out_dist);
+        if (++sk_repairs <= 16)
+          fprintf(stderr, "[seekdb_cuvs] repaired malformed result row (topk=%ld): %s\n",
+                  topk, fixed ? "ok" : "FAILED");
+      }
+    }
     if (tim) t_end = sk_now_ms();
   }
   /* Per-call split of the bridge call itself. Printed for the first 3 calls and then
