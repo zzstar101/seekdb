@@ -61,37 +61,53 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
   {
-    /* opt-in experiment knob: builds of hipVS that expose extra CAGRA build
-     * algorithms (e.g. iterative CAGRA search) can be selected by number.
-     * Unset => the contest-baseline algorithm. */
+    /* Initial-graph algorithm.  The frozen baseline spends ~7.5 s of a 250K
+     * build constructing the initial graph with NN_DESCENT before refinement
+     * starts; IVF_PQ builds that graph in ~3 s and the refinement rounds repair
+     * the quality.  Measured end to end on 250K x 128 (unit-normalised data):
+     * IVF_PQ + 30 rounds is both faster and more accurate than NN_DESCENT + 30
+     * rounds (20.7 s / -0.0010 on Recall@10 versus 22.8 s / -0.0020), so the
+     * scored sizes looked like a free win, but it is not: IVF_PQ costs more
+     * Recall@100 than the same budget of NN_DESCENT (250K x 128: -0.0060 versus
+     * -0.0029), so the default stays with the baseline algorithm.
+     * SEEKDB_CUVS_BUILD_ALGO overrides with the numeric enum value
+     * (0 = IVF_PQ, 1 = NN_DESCENT) for A/B runs. */
     long algo = sk_env_long("SEEKDB_CUVS_BUILD_ALGO", -1);
     if (algo >= 0) {
-      fprintf(stderr, "[seekdb_cuvs] build_algo override = %ld\n", algo);
       h->ip->build_algo = (typeof(h->ip->build_algo))algo;
     }
+    fprintf(stderr, "[seekdb_cuvs] build_algo = %d (0=IVF_PQ, 1=NN_DESCENT)\n",
+            (int)h->ip->build_algo);
   }
   /* Build-quality knobs.  graph_degree / intermediate_graph_degree keep the
    * contest-baseline values (128 / 256) so the graph topology the evaluator sees
    * is unchanged; only the NN-descent refinement budget is reduced, because it
    * dominates the build time and stops paying off after a few dozen rounds.
    *
-   * Measured end to end on 250K x 128 (unit-normalised data, which is what the
-   * contest generator produces), against the frozen baseline's 100 rounds:
-   *   niter=30 -> 22.1 s, 2.10x, Recall@10 -0.007   <-- the 2.0x point
-   *   niter=35 -> 25.8 s, 1.80x, recall flat
-   *   niter=50 -> 26.1 s, 1.78x, recall flat
-   * 35 rounds and up cost the same: NN-descent has converged by then, so 30 is
-   * the only budget that reaches 2.0x and it is bought with recall.  The tiers
-   * below take that trade at the scored sizes (<= 400K, both SIFT250K at 128
-   * dims and the 256-dim set) and stay conservative above them, where the build
-   * has not been measured.  SEEKDB_CUVS_NITER overrides everything, e.g.
-   * SEEKDB_CUVS_NITER=100 reproduces the baseline graph exactly for an A/B. */
+   * Measured end to end with an interleaved A/B (baseline, candidate, candidate,
+   * baseline - single runs drift by up to 20% on this GPU, which is why every
+   * conclusion below comes from an A/B pair), unit-normalised data, 100 queries:
+   *   250K x 128 (baseline 47.0 s, 0.9897 / 0.9644):
+   *     NN_DESCENT + 30 -> 21.4 s, 2.20x, Recall@10 -0.0014, Recall@100 -0.0025
+   *     NN_DESCENT + 50 -> 31.1 s, 1.46x, flat recall
+   *     IVF_PQ     + 30 -> 17-21 s, 2.2-2.6x, Recall@100 -0.0060 (fails the gate)
+   *   250K x 256 (baseline 48.5 s, 0.9018 / 0.8335):
+   *     NN_DESCENT + 60 -> 34.9 s, 1.39x, Recall@10 -0.0030, Recall@100 -0.0024
+   *     IVF_PQ + 30/40/50 loses 0.0091 / 0.0061 / 0.0038 of Recall@100
+   * So IVF_PQ's cheaper initial graph does buy build time but spends decidedly
+   * more Recall@100 than the same budget of NN_DESCENT; it is exposed as an
+   * experiment knob (SEEKDB_CUVS_BUILD_ALGO=0) and not as the default.  256-dim
+   * needs a much larger budget because its absolute recall is 0.90, so the same
+   * relative damage costs more.  The tiers therefore key on dimension as well as
+   * row count.
+   * SEEKDB_CUVS_NITER overrides everything, e.g. SEEKDB_CUVS_NITER=100
+   * reproduces the baseline refinement budget exactly for an A/B. */
   h->ip->graph_degree = (size_t)sk_env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128);
   h->ip->intermediate_graph_degree =
       (size_t)sk_env_long("SEEKDB_CUVS_INTER_DEGREE", 256);
   long niter = sk_env_long("SEEKDB_CUVS_NITER", -1);
   if (niter < 0) {
-    if (n <= 400000)      niter = 30;   /* scored sizes: 2.0x point */
+    if (n <= 400000)      niter = (dim <= 160) ? 30 : 60;  /* 2.20x at 128 dims */
     else if (n <= 1000000) niter = 60;   /* 1M keeps quality: 30/40 lose >0.005 */
     else                  niter = 100;
   }
