@@ -19,16 +19,36 @@ OUTPUT=${1:-$SCRIPT_DIR/libseekdb_cuvs_bridge.so}
 }
 
 mkdir -p "$(dirname "$OUTPUT")"
+OBJDIR=$(mktemp -d)
+trap 'rm -rf "$OBJDIR"' EXIT
+
+# GPU graph-construction kernels (exact kNN select, CAGRA prune/merge)
+"$HIPCC" \
+  -fPIC \
+  -O3 \
+  -D__HIP_PLATFORM_AMD__ \
+  --offload-arch=${HIP_OFFLOAD_ARCH:-gfx1100} \
+  -I"$HIPVS_ROOT/include" \
+  -I"$ROCM_ROOT/include" \
+  -c "$SCRIPT_DIR/sk_cagra_graph.hip" \
+  -o "$OBJDIR/sk_cagra_graph.o"
 
 "$HIPCC" \
-  -shared \
   -fPIC \
   -O2 \
   -D__HIP_PLATFORM_AMD__ \
   -I"$HIPVS_ROOT/include" \
   -I"$ROCM_ROOT/include" \
-  "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \
+  -c "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \
+  -o "$OBJDIR/seekdb_cuvs_bridge.o"
+
+"$HIPCC" \
+  -shared \
+  -fPIC \
+  "$OBJDIR/seekdb_cuvs_bridge.o" \
+  "$OBJDIR/sk_cagra_graph.o" \
   -L"$HIPVS_ROOT/lib" \
+  -L"$ROCM_ROOT/lib" \
   -Wl,-soname,libseekdb_cuvs_bridge.so \
   -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib" \
   -lcuvs_c \

@@ -1,5 +1,6 @@
 #ifndef SEEKDB_CUVS_BRIDGE_H
 #define SEEKDB_CUVS_BRIDGE_H
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +26,16 @@ int   seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
 void  seekdb_cuvs_free(void* handle);
 int seekdb_cuvs_serialize(void* handle, const char* filename);
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim);
+/* Graph export/import for indexes built by the GPU-resident graph pipeline:
+ *  - seekdb_cuvs_graph_degree: graph degree of the handle, 0 when the graph is not
+ *    exportable (index built by cuvsCagraBuild / loaded from a cuVS file).
+ *  - seekdb_cuvs_copy_graph: copies the n x degree uint32 graph to host memory.
+ *  - seekdb_cuvs_from_graph: rebuilds a searchable handle from base vectors and a
+ *    previously exported graph (no graph construction). */
+long  seekdb_cuvs_graph_degree(void* handle);
+int   seekdb_cuvs_copy_graph(void* handle, uint32_t* out);
+void* seekdb_cuvs_from_graph(const float* base, const uint32_t* graph, long n, long dim,
+                             long degree);
 #ifdef __cplusplus
 }
 #endif
