@@ -496,24 +496,35 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   int rc = sk_ensure_buffers(h, nq, topk);
   if (tim) t_ws = sk_now_ms();
   if (rc) { fprintf(stderr, "[seekdb_cuvs] workspace alloc rc=%d: %s\n", rc, cuvsGetLastErrorText()); return rc; }
-  if (!h->sp || h->sp_topk != topk) {
+  /* Search plan. Single/few-query calls (the SQL path issues nq=1) use MULTI_CTA:
+   * several CTAs walk the graph in parallel from different random seeds, which is
+   * ~4-5x lower latency than SINGLE_CTA for one query because one CTA leaves the
+   * GPU almost idle. MULTI_CTA's recall is governed by the number of parallel
+   * walkers (itopk / per-CTA itopk), so it gets a larger itopk (2048) than the
+   * baseline's SINGLE_CTA 512; measured on SIFT, nytimes-256 and clustered
+   * synthetic data this is recall-equal or better than the baseline setting.
+   * Large batches keep the baseline SINGLE_CTA plan (throughput-optimal there). */
+  long multi_cta_max_nq = sk_env_long("SEEKDB_CUVS_MULTI_CTA_MAX_NQ", 16);
+  long plan_key = topk * 2 + (nq <= multi_cta_max_nq ? 1 : 0);
+  if (!h->sp || h->sp_topk != plan_key) {
     if (h->sp) { cuvsCagraSearchParamsDestroy(h->sp); h->sp = 0; }
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) return 14;
-    /* Default search effort is identical to the contest baseline
-     * (itopk = max(4*topk, 512), width 4) so recall is unchanged; both are
-     * overridable for tuning. */
+    int small = (int)(plan_key & 1);
+    long algo = sk_env_long("SEEKDB_CUVS_SEARCH_ALGO", small ? 1 : 0);
     size_t itopk = (size_t)sk_env_long("SEEKDB_CUVS_ITOPK", 0);
     if (itopk == 0) {
-      itopk = (size_t)topk * 4;
-      if (itopk < 512) itopk = 512;
+      if (algo == 1) {
+        itopk = (size_t)sk_env_long("SEEKDB_CUVS_MULTI_CTA_ITOPK", 2048);
+        if (itopk < (size_t)topk * 4) itopk = (size_t)topk * 4;
+      } else {
+        itopk = (size_t)topk * 4;
+        if (itopk < 512) itopk = 512;
+      }
     }
     h->sp->itopk_size = itopk;
     h->sp->search_width = (uint32_t)sk_env_long("SEEKDB_CUVS_SEARCH_WIDTH", 4);
-    /* SINGLE_CTA (the cuVS default the baseline uses). AUTO would pick MULTI_CTA
-     * for nq=1, which is ~4x faster per query but measurably loses recall@10 on
-     * hard (low-contrast, high-intrinsic-dimension) data, so it stays opt-in. */
-    h->sp->algo = (enum cuvsCagraSearchAlgo)sk_env_long("SEEKDB_CUVS_SEARCH_ALGO", 0);
-    h->sp_topk = topk;
+    h->sp->algo = (enum cuvsCagraSearchAlgo)algo;
+    h->sp_topk = plan_key;
   }
   {
     DLManagedTensor qt, nt, dt; long qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};

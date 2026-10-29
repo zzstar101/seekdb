@@ -33,6 +33,10 @@ static void eval_cagra(cuvsResources_t res,cuvsCagraIndex_t idx,const float*qs,l
     cuvsCagraSearchParams_t sp; cuvsCagraSearchParamsCreate(&sp);
     long it=kv(argc,argv,"itopk",0); if(!it){it=topk*4; if(it<512) it=512;}
     sp->itopk_size=it; sp->search_width=kv(argc,argv,"width",4); sp->algo=kv(argc,argv,"salgo",3);
+    sp->max_iterations=kv(argc,argv,"maxit",0); sp->min_iterations=kv(argc,argv,"minit",0);
+    sp->team_size=kv(argc,argv,"team",0); sp->thread_block_size=kv(argc,argv,"tbs",0);
+    sp->persistent=kv(argc,argv,"persist",0); sp->num_random_samplings=kv(argc,argv,"rand",1);
+    sp->hashmap_mode=kv(argc,argv,"hash",0);
     double t1=now_ms(); double t1q=0;
     for(long i=0;i<nq;i+=256){
       long m=nq-i<256?nq-i:256; long qsh[2]={m,dim},nsh[2]={m,topk};
@@ -42,18 +46,22 @@ static void eval_cagra(cuvsResources_t res,cuvsCagraIndex_t idx,const float*qs,l
     }
     cudaDeviceSynchronize(); double bt=now_ms()-t1;
     cudaMemcpy(ids,nd,4*nq*topk,cudaMemcpyDefault);
-    /* serial nq=1 latency on 512 queries */
+    /* serial nq=1 latency + recall on the first n1 queries */
+    long n1=kv(argc,argv,"nq1n",1024); if(n1>nq) n1=nq;
+    unsigned*ids1=malloc(4*n1*topk);
     t1=now_ms();
-    for(long i=0;i<512;i++){
+    for(long i=0;i<n1;i++){
       long qsh[2]={1,dim},nsh[2]={1,topk};
       DLManagedTensor qt,nt,dt; mk(&qt,qd+i*dim,1,kDLFloat,32,qsh); mk(&nt,nd,1,kDLUInt,32,nsh); mk(&dt,dd,1,kDLFloat,32,nsh);
       cuvsFilter fl={0,NO_FILTER};
-      CK(cuvsCagraSearch(res,sp,idx,&qt,&nt,&dt,fl)); cudaDeviceSynchronize();
+      CK(cuvsCagraSearch(res,sp,idx,&qt,&nt,&dt,fl)); cudaMemcpy(ids1+i*topk,nd,4*topk,cudaMemcpyDefault);
     }
-    t1q=(now_ms()-t1)/512;
-    long hit=0;
+    t1q=(now_ms()-t1)/n1;
+    long hit=0,hit1=0;
     for(long q=0;q<nq;q++){ for(long a=0;a<topk;a++){ unsigned g=gt[q*100+a]; for(long b=0;b<topk;b++) if(ids[q*topk+b]==g){hit++;break;} } }
-    printf("  search top%ld itopk=%ld recall=%.4f batch_ms_per_q=%.4f nq1_ms=%.3f\n",topk,it,(double)hit/(nq*topk),bt/nq,t1q);
+    for(long q=0;q<n1;q++){ for(long a=0;a<topk;a++){ unsigned g=gt[q*100+a]; for(long b=0;b<topk;b++) if(ids1[q*topk+b]==g){hit1++;break;} } }
+    free(ids1);
+    printf("  search top%ld itopk=%ld recall=%.4f batch_ms_per_q=%.4f nq1_ms=%.3f nq1_recall=%.4f\n",topk,it,(double)hit/(nq*topk),bt/nq,t1q,(double)hit1/(n1*topk));
     cuvsCagraSearchParamsDestroy(sp);
   }
   free(ids);
